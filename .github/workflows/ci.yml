@@ -1,0 +1,142 @@
+name: SafeBox CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: safebox-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_REVISION: 4cf24164269a5ebf0c16a028a00727d0e77bbb05
+
+jobs:
+  vulnerability-scan:
+    name: Dart dependency vulnerability scan
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@8dc09193bb540e09b23da07ad7e30bd33bf87018 # v2.3.8
+    with:
+      scan-args: |-
+        --lockfile=pubspec.lock
+      upload-sarif: false
+      fail-on-vuln: true
+    permissions:
+      contents: read
+
+  windows:
+    name: Windows / tests and release build
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned Flutter
+        shell: pwsh
+        run: |
+          $flutterRoot = Join-Path $env:RUNNER_TEMP 'flutter'
+          git init $flutterRoot
+          git -C $flutterRoot remote add origin https://github.com/flutter/flutter.git
+          git -C $flutterRoot fetch --depth 1 origin $env:FLUTTER_REVISION
+          git -C $flutterRoot checkout --detach FETCH_HEAD
+          (Join-Path $flutterRoot 'bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Resolve dependencies
+        run: |
+          flutter config --no-analytics
+          flutter pub get
+      - name: Analyze and test
+        run: |
+          flutter analyze --no-pub
+          dart test test/sbox
+          flutter test test/persistence_security_test.dart test/widget_test.dart test/golden_test.dart --no-pub
+      - name: Verify anonymous GitHub and Gitee reads
+        env:
+          SBOX_LIVE_REMOTE_TESTS: '1'
+        run: dart test test/live_remote_source_test.dart
+      - name: Build Windows release
+        run: flutter build windows --release --no-pub
+
+  linux:
+    name: Linux / protocol tests and release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev libjsoncpp-dev
+      - name: Install pinned Flutter
+        shell: bash
+        run: |
+          flutter_root="$RUNNER_TEMP/flutter"
+          git init "$flutter_root"
+          git -C "$flutter_root" remote add origin https://github.com/flutter/flutter.git
+          git -C "$flutter_root" fetch --depth 1 origin "$FLUTTER_REVISION"
+          git -C "$flutter_root" checkout --detach FETCH_HEAD
+          echo "$flutter_root/bin" >> "$GITHUB_PATH"
+      - name: Analyze and test
+        run: |
+          flutter config --no-analytics
+          flutter pub get
+          flutter analyze --no-pub
+          dart test test/sbox
+      - name: Build Linux release
+        run: flutter build linux --release --no-pub
+
+  apple:
+    name: macOS and iOS / protocol tests and release builds
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned Flutter
+        shell: bash
+        run: |
+          flutter_root="$RUNNER_TEMP/flutter"
+          git init "$flutter_root"
+          git -C "$flutter_root" remote add origin https://github.com/flutter/flutter.git
+          git -C "$flutter_root" fetch --depth 1 origin "$FLUTTER_REVISION"
+          git -C "$flutter_root" checkout --detach FETCH_HEAD
+          echo "$flutter_root/bin" >> "$GITHUB_PATH"
+      - name: Analyze and test
+        run: |
+          flutter config --no-analytics
+          flutter pub get
+          flutter analyze --no-pub
+          dart test test/sbox
+      - name: Build macOS release
+        run: flutter build macos --release --no-pub
+      - name: Build iOS release without signing
+        run: flutter build ios --release --no-codesign --no-pub
+
+  android:
+    name: Android / protocol tests and release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - name: Install pinned Flutter
+        shell: bash
+        run: |
+          flutter_root="$RUNNER_TEMP/flutter"
+          git init "$flutter_root"
+          git -C "$flutter_root" remote add origin https://github.com/flutter/flutter.git
+          git -C "$flutter_root" fetch --depth 1 origin "$FLUTTER_REVISION"
+          git -C "$flutter_root" checkout --detach FETCH_HEAD
+          echo "$flutter_root/bin" >> "$GITHUB_PATH"
+      - name: Analyze and test
+        run: |
+          flutter config --no-analytics
+          flutter pub get
+          flutter analyze --no-pub
+          dart test test/sbox
+      - name: Build Android release APK
+        run: flutter build apk --release --no-pub
