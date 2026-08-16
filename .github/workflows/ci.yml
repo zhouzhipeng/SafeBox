@@ -60,6 +60,16 @@ jobs:
         run: dart test test/live_remote_source_test.dart
       - name: Build Windows release
         run: flutter build windows --release --no-pub
+      - name: Package Windows release
+        shell: pwsh
+        run: Compress-Archive -Path 'build/windows/x64/runner/Release/*' -DestinationPath 'safebox-windows-x64.zip' -Force
+      - name: Upload Windows package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: safebox-windows-x64
+          path: safebox-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
 
   linux:
     name: Linux / protocol tests and release build
@@ -88,6 +98,15 @@ jobs:
           dart test test/sbox
       - name: Build Linux release
         run: flutter build linux --release --no-pub
+      - name: Package Linux release
+        run: tar -C build/linux/x64/release/bundle -czf safebox-linux-x64.tar.gz .
+      - name: Upload Linux package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: safebox-linux-x64
+          path: safebox-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 30
 
   apple:
     name: macOS and iOS / protocol tests and release builds
@@ -114,6 +133,32 @@ jobs:
         run: flutter build macos --release --no-pub
       - name: Build iOS release without signing
         run: flutter build ios --release --no-codesign --no-pub
+      - name: Package macOS release
+        shell: bash
+        run: |
+          app_path="$(find build/macos/Build/Products/Release -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$app_path"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "safebox-macos-${RUNNER_ARCH}.zip"
+      - name: Package unsigned iOS app
+        shell: bash
+        run: |
+          app_path="$(find build/ios/iphoneos -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$app_path"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" safebox-ios-unsigned.app.zip
+      - name: Upload macOS package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: safebox-macos-${{ runner.arch }}
+          path: safebox-macos-${{ runner.arch }}.zip
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload unsigned iOS package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: safebox-ios-unsigned
+          path: safebox-ios-unsigned.app.zip
+          if-no-files-found: error
+          retention-days: 30
 
   android:
     name: Android / protocol tests and release build
@@ -143,3 +188,76 @@ jobs:
           dart test test/sbox
       - name: Build Android release APK
         run: flutter build apk --release --no-pub
+      - name: Upload Android package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: safebox-android
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish rolling latest release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - vulnerability-scan
+      - windows
+      - linux
+      - apple
+      - android
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: latest
+    steps:
+      - name: Download platform packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: safebox-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          assets=(release-assets/*)
+          if ((${#assets[@]} == 0)); then
+            echo 'No release assets were downloaded.' >&2
+            exit 1
+          fi
+
+          release_notes="Automatically updated from main commit $GITHUB_SHA."
+          tag_ref="repos/$GITHUB_REPOSITORY/git/refs/tags/$RELEASE_TAG"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh api --method PATCH "$tag_ref" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+            mapfile -t old_assets < <(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            for old_asset in "${old_assets[@]}"; do
+              gh release delete-asset "$RELEASE_TAG" "$old_asset" --repo "$GITHUB_REPOSITORY" --yes
+            done
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title 'SafeBox latest (main)' \
+              --notes "$release_notes" \
+              --latest
+          else
+            if gh api "$tag_ref" >/dev/null 2>&1; then
+              gh api --method PATCH "$tag_ref" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+              gh release create "$RELEASE_TAG" "${assets[@]}" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title 'SafeBox latest (main)' \
+                --notes "$release_notes" \
+                --verify-tag \
+                --latest
+            else
+              gh release create "$RELEASE_TAG" "${assets[@]}" \
+                --repo "$GITHUB_REPOSITORY" \
+                --target "$GITHUB_SHA" \
+                --title 'SafeBox latest (main)' \
+                --notes "$release_notes" \
+                --latest
+            fi
+          fi
