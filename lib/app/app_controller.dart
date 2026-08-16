@@ -237,6 +237,7 @@ final class AppController extends ChangeNotifier {
   bool _cancellationRequested = false;
 
   bool get initialized => _initialized;
+  bool get isPreview => _previewMode;
   bool get hasIdentity => _identity != null || _previewRecipientKeyId != null;
   PublicIdentityRecord? get identity => _identity;
   String? get recipientKeyId => _identity == null

@@ -30,7 +30,9 @@ private final class AuthorizedDirectoryPlugin: NSObject, UIDocumentPickerDelegat
   private let worker = DispatchQueue(label: "com.zhouzhipeng.safebox.authorized-directory")
 
   static func register(with registry: FlutterPluginRegistry) {
-    let registrar = registry.registrar(forPlugin: "SafeBoxAuthorizedDirectoryPlugin")
+    guard let registrar = registry.registrar(forPlugin: "SafeBoxAuthorizedDirectoryPlugin") else {
+      return
+    }
     let instance = AuthorizedDirectoryPlugin()
     retainedInstance = instance
     FlutterMethodChannel(name: channelName, binaryMessenger: registrar.messenger())

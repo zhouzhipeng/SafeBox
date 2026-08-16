@@ -404,6 +404,7 @@ class _LibraryPageState extends State<LibraryPage> {
                   padding: const EdgeInsets.only(bottom: 11),
                   child: _CatalogRow(
                     entry: entry,
+                    useUtcForPreview: controller.isPreview,
                     onDecrypt: () => widget.onDecryptEntry(entry.entryId),
                     onEdit:
                         source.isWritable &&
@@ -615,7 +616,7 @@ class _SourceBar extends StatelessWidget {
           final lastSync = source.lastLocalSyncAt == null
               ? null
               : Text(
-                  '本地同步 ${DateFormat('MM-dd HH:mm').format(source.lastLocalSyncAt!.toLocal())}',
+                  '本地同步 ${DateFormat('MM-dd HH:mm').format(controller.isPreview ? source.lastLocalSyncAt!.toUtc() : source.lastLocalSyncAt!.toLocal())}',
                   style: Theme.of(context).textTheme.bodyMedium,
                 );
           if (constraints.maxWidth < 660) {
@@ -695,12 +696,14 @@ class _VerifiedSummary extends StatelessWidget {
 class _CatalogRow extends StatelessWidget {
   const _CatalogRow({
     required this.entry,
+    required this.useUtcForPreview,
     required this.onDecrypt,
     this.onEdit,
     this.onDelete,
   });
 
   final CatalogEntryViewData entry;
+  final bool useUtcForPreview;
   final VoidCallback onDecrypt;
   final VoidCallback? onEdit;
   final VoidCallback? onDelete;
@@ -773,7 +776,7 @@ class _CatalogRow extends StatelessWidget {
               const SizedBox(height: 5),
               Text(
                 '${_formatBytes(BigInt.parse(entry.plaintextSize))} · '
-                '${_formatTime(entry.updatedAt)} · revision ${entry.revision}',
+                '${_formatTime(entry.updatedAt, useUtc: useUtcForPreview)} · revision ${entry.revision}',
                 style: Theme.of(context).textTheme.bodyMedium,
               ),
             ],
@@ -1233,10 +1236,11 @@ Future<_CatalogMetadataEdit?> _showCatalogMetadataDialog(
   }
 }
 
-String _formatTime(String value) {
+String _formatTime(String value, {bool useUtc = false}) {
   try {
+    final parsed = DateTime.parse(value);
     return DateFormat('yyyy-MM-dd HH:mm')
-        .format(DateTime.parse(value).toLocal());
+        .format(useUtc ? parsed.toUtc() : parsed.toLocal());
   } catch (_) {
     return value;
   }
