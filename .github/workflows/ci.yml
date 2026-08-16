@@ -25,7 +25,9 @@ jobs:
       upload-sarif: false
       fail-on-vuln: true
     permissions:
+      actions: read
       contents: read
+      security-events: write
 
   windows:
     name: Windows / tests and release build
