@@ -151,8 +151,8 @@ class _LibraryPageState extends State<LibraryPage> {
     if (resolutions == null || !mounted) return;
     final mnemonic = await showMnemonicPrompt(
       context,
-      title: '应用冲突选择并重新签名',
-      actionLabel: '签名并条件提交',
+      title: '应用冲突选择并加密提交',
+      actionLabel: '加密并条件提交',
     );
     if (mnemonic == null || !mounted) return;
     try {
@@ -168,7 +168,7 @@ class _LibraryPageState extends State<LibraryPage> {
     if (edit == null || !mounted) return;
     final mnemonic = await showMnemonicPrompt(
       context,
-      title: '签名并加密 Catalog 修改',
+      title: '解锁并加密 Catalog 修改',
       actionLabel: '保存修改',
     );
     if (mnemonic == null || !mounted) return;
@@ -196,8 +196,8 @@ class _LibraryPageState extends State<LibraryPage> {
     if (!confirmed || !mounted) return;
     final mnemonic = await showMnemonicPrompt(
       context,
-      title: '签名并加密删除墓碑',
-      actionLabel: '签名并删除',
+      title: '解锁并加密删除墓碑',
+      actionLabel: '加密并删除',
     );
     if (mnemonic == null || !mounted) return;
     try {
@@ -234,7 +234,7 @@ class _LibraryPageState extends State<LibraryPage> {
       children: <Widget>[
         PageHeading(
           title: '资料库',
-          subtitle: '只展示通过 Catalog 解密与 Ed25519 签名验证的可信索引',
+          subtitle: '只展示通过 Catalog 解密与结构校验的可信索引；旧版 Ed25519 目录会额外验证',
           trailing: source == null
               ? null
               : ElevatedButton.icon(
@@ -321,8 +321,8 @@ class _LibraryPageState extends State<LibraryPage> {
                   File(
                     '${source.localSyncPath}${Platform.pathSeparator}catalog.sbox',
                   ).existsSync()
-                  ? 'catalog.sbox 已作为密文永久保存在本地。输入本次助记词后才能显示标题、说明和原始文件名。'
-                  : '首次“加密保存”会创建签名并加密的 catalog.sbox；也可以先从远端同步。',
+                  ? 'catalog.sbox 已作为密文永久保存在本地。没有匹配的明文缓存时，输入助记词才能显示标题、说明和原始文件名。'
+                  : '首次“加密保存”只用公钥创建加密的 catalog.sbox；也可以先从远端同步。',
               actions: <Widget>[
                 if (File(
                   '${source.localSyncPath}${Platform.pathSeparator}catalog.sbox',
@@ -907,7 +907,7 @@ class _LooseLibrary extends StatelessWidget {
       children: <Widget>[
         const SecurityNotice(
           title: '未编目本地 SBOX · 不受信索引',
-          message: '只显示公共头部信息。没有签名 Catalog 时不能显示原始文件名，也不能重组 content_kind = 4 的 multipart。',
+          message: '只显示公共头部信息。没有已认证 Catalog 时不能显示原始文件名，也不能重组 content_kind = 4 的 multipart。',
           warning: true,
         ),
         const SizedBox(height: 14),
@@ -991,7 +991,7 @@ String _operationLabel(AppOperation operation) => switch (operation) {
   AppOperation.unlockingCatalog => '正在解密并验证 Catalog',
   AppOperation.syncingObjects => '正在同步全部密文分片到本地',
   AppOperation.encrypting => '正在加密并本地提交',
-  AppOperation.updatingCatalog => '正在签名并加密 Catalog 修改',
+  AppOperation.updatingCatalog => '正在解锁并加密 Catalog 修改',
   AppOperation.uploading => '正在上传密文并条件提交 Catalog',
   AppOperation.decrypting => '正在认证、解密与重组',
   AppOperation.exporting => '正在通过系统选择器导出文件',

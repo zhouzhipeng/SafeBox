@@ -37,7 +37,12 @@ class _SourcesPageState extends State<SourcesPage> {
   Future<void> _test(SourceConfiguration source) async {
     try {
       await widget.controller.selectSource(source.sourceId);
-      await widget.controller.refreshSelectedSource();
+      await widget.controller.refreshSelectedSource(
+        verifyRemoteRepository: source.isRemote,
+        allowMissingRemoteCatalog:
+            source.provider == SourceProvider.github ||
+            source.provider == SourceProvider.gitee,
+      );
       if (!mounted ||
           source.localDirectoryMode == ConfiguredLocalMode.looseReadOnly) {
         return;

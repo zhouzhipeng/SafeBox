@@ -34,6 +34,10 @@ migrate_working_dir/
 /coverage/
 /test/failures/
 
+# SafeBox local plaintext Catalog cache (never upload or commit)
+**/.sbox-sync/catalog.json
+**/.sbox-sync/catalog.json.part
+
 # Symbolication related
 app.*.symbols
 

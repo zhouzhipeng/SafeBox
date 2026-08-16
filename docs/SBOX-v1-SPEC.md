@@ -9,14 +9,14 @@
 | 更新日期 | 2026-08-15 |
 | 密钥体系 | BIP39 12 词确定性 RSA-3072 |
 | 内容加密 | AES-256-GCM 分块认证加密 |
-| 目录认证 | Ed25519 签名的加密 `catalog.sbox` |
+| 目录认证 | 默认 RSA 公钥加密 + AES-256-GCM 认证；兼容 Ed25519 签名目录 |
 | 客户端技术栈 | 纯 Flutter + Dart（无自定义 Rust/FFI 密码核心） |
 | 一级支持平台 | Windows、macOS、Linux、Android、iOS |
 | 密钥留存策略 | 公钥可永久保存；助记词、RSA 私钥和 Ed25519 私钥不得持久化 |
 | 本地密文副本 | 每个数据源拥有可配置的本地同步目录，`.sbox` 密文原件允许永久保存 |
 | 云端依赖 | 可完全跳过；用户可直接挂载本地 SBOX 目录并离线使用 |
 | 临时明文 | 使用独立的临时解密目录，用户可随时执行“全部删除” |
-| 大文件存储 | 逻辑文件拆成多个独立 `.sbox` 分片，顺序与完整性信息写入加密签名 Catalog |
+| 大文件存储 | 逻辑文件拆成多个独立 `.sbox` 分片，顺序与完整性信息写入加密 Catalog |
 | 默认 SBOX 分片 | 每片承载 16 MiB 明文，即 `16,777,216` 字节；末片按剩余长度 |
 | 默认扩展名 | `.sbox` |
 
@@ -54,8 +54,8 @@ SBOX v1 用于将任意单个本地文件或直接输入的 UTF-8 文本转换�
 7. 协议解析必须有明确的长度上限和失败行为。
 8. Windows、macOS、Linux、Android 和 iOS 客户端必须产生互相兼容的密文与身份。
 9. 客户端可以从公开 GitHub、Gitee 等数据源匿名拉取密文目录和对象，并在获得最小写入授权后上传同步。
-10. `catalog.sbox` 在不公开目录内容的前提下，为随机命名的 SBOX 对象提供标题、说明、标签和版本索引。
-11. RSA 公钥、Ed25519 验证公钥和对应 Key ID 可以在本地永久保存；任何私钥材料只允许在当前 Flutter 应用进程的临时内存中存在，应用不得将其持久化，操作结束后应尽力覆盖可变缓冲区、释放引用并终止专用 Crypto Isolate。
+10. `catalog.sbox` 在不公开目录内容的前提下，为随机命名的 SBOX 对象提供标题、说明、标签和版本索引；新建目录只需要 RSA 公钥。
+11. RSA 公钥、Ed25519 验证公钥和对应 Key ID 可以在本地永久保存；任何私钥材料只允许在当前 Flutter 应用进程的临时内存中存在，应用不得将其持久化，操作结束后应尽力覆盖可变缓冲区、释放引用并终止专用 Crypto Isolate。加密保存、上传和同步已完成的公钥密文不得要求私钥。
 12. 每个数据源都可以同步到本地 SBOX 目录；完整的 `catalog.sbox` 和对象 `.sbox` 是可长期保留的密文原件，不属于可随意清除的应用缓存。
 13. 解密产生的临时明文必须与本地 SBOX 同步目录物理分离；用户能够查看其数量和占用空间，并选择一次性全部删除。
 14. 超过当前数据源有效分片明文上限的逻辑文件必须拆成多个独立 SBOX；Catalog 必须认证分片集合、顺序、偏移、每片哈希和重组后整体哈希。
@@ -104,15 +104,16 @@ SBOX v1 不提供以下能力：
 | 修改头部或记录 | AES-GCM 认证失败 |
 | 截断最后记录 | 缺少最终认证记录，整体失败 |
 | 重排或重复数据块 | 记录索引和最终清单不匹配，整体失败 |
-| 缺失、调换、重复或混入 SBOX 分片 | 签名 Catalog 清单、分片 Metadata、逐片摘要或整体摘要不匹配；不得发布任何部分明文 |
+| 缺失、调换、重复或混入 SBOX 分片 | 已认证 Catalog 清单、分片 Metadata、逐片摘要或整体摘要不匹配；不得发布任何部分明文 |
 | 替换为旧的合法 SBOX | 单个文件不能识别回滚，需要外部版本状态 |
 | 使用公钥构造新 SBOX | 可以构造，因此解密后的内容仍应视为不可信输入 |
-| 使用公钥伪造目录 | 目录内层 Ed25519 签名失败；不得显示为可信目录 |
+| 使用公钥构造新目录 | 新版 `public-key-only` Catalog 可以被任何公钥持有者构造；外层 GCM 可检测篡改但不能证明发布者，客户端必须显示“目录已认证但未签名”语义并依靠身份/哈希链/人工检查点防止误导 |
 | 回滚到旧的已签名目录 | 已见过更高代数的客户端报警；全新设备仍无法独立识别回滚 |
 | 并发更新同一目录 | 远端条件写入失败，客户端重新拉取、合并或要求用户处理冲突 |
-| 窃取数据源写入令牌 | 可删除、回滚或上传密文，但没有 Catalog 签名私钥时不能发布可信的新目录；可用性仍可能受损 |
+| 窃取数据源写入令牌 | 可删除、回滚或上传密文；公钥目录模式下还可发布可解密但未经发布者签名的新目录，因此客户端必须保留 generation/哈希检查并提示用户核对；可用性仍可能受损 |
 | 读取本地身份记录或 SBOX 同步目录 | 只能取得公钥、Key ID、密文和公开配置，不能取得助记词或私钥 |
 | 读取尚未清理的临时解密目录 | 可以直接取得其中的明文；该目录必须受文件权限保护并允许用户全部删除，但普通删除不保证物理不可恢复 |
+| 读取用户允许保留的 `.sbox-sync/catalog.json` | 可以取得 Catalog 标题、说明、原始文件名、标签和对象索引，但不能取得文件明文；该缓存必须明确标注为本地明文并且不得上传 |
 | 窃取助记词或私钥 | 对应身份的全部历史公开密文可能失密 |
 
 ## 5. 固定密码套件
@@ -136,7 +137,7 @@ SBOX v1 只定义一个规范密码套件。实现不得静默降级。
 | 目录签名 | Ed25519（RFC 8032），签名密钥由同一 BIP39 Seed 域分离派生 |
 | 目录规范 JSON | JSON Canonicalization Scheme（RFC 8785） |
 | 默认明文分块 | 4 MiB，即 `4,194,304` 字节 |
-| 大文件外层分片 | 默认每片 16 MiB 明文；多个独立完整 SBOX 容器，集合、顺序和摘要由签名 Catalog 的 multipart payload 认证 |
+| 大文件外层分片 | 默认每片 16 MiB 明文；多个独立完整 SBOX 容器，集合、顺序和摘要由已认证 Catalog 的 multipart payload 保护 |
 
 相关标准包括 [BIP39](https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki)、[RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html)、[NIST SP 800-90A Rev.1](https://csrc.nist.gov/pubs/sp/800/90/a/r1/final)、[FIPS 186-5](https://csrc.nist.gov/pubs/fips/186-5/final)、[RFC 8017](https://www.rfc-editor.org/rfc/rfc8017.html)、[RFC 8032](https://www.rfc-editor.org/rfc/rfc8032.html)、[RFC 8785](https://www.rfc-editor.org/rfc/rfc8785.html) 和 [NIST SP 800-38D](https://csrc.nist.gov/pubs/sp/800/38/d/final)。
 
@@ -311,7 +312,7 @@ Windows DPAPI、macOS/iOS Keychain、Android Keystore 和 Linux Secret Service �
 
 1. 要求用户重新输入完整 12 词助记词；
 2. 在本次解密专用的 Crypto Isolate 中临时派生 RSA 私钥，并将所得公钥和 `recipient_key_id` 与本地永久公钥及目标 SBOX 头部同时比对；
-3. 单对象使用 RSA 私钥执行一次 OAEP 解封；multipart 逻辑文件则在同一次前台操作中只对签名 Catalog 清单列出的全部分片逐一解封，每片取得独立 32 字节 DEK；
+3. 单对象使用 RSA 私钥执行一次 OAEP 解封；multipart 逻辑文件则在同一次前台操作中只对已认证 Catalog 清单列出的全部分片逐一解封，每片取得独立 32 字节 DEK；
 4. 当前逻辑文件所需的全部 OAEP 解封结束后立即释放 RSA 私钥及 `p/q/d/CRT`、PKCS#8 和模幂中间对象的应用引用，并尽力覆盖实现可控制的 `Uint8List` 缓冲区；不得把 RSA 私钥留给下一逻辑文件。Dart VM 可能保留不可控副本，因此本规范不声称确定性物理清零；
 5. 随后的 AES-256-GCM 解密只继续使用一个 DEK 或有上限的分片 DEK 数组；每片 Final 验证后尽力覆盖对应 DEK，整个逻辑文件完成、失败或取消后覆盖其余 DEK 与明文缓冲区并终止本次 Crypto Isolate；
 6. 清空助记词 UI 控件和其可控副本，不得提供“记住助记词”“保持解锁”或“一段时间内免输入”选项；应用进入后台时必须取消私钥任务、删除未发布明文暂存文件并终止对应 Crypto Isolate。
@@ -322,7 +323,7 @@ Windows DPAPI、macOS/iOS Keychain、Android Keystore 和 Linux Secret Service �
 
 ### 6.7 Catalog 签名子密钥
 
-普通 SBOX 只提供机密性和完整性，不证明创建者身份。因为任何持有 RSA 公钥的人都可以生成一份可被接收者解密的 SBOX，所以 `catalog.sbox` 必须增加只有助记词持有者能够生成的签名。
+普通 SBOX 只提供机密性和完整性，不证明创建者身份。`catalog.sbox` 默认沿用这一公钥加密语义，保证加密保存不需要私钥；需要发布者真实性时，可以额外使用只有助记词持有者能够生成的 Ed25519 签名模式。
 
 从第 6.2 节的 `bip39_seed` 派生 Ed25519 私钥种子：
 
@@ -346,8 +347,8 @@ catalog_signer_key_id = SHA-256(ed25519_public_key_raw_32)
 - RSA 接收密钥和 Ed25519 目录签名密钥必须使用不同的 HKDF 域，任何实现不得复用 RSA 私钥执行目录签名；
 - Ed25519 私钥种子不得持久化。创建或修改 Catalog 时从用户本次输入的助记词临时派生，只用于当前前台签名；签名后应尽力覆盖可变缓冲区、释放引用，并在操作结束时终止 Crypto Isolate；
 - 恢复身份时必须同时重建 RSA 和 Ed25519 密钥，并分别核对两个 Key ID；
-- 普通文件加密仍只需要 RSA 公钥；只有创建或修改可信目录需要目录签名私钥；
-- 若本地身份缺少匹配的签名公钥，客户端可以把 `catalog.sbox` 作为普通加密文件解密，但不得把它标记为“目录已验证”。
+- 普通文件和 `catalog.sbox` 加密默认只需要 RSA 公钥；只有解密已有目录、处理冲突，或选择 Ed25519 发布者签名模式时才临时使用目录签名私钥；
+- 若本地身份缺少匹配的签名公钥，客户端仍可以按 `public-key-only` 模式解密并验证目录结构，但不得把它标记为“Ed25519 签名可信”。
 
 ## 7. 每文件密钥与 RSA-OAEP
 
@@ -414,7 +415,7 @@ SBOX v1 固定头部总长为 468 字节。
 | 9 | 1 | `version_minor` | `0` |
 | 10 | 2 | `header_len` | `468` |
 | 12 | 4 | `flags` | 必须为 `0` |
-| 16 | 2 | `key_profile_id` | `1` = BIP39-12 / deterministic RSA-3072 + Catalog Ed25519 v1 |
+| 16 | 2 | `key_profile_id` | `1` = BIP39-12 / deterministic RSA-3072 + Catalog authentication v1 (Ed25519 compatibility) |
 | 18 | 2 | `key_wrap_alg` | `1` = RSA-OAEP-SHA256-MGF1SHA256 |
 | 20 | 2 | `payload_alg` | `1` = AES-256-GCM chunked |
 | 22 | 2 | `reserved0` | 必须为 `0` |
@@ -534,7 +535,7 @@ Metadata 记录的明文格式如下：
 - `part_index < part_count`，`original_size > 0`，且 `plaintext_offset + original_size <= logical_plaintext_size`；
 - 同一逻辑 revision 的所有分片必须具有相同 `multipart_id`、`part_count`、`logical_plaintext_size`、`original_name` 和 `media_type`；
 - `part_index = 0` 时 `plaintext_offset = 0`；后续偏移必须等于之前所有分片 `original_size` 之和，最后一个分片的结束偏移必须等于 `logical_plaintext_size`；
-- 分片本身不得作为完整文件直接发布。没有经过签名 Catalog 清单验证的 `content_kind = 4` 文件只能显示为“未关联 SBOX 分片”，不能自动重组或导出为原文件；
+- 分片本身不得作为完整文件直接发布。没有经过已认证 Catalog 清单验证的 `content_kind = 4` 文件只能显示为“未关联 SBOX 分片”，不能自动重组或导出为原文件；
 - `multipart_id`、索引、偏移和逻辑大小位于 GCM 认证的 Metadata 内部，不会以明文暴露在 SBOX 外部文件名中。
 
 ### 8.5 数据记录
@@ -703,7 +704,7 @@ original_name = "catalog.json"
 media_type = "application/vnd.sbox.catalog+json"
 ```
 
-Catalog 的明文负载是 UTF-8 JSON。目录本身通过 RSA-OAEP + AES-256-GCM 保密，再通过第 6.7 节的 Ed25519 子密钥证明目录由助记词持有者发布。公开仓库只能看到 `catalog.sbox`、随机对象路径、密文大小和提交历史，不能看到标题、说明、原始文件名或标签。
+Catalog 的明文负载是 UTF-8 JSON。目录本身始终通过 RSA-OAEP + AES-256-GCM 保密和认证。新建或普通“加密保存”默认使用 `public-key-only` 目录模式，只需 RSA 公钥；该模式不声称证明发布者身份。实现必须兼容读取旧版 `Ed25519` 目录模式，只有该模式才提供助记词持有者的发布者签名证明。公开仓库只能看到 `catalog.sbox`、随机对象路径、密文大小和提交历史，不能看到标题、说明、原始文件名或标签。
 
 每次更新 Catalog 必须像普通文件一样重新生成 DEK、`file_id`、`nonce_prefix` 和 OAEP 随机值。不得复用上一版 Catalog 的 DEK 或 Nonce。
 
@@ -777,13 +778,13 @@ Catalog 的明文负载是 UTF-8 JSON。目录本身通过 RSA-OAEP + AES-256-GC
     "tombstones": []
   },
   "signature": {
-    "algorithm": "Ed25519",
-    "value": "base64url-without-padding"
+    "algorithm": "public-key-only",
+    "value": ""
   }
 }
 ```
 
-上例只展示语义，缩写哈希和签名不是测试向量，不得用于解析器测试。
+上例展示默认的公钥加密目录模式；兼容旧版时 `algorithm` 为 `Ed25519`，`value` 为 Base64URL 无填充签名。缩写哈希和签名不是测试向量，不得用于解析器测试。
 
 小文件或文本使用相同的 payload 结构，但固定为一个 part，例如：
 
@@ -868,7 +869,20 @@ Catalog 的明文负载是 UTF-8 JSON。目录本身通过 RSA-OAEP + AES-256-GC
 
 SBOX v1 默认永久保留墓碑；实现可以提供显式“压缩目录”，但必须警告长期离线设备可能重新引入已删除条目。
 
-### 12.4 目录签名
+### 12.4 目录认证模式
+
+`signature.algorithm` 必须是下列值之一：
+
+| 值 | `signature.value` | 用途 | 是否需要私钥 |
+|---|---|---|---|
+| `public-key-only` | 必须是空字符串 `""` | 新建/保存目录的默认模式；只有 RSA 公钥即可生成 | 否 |
+| `Ed25519` | Base64URL 无填充的 64 字节签名 | 兼容旧版可信目录和需要发布者签名的显式模式 | 是，临时 |
+
+两种模式都必须先通过外层 SBOX 的 RSA-OAEP 解封和 AES-256-GCM 全部认证，再验证 Catalog JSON、身份字段、分片清单、generation 与哈希链。`public-key-only` 模式只能证明“这是一份可由当前 RSA 私钥解密、且容器未被修改的目录”；任何知道 RSA 公钥的人都能构造另一份可解密目录，因此不能替代发布者签名。客户端 UI 必须避免把它显示为“Ed25519 签名有效”，可显示“目录已认证”并在能识别模式时追加“未签名”。
+
+新建目录或加密保存文件时，调用方必须使用公钥生成随机 DEK、RSA-OAEP 包装和 AES-256-GCM 容器，不得因为目录负载而要求用户输入助记词。若本地已经存在加密 `catalog.sbox`，调用方可以在本次会话中复用已经解锁的 Catalog 明文快照；没有快照时，必须先执行一次目录解密，临时取得私钥后再追加条目。解锁、冲突合并和文件解密完成后必须按第 6 节清理私钥引用。
+
+#### 12.4.1 Ed25519 兼容签名
 
 签名输入为：
 
@@ -884,20 +898,20 @@ signature.value = BASE64URL_NOPAD(
 )
 ```
 
-生成 Catalog 签名时必须要求用户在当前前台操作中输入助记词，临时派生并核对 Ed25519 公钥。`Ed25519.Sign` 返回后必须清空助记词控件，尽力覆盖 `catalog_sign_seed`、BIP39 Seed 等可变缓冲区并释放 Ed25519 私钥对象引用；不得把签名私钥留到上传或条件提交阶段。签名后的 Catalog JSON 和加密后的 `catalog.sbox` 可以在终止 Crypto Isolate 后继续上传和重试。
+仅在选择 `Ed25519` 兼容模式时，生成 Catalog 签名才必须要求用户在当前前台操作中输入助记词，临时派生并核对 Ed25519 公钥。`Ed25519.Sign` 返回后必须清空助记词控件，尽力覆盖 `catalog_sign_seed`、BIP39 Seed 等可变缓冲区并释放 Ed25519 私钥对象引用；不得把签名私钥留到上传或条件提交阶段。签名后的 Catalog JSON 和加密后的 `catalog.sbox` 可以在终止 Crypto Isolate 后继续上传和重试。`public-key-only` 模式不得生成伪造的 Ed25519 值，必须使用空字符串签名值。
 
 验证器必须：
 
 1. 先完成外层 SBOX 的全部 GCM、Final 和 EOF 验证；
 2. 按 UTF-8 严格模式解析 JSON，拒绝重复对象键、无效 Unicode 和非整数 `generation/revision`；
 3. 要求顶层恰好包含 `catalog` 和 `signature`，且 `signature` 恰好包含 `algorithm` 和 `value`；
-4. 要求 `algorithm = "Ed25519"`，并以严格 Base64URL 无填充形式解码 `value` 为恰好 64 字节；
-5. 从本地身份记录取得预期 Ed25519 公钥，不得信任 Catalog 自带或远端提供的新公钥；
-6. 核对 `recipient_key_id`、`signer_key_id` 和已固定的 `catalog_id`；
-7. 对 `catalog` 成员重新执行 RFC 8785 规范化并验证 Ed25519 签名；
-8. 只有全部通过后才在 UI 中显示标题、说明、原始文件名和“目录已验证”。
+4. 若 `algorithm = "Ed25519"`，以严格 Base64URL 无填充形式解码 `value` 为恰好 64 字节；
+5. 若 `algorithm = "public-key-only"`，要求 `value = ""`，不得尝试把空值当作签名；
+6. 从本地身份记录取得预期 RSA/Ed25519 公钥，不得信任 Catalog 自带或远端提供的新公钥；
+7. 核对 `recipient_key_id`、`signer_key_id` 和已固定的 `catalog_id`；Ed25519 模式还要对 `catalog` 成员重新执行 RFC 8785 规范化并验证签名；
+8. 只有全部通过后才在 UI 中显示标题、说明、原始文件名和目录认证状态；public-only 必须标注“未签名”。
 
-外层 GCM 保护传输完整性；内层签名防止只持有公开 RSA 公钥的人伪造目录。两者缺一不可。
+外层 GCM 保护容器内明文的完整性。只有 Ed25519 模式还能防止只持有公开 RSA 公钥的人伪造目录；public-only 模式的发布者真实性必须由外部检查点、可信仓库权限或用户人工核对补足。
 
 ### 12.5 版本、回滚与分叉
 
@@ -917,6 +931,25 @@ last_provider_revision
 - 当数据源声明 `history` 能力时，客户端可以按提供方提交历史回取受限数量的中间 Catalog 并逐代验证签名和哈希链；历史解析失败不得降低为无警告接受；
 - 全新设备没有本地最高值，因此无法仅凭签名识别一个旧但合法的 Catalog；这是 v1 的已知限制；
 - 时间戳、Git 提交时间、HTTP `Last-Modified` 和设备时钟不得用于自动解决冲突。
+
+### 12.6 本地 Catalog 明文缓存
+
+用户明确允许时，客户端必须允许把成功解锁后的 Catalog 明文永久缓存到当前本地同步目录的：
+
+```text
+<LocalCipherRoot>/.sbox-sync/catalog.json
+```
+
+该文件使用 `SBOX-CATALOG-CACHE-1` 包装，至少包含 `format`、当前 `catalog.sbox` 二进制的 `catalog_sha256` 和 `catalog` 对象。它不是远端协议文件、不是临时解密文件，也不得进入 GitHub、Gitee、HTTPS 或其他数据源的上传计划；应用不得因退到后台、重启、同步完成或“全部删除临时明文”而自动删除它。缓存可包含标题、说明、原始文件名和标签，UI 必须明确提示这是用户选择保留的本地明文。
+
+应用启动、切换数据源或加密保存前可以读取该缓存，但只有同时满足以下条件才可使用：
+
+1. `catalog_sha256` 与当前本地 `catalog.sbox` 的完整 SHA-256 一致；
+2. `recipient_key_id`、`signer_key_id` 和已绑定的 `catalog_id` 与当前公开身份/数据源配置一致；
+3. 若数据源已有 `last_catalog_sha256`/`pending_catalog_sha256` 或最高 generation 检查点，缓存也必须与该检查点一致或不低于其 generation；
+4. JSON、Catalog 字段、上限和哈希链验证全部通过。
+
+任一条件不满足时，缓存必须视为过期并忽略，不能用它覆盖新的 `catalog.sbox`，也不得据此展示目录条目；原文件可以留在本地供用户检查或手工删除。成功解锁或提交新 Catalog 后，客户端应使用新密文 SHA-256 原子替换该缓存。缓存只用于读取已有目录明文，不包含助记词、RSA 私钥、Ed25519 私钥或 DEK。
 
 ## 13. 数据源与同步协议
 
@@ -1050,7 +1083,7 @@ Catalog 不得保存提供方返回的临时 `download_url`、带签名 URL、�
 
 本地同步目录规则：
 
-- `catalog.sbox` 和 `objects/**/*.sbox` 必须保持与远端规范路径一致；目录中不得保存明文 Catalog、原始文件名映射、助记词、私钥、DEK、OAuth 令牌或临时解密文件；
+- `catalog.sbox` 和 `objects/**/*.sbox` 必须保持与远端规范路径一致；远端规范路径中不得保存明文 Catalog。用户允许的本地明文缓存只能位于 `.sbox-sync/catalog.json`，不得保存助记词、私钥、DEK、OAuth 令牌或临时解密文件；
 - `.sbox-staging/` 只允许保存当前加密事务生成的密文 `.part`；分片集合和提交状态在事务完成前只存在于受控进程状态，不得写入包含原始文件名、明文哈希或明文 Catalog 的 sidecar。该目录不属于远端布局，不得上传，也不属于“临时解密文件”清理范围；
 - 已完整下载、创建或验证的 `.sbox` 是**永久密文原件**而不是缓存。应用升级、退出、普通“清理缓存”和“清空临时解密文件”都不得删除它们；
 - 新建和下载必须先写入同一文件系统中的随机 `.part` 文件，完成长度与 SHA-256 检查、Flush 和关闭后再原子重命名为规范 `.sbox` 路径；崩溃遗留的 `.part` 可以在确认不被任务使用后清理；
@@ -1068,10 +1101,10 @@ Catalog 不得保存提供方返回的临时 `download_url`、带签名 URL、�
 
 1. 获取用户明确选择的目录授权，解析稳定目录身份，并执行与 `ManagedTemporaryPlaintextRoot` 的同路径、父子路径、符号链接和重解析点边界检查；
 2. 首次检查只能读取，不得移动、重命名、删除、整理或创建任何文件，也不得发起 DNS、HTTP、OAuth 或遥测请求；
-3. 若根目录存在名称完全为 `catalog.sbox` 的普通文件，则进入 `canonical_catalog` 候选模式。客户端先验证 SBOX 公共头部和大小；用户输入助记词后，再按第 10、12 节验证外层认证、Catalog 签名、身份与全部对象路径；
-4. 有 `catalog.sbox` 但其格式、身份或签名无效时必须停止并显示目录错误，不得静默降级为散装扫描，因为降级会绕过可信目录与回滚检查；用户可以从单独的诊断入口显式选择只读原始扫描，但结果不得标记为可信资料库；
-5. 若根目录没有 `catalog.sbox`，则以 `loose_read_only` 模式扫描候选 `.sbox`。该模式不创建 Catalog、不修改目录，也不把扫描结果当作已签名目录；
-6. 成功挂载后可以永久保存目录路径或平台目录授权引用、公开 Key ID、扫描统计和模式，但不得保存解密后的 Catalog、原始文件名映射、助记词、私钥或 DEK；
+3. 若根目录存在名称完全为 `catalog.sbox` 的普通文件，则进入 `canonical_catalog` 候选模式。客户端先验证 SBOX 公共头部和大小；用户输入助记词后，再按第 10、12 节验证外层认证、Catalog 认证模式、身份与全部对象路径；
+4. 有 `catalog.sbox` 但其格式、身份或认证无效时必须停止并显示目录错误，不得静默降级为散装扫描，因为降级会绕过可信目录与回滚检查；用户可以从单独的诊断入口显式选择只读原始扫描，但结果不得标记为可信资料库；
+5. 若根目录没有 `catalog.sbox`，则以 `loose_read_only` 模式扫描候选 `.sbox`。该模式不创建 Catalog、不修改目录，也不把扫描结果当作已认证目录；
+6. 成功挂载后可以永久保存目录路径或平台目录授权引用、公开 Key ID、扫描统计和模式；若用户允许，可额外保存经过第 12.6 节绑定校验的明文 Catalog 缓存，但不得保存助记词、私钥或 DEK；
 7. 应用重启后可以重新挂载仍有效的本地授权。授权失效时显示“重新选择目录”，不得悄悄复制文件到应用缓存或改为云端模式。
 
 散装目录扫描规则：
@@ -1082,7 +1115,7 @@ Catalog 不得保存提供方返回的临时 `download_url`、带签名 URL、�
 - 相同 `file_id` 出现多次且完整 SHA-256 相同时可以折叠为重复副本；相同 `file_id` 但哈希不同时必须报告冲突并禁止自动选择；
 - 从扫描列表实际打开候选时必须使用 no-follow 或等价安全句柄，并重新核对目录边界、普通文件类型、平台文件身份、长度和公共头部；扫描后被替换的路径不得沿用旧检查结果；
 - 对候选文件执行解密后，只有 `content_kind = 1` 或 `2` 的独立 single SBOX 可以按第 10 节发布临时明文；`content_kind = 3` 只能作为未绑定 Catalog 诊断，不能自动接管当前目录；
-- `content_kind = 4` 是 multipart 分片。即使同一目录看似包含全部分片，也必须要求对应且签名有效的 `catalog.sbox`，不得根据文件名、扫描顺序或 Metadata 猜测分片集合并重组；
+- `content_kind = 4` 是 multipart 分片。即使同一目录看似包含全部分片，也必须要求对应且已认证的 `catalog.sbox`，不得根据文件名、扫描顺序或 Metadata 猜测分片集合并重组；
 - `loose_read_only` 不能作为“加密保存”目标。用户若要在该位置继续写入，必须明确选择一个空目录初始化规范本地 Catalog，或选择新的规范子目录；客户端不得就地移动或自动收编散装文件。
 
 `canonical_catalog` 本地源不执行“拉取/上传”；对应 UI 操作名称为“刷新目录”和“校验本地密文”。只读源可以离线加载与解密；可写源可以按与远端相同的对象先行、Catalog 后置规则本地提交，但不产生任何网络队列。
@@ -1093,8 +1126,8 @@ Catalog 不得保存提供方返回的临时 `download_url`、带签名 URL、�
 
 1. 根据数据源配置读取 `<prefix>/catalog.sbox` 的 ETag、blob SHA 或提供方版本；本地副本版本一致时直接复用，否则流式下载到本地同步目录的 `.part` 文件；
 2. 在下载过程中流式计算 SHA-256，并执行最大 20 MiB 的 Catalog 密文上限；完整后原子更新本地 `catalog.sbox`，即使当前没有助记词也可把它作为“尚未验证的密文副本”永久保存；
-3. 按第 10、12 节解密并验证外层容器、内层签名、身份、代数和本地回滚状态；
-4. Catalog 有效后才刷新资料库列表；不得持久化明文 Catalog 缓存，只永久保存原始加密 `catalog.sbox` 和不含标题/文件名的对象同步计划；
+3. 按第 10、12 节解密并验证外层容器、目录认证模式、身份、代数和本地回滚状态；
+4. Catalog 有效后才刷新资料库列表；可按第 12.6 节持久化用户允许的明文 Catalog 缓存，但远端同步计划只能保存原始加密 `catalog.sbox` 和不含标题/文件名的对象状态；
 5. 根据已验证 Catalog 展开所有活动条目的 `payload.parts`，建立 `full_ciphertext` 同步计划。若本地分片对象缺失，则验证其 `object_path` 后流式下载到本地同步目录，并计算该 part 的 `sbox_sha256`；
 6. 每个单对象或分片完成 `sbox_sha256`、`sbox_size`、SBOX 头部 `file_id` 和 `recipient_key_id` 检查后原子发布为本地永久 `.sbox`；同步中断只删除或保留可安全重试的 `.part`，不得损坏既有原件；
 7. 用户选择解密时必须读取 `payload.parts` 列出的全部本地永久 `.sbox`；远端镜像缺少对象时先继续同步，纯本地源缺少对象时报告缺失且不得到目录外搜索替代品；single 进入第 10 节，multipart 进入第 10.1 节；
@@ -1107,7 +1140,7 @@ Catalog 不得保存提供方返回的临时 `download_url`、带签名 URL、�
 
 初始化空数据源必须由用户显式确认，并使用“仅当不存在时创建”语义发布 generation 1。若创建时发现 `catalog.sbox` 已出现，必须停止、拉取并验证新文件，不能把初始化结果覆盖上去。
 
-发布或修改 Catalog 是私钥操作，必须在前台要求用户输入助记词。可以由同一次输入在专用 Crypto Isolate 中派生本次所需的 RSA 私钥和 Ed25519 签名种子；完成解封与签名后必须尽力覆盖可变秘密缓冲区、释放私钥引用并终止该 Isolate。私钥材料不得进入上传队列，上传队列只可保存已经签名并加密完成的 `catalog.sbox`。
+发布或修改 Catalog 默认是公钥操作：加密保存文件、初始化 generation 1、上传已完成密文和重试上传不得要求用户输入助记词。应用使用 `public-key-only` 模式生成随机 DEK、RSA-OAEP 封装和 AES-256-GCM `catalog.sbox`；上传队列只可保存已经加密完成的 Catalog。只有读取已有 Catalog、处理远端并发冲突，或用户明确选择兼容的 `Ed25519` 发布者签名模式时，才在前台临时输入助记词并在一次性 Crypto Isolate 中派生 RSA/Ed25519 私钥。完成解密、合并或签名后必须尽力覆盖可变秘密缓冲区、释放私钥引用并终止该 Isolate。
 
 规范远端上传必须遵循“对象先行，Catalog 后置”的顺序：
 
@@ -1117,14 +1150,14 @@ Catalog 不得保存提供方返回的临时 `download_url`、带签名 URL、�
 4. 下载、解密并验证当前 Catalog；
 5. 从本地同步目录将新 payload 的全部对象上传到各自规范、不可变的 `parts[].object_path`；可以有限并发，任一路径已存在时只能在完整哈希相同时视为幂等成功；
 6. 在内存中应用目录变更，增加条目 `revision` 和 Catalog `generation`，并填写前一 Catalog SHA-256；
-7. 规范化、签名并重新加密新的 `catalog.sbox`；
+7. 按当前目录认证模式规范化并重新加密新的 `catalog.sbox`；新建/默认保存使用 `public-key-only`，兼容签名模式才执行 Ed25519 签名；
 8. 使用第 3 步的版本令牌执行条件更新；
 9. 条件更新成功后，将新 `catalog.sbox` 原子写入本地同步目录，并保存新的提供方版本、Catalog 哈希、最高代数和本地同步时间；
 10. 条件更新失败时，不得覆盖远端；进入第 13.6 节冲突处理。
 
 部分或全部对象上传成功而 Catalog 更新失败时会留下孤立密文，这是安全且可恢复的失败模式。本地永久 `.sbox` 原件、完整 multipart 清单和上传任务必须保留，客户端可以在后续成功提交时复用哈希一致的分片，但不得提交引用尚未成功上传分片的 Catalog，也不得在不确定是否被其他目录版本引用时自动删除对象。
 
-可写 `canonical_catalog` 本地源执行相同的对象先行语义，但省略远端读取、上传和网络队列：客户端先取得目录级排他写锁，读取并验证锁内当前 `catalog.sbox` 哈希，在同一文件系统提交全部新对象，生成并签名新 Catalog，最后以暂存文件原子替换 `catalog.sbox`。替换前若 Catalog 哈希已经变化，必须停止并进入本地冲突处理；不得以“只有本机”作为覆盖并发进程或云盘同步程序更改的理由。
+可写 `canonical_catalog` 本地源执行相同的对象先行语义，但省略远端读取、上传和网络队列：客户端先取得目录级排他写锁，读取并验证锁内当前 `catalog.sbox` 哈希，在同一文件系统提交全部新对象，按当前认证模式生成并加密新 Catalog，最后以暂存文件原子替换 `catalog.sbox`。替换前若 Catalog 哈希已经变化，必须停止并进入本地冲突处理；不得以“只有本机”作为覆盖并发进程或云盘同步程序更改的理由。
 
 ### 13.6 并发合并与冲突
 
@@ -1138,7 +1171,7 @@ Catalog 不得保存提供方返回的临时 `download_url`、带签名 URL、�
 - 一端删除、另一端修改同一 `entry_id`：必须由用户选择“保留修改”或“确认删除”；
 - 同一 `entry_id`、同一 revision 但内容不同：视为目录分叉，不得自动接受；
 - `payload` 是不可分割的原子值；合并器不得把两个 revision 的 `parts` 子集合拼成一个新 multipart，也不得只接受某些分片的更新；
-- 合并后以最新远端 Catalog 为父版本，重新增加 `generation`、重新签名和重新加密，再做一次条件提交。
+- 合并后以最新远端 Catalog 为父版本，重新增加 `generation`，按当前认证模式重新加密（兼容签名模式才重新签名），再做一次条件提交。
 
 实现必须限制自动重试次数并加入随机退避，避免多设备持续争抢 Catalog。外部 UI 应明确区分网络错误、授权失效、提供方限流和真正的目录冲突。
 
@@ -1173,8 +1206,8 @@ v1 必须遵守：
 - 取消下载、上传或应用进入后台不会改变已验证的远端 Catalog，也不得删除已完成的本地 `.sbox` 原件；未完成 `.part` 必须清理或以不含秘密的任务状态等待重试；
 - v1 原生客户端应保证前台可靠同步；移动后台同步受 Android/iOS 调度限制，不得承诺固定完成时间；
 - 后台任务可以下载、哈希并缓存密文 Catalog，但没有助记词时不能解密或把它标记为已验证；生物识别只能保护数据源令牌或确认 UI 操作，不能替代助记词产生 SBOX 私钥；
-- 已在前台完成签名和加密的 Catalog 可以在私钥 Crypto Isolate 终止后继续后台上传。若条件提交发生冲突，后台必须停止，等待用户回到前台重新输入助记词、解密最新 Catalog、合并并重新签名；
-- 自动同步在锁定状态可以拉取密文 Catalog，并可按最后一次可信对象路径清单补齐本地 `.sbox`；发现新 Catalog 后必须等待用户解锁验证，才能生成新增对象的完整同步计划。自动上传只能处理本地同步目录中已经完成的密文对象或已签名 Catalog，必须由用户明确启用，并遵守“仅 Wi-Fi / 任意网络 / 手动”策略；
+- 已在前台完成公钥加密（或兼容签名）且没有待解密内容的 Catalog 可以在 Crypto Isolate 终止后继续后台上传。若条件提交发生冲突，后台必须停止，等待用户回到前台临时解锁最新 Catalog、合并并按当前模式重新加密；
+- 自动同步在锁定状态可以拉取密文 Catalog，并可按最后一次可信对象路径清单补齐本地 `.sbox`；发现新 Catalog 后必须等待用户解锁认证，才能生成新增对象的完整同步计划。自动上传只能处理本地同步目录中已经完成的密文对象或已加密 Catalog，必须由用户明确启用，并遵守“仅 Wi-Fi / 任意网络 / 手动”策略；
 - 计量网络、漫游和低电量状态应在开始大对象传输前提示。
 
 ## 14. 纯 Flutter + Dart 跨平台技术架构
@@ -1282,11 +1315,13 @@ Android Storage Access Framework 会返回 `content://` URI，并可连接本地
 LocalCipherRoot/                    # 用户选择；永久密文，可参与系统/云盘备份
 └─ <source_id>/
    ├─ .sbox-staging/
+   ├─ .sbox-sync/catalog.json    # 可选、用户允许保留的明文 Catalog 缓存
    ├─ catalog.sbox
    └─ objects/**/*.sbox
 
 <direct_local_source_root>/         # provider=local 时用户直接选择；不增加 source_id 层
 ├─ .sbox-staging/
+├─ .sbox-sync/catalog.json       # 可选、用户允许保留的明文 Catalog 缓存
 ├─ catalog.sbox                     # canonical_catalog 模式
 └─ objects/**/*.sbox
 
@@ -1445,7 +1480,7 @@ SafeBox
 
 用户选择“暂不配置云端”后，应用不得在每次启动、加密或解密时弹出强制云端引导；云端入口只保留在资料库空状态的次级操作和数据源页面，除非用户主动打开。
 
-Catalog 字符串必须按纯文本渲染，不得解释为 HTML、Markdown、富文本、命令或可自动打开的 URL。资料库不得把解密后的 Catalog 作为普通 JSON 持久化。应用切换器快照、通知和桌面最近项目列表默认不得包含 Catalog 标题或原始文件名。
+Catalog 字符串必须按纯文本渲染，不得解释为 HTML、Markdown、富文本、命令或可自动打开的 URL。资料库只能把解密后的 Catalog 持久化为第 12.6 节定义的本地缓存，不得写入其他普通 JSON、应用切换器快照、通知或桌面最近项目列表；这些 UI 状态默认不得包含 Catalog 标题或原始文件名。
 
 ### 15.3 加密主界面
 
@@ -1518,7 +1553,7 @@ Catalog 字符串必须按纯文本渲染，不得解释为 HTML、Markdown、�
 - “本地 SBOX 目录”必须排在云端类型之前，并明确标注“不需要账号 · 完全离线”；
 - 本地源显示目录、`canonical_catalog`/`loose_read_only` 模式、授权状态和读写模式；远端源才显示仓库 owner/name、分支和目录前缀；
 - 远端源的公开匿名读取与授权写入必须显示为独立状态，不得用一个“已登录”状态混淆；本地源只显示文件系统授权；
-- 远端源提供“测试连接”，依次验证仓库可读、Catalog 可下载、SBOX 可解密、目录签名正确及可选写入权限；本地源使用“刷新目录”和“校验本地密文”，不得显示网络连接测试；
+- 远端源提供“测试连接”，依次验证仓库与分支可读、Catalog 可下载、SBOX 可解密、目录认证正确及可选写入权限；对于已确认可读但尚未包含 `catalog.sbox` 的新仓库，必须显示“连接成功，等待首次初始化”，不得误报为网络故障；本地源使用“刷新目录”和“校验本地密文”，不得显示网络连接测试；
 - 远端源显示自动同步开关、仅 Wi-Fi、计量网络确认和移动后台限制说明；本地源不显示网络策略，可提供默认关闭的“目录变化时自动刷新”；
 - 本地 SBOX 同步目录、密文对象数量、合计大小、最后本地同步时间和可用空间；
 - 远端源显示当前 `max_object_bytes`、由此计算的有效分片明文大小、最大分片数和并发传输上限；能力未知或过期时不得开始上传。纯本地源显示应用分片策略、文件系统能力和剩余空间；
@@ -1597,7 +1632,7 @@ Dart 协议核心应使用结构化内部错误；UI 只暴露必要信息。
 | `SBOX_E_LOCAL_DIRECTORY_ACCESS` | 所选目录不存在、授权失效、不是目录或无法安全枚举 | 无法访问本地 SBOX 目录，请重新选择 |
 | `SBOX_E_LOCAL_SCAN_LIMIT` | 散装扫描超过深度或 100,000 个候选上限 | 本地目录过大，请选择更小的目录 |
 | `SBOX_E_LOCAL_READ_ONLY` | 只读或 loose 目录收到写入请求 | 此目录仅可读取；请选择可写规范目录 |
-| `SBOX_E_CATALOG_REQUIRED` | 尝试在没有签名 Catalog 时重组 multipart | 这是大文件分片，需要对应的 catalog.sbox |
+| `SBOX_E_CATALOG_REQUIRED` | 尝试在没有已认证 Catalog 时重组 multipart | 这是大文件分片，需要对应的 catalog.sbox |
 | `SBOX_E_STORAGE_OVERLAP` | 本地密文目录与临时明文目录重叠 | 存储目录不能相同或互相包含 |
 | `SBOX_E_TEMP_CLEANUP` | 临时明文未能全部删除 | 已删除部分文件，仍有项目需要处理 |
 | `SBOX_E_CANCELLED` | 用户取消 | 操作已取消，临时文件已清理 |
@@ -1662,7 +1697,7 @@ Dart 协议核心应使用结构化内部错误；UI 只暴露必要信息。
 - 明文临时文件的安全删除在闪存和日志文件系统上不可靠；产品文案不得声称能够物理擦除所有副本。
 - 本地同步目录中的完整 `.sbox` 是用户数据而非缓存。任何缓存清理、临时明文清理、注销数据源或空间优化 API 都不得自动删除这些密文原件。
 - “全部删除”只能遍历带有管理标记的临时明文根目录且不得跟随符号链接；实现必须以路径边界测试证明它不会越界到 LocalCipherRoot、导出目录、用户主目录或磁盘根目录。
-- 实现不得创建私钥缓存。OAuth 令牌和解密后的 Catalog 不得放入普通临时目录、剪贴板或 Flutter/Dart 调试状态恢复数据。
+- 实现不得创建私钥缓存。OAuth 令牌和解密后的 Catalog 不得放入普通临时目录、剪贴板或 Flutter/Dart 调试状态恢复数据；允许的 Catalog 明文只能写入第 12.6 节路径。
 - 应用在移动任务切换器中的快照必须使用隐私遮罩；桌面窗口标题不得包含解密文件名。
 - SBOX v1 不自动提取 ZIP，从而避免 Zip Slip 和压缩炸弹进入核心解密流程。
 
@@ -1731,7 +1766,7 @@ Future<VerifiedPlaintext> decryptCatalogEntry({
 });
 ```
 
-`encryptContainer` 与 `decryptSingleContainerWithMnemonic` 是单个完整 SBOX 的底层原语。`encryptLogicalFile` 按第 9.1 节产生 `PreparedPayload`：其中包含 single 或 multipart 的不可变对象列表、逐片摘要和待签名 Catalog payload，但不包含任何 DEK。`decryptCatalogEntry` 只接受已验证的 Catalog 领域对象；multipart 时它负责取得全部 part、一次派生 RSA、逐片解封、顺序重组和整体摘要验证，调用方不能自行传入一个未签名的 part 数组。
+`encryptContainer` 与 `decryptSingleContainerWithMnemonic` 是单个完整 SBOX 的底层原语。`encryptLogicalFile` 按第 9.1 节产生 `PreparedPayload`：其中包含 single 或 multipart 的不可变对象列表、逐片摘要和待认证 Catalog payload，但不包含任何 DEK。`decryptCatalogEntry` 只接受已验证的 Catalog 领域对象；multipart 时它负责取得全部 part、一次派生 RSA、逐片解封、顺序重组和整体摘要验证，调用方不能自行传入一个未认证的 part 数组。
 
 `EncryptedArtifact`、`PreparedPayload` 和 `VerifiedPlaintext` 只代表经过核心验证、等待对应存储层提交的结果。`EncryptedArtifact` 成功后提交为 LocalCipherRoot 中的永久 `.sbox`；`PreparedPayload` 只有在全部对象均已原子提交后才可返回；`VerifiedPlaintext` 成功后只能提交为 ManagedTemporaryPlaintextRoot 中的已验证临时明文。Document Provider 导出或系统分享必须在后者完成后由用户明确触发。若输入提供方不能可靠报告长度，平台层必须先暂存或完整扫描；不得把未知长度伪装为 `0`。
 
@@ -1742,7 +1777,7 @@ Future<VerifiedPlaintext> decryptCatalogEntry({
 ```text
 ParsedPublicHeader      // 仅含未认证公开头部，不含原始文件名
 AuthenticatedMetadata   // Metadata GCM 成功后可用
-VerifiedCatalogEntry    // 签名 Catalog 中经过结构与上限检查的原子 payload
+VerifiedCatalogEntry    // 已认证 Catalog 中经过结构与上限检查的原子 payload
 PreparedPayload         // 已完成本地提交的 single/multipart 密文对象集合
 VerifiedPlaintext       // Final、摘要和 EOF 全部成功后可发布到受管理临时明文区
 VerifiedCatalog         // 外层 SBOX + JCS + Ed25519 全部成功后可展示
@@ -2103,7 +2138,7 @@ SBOX v1 跨平台应用达到发布条件前，必须满足：
 - Windows、macOS、Linux、Android 和 iOS 上允许永久保存 RSA/Ed25519 公钥、Key ID、公开配置和完整 `.sbox` 密文原件；文件、数据库、平台安全存储、备份和后台任务中均不存在助记词或私钥材料；
 - 自动化持久化扫描覆盖 SharedPreferences、Hive/SQLite、平台 Secure Storage、Flutter 状态恢复、普通/临时文件、上传队列和备份清单，确认其中不存在助记词、BIP39 Seed、RSA/Ed25519 私钥、PKCS#8 或可逆私钥封装；
 - 生命周期测试和代码审计证明：OAEP 与 Ed25519 操作后立即释放对应私钥引用、尽力覆盖可变缓冲区；成功、失败、取消和应用退到后台时均终止专用 Crypto Isolate，且不会恢复该私钥任务；不得宣称 Dart Heap 已被确定性物理清零；
-- 完整杀死并重新启动 Flutter Release 应用进程后，只能恢复公钥身份和已完成密文任务，不能恢复助记词、私钥、DEK、解密后的 Catalog 或进行中的私钥操作；Hot Restart 不得作为此项测试替代；
+- 完整杀死并重新启动 Flutter Release 应用进程后，可以恢复公钥身份、已完成密文任务和通过第 12.6 节校验的 Catalog 明文缓存，但不能恢复助记词、私钥、DEK 或进行中的私钥操作；Hot Restart 不得作为此项测试替代；
 - 伪造 Catalog、错误 Signer Key、旧代数、同代不同哈希和重复 JSON 键均被拒绝或进入明确冲突状态；
 - GitHub 与 Gitee 适配器至少通过一次公开匿名拉取、授权上传、条件 Catalog 更新、授权过期和并发 409/412 冲突测试；
 - 全新安装在身份创建/恢复完成后可以选择“打开本地 SBOX 目录”或“暂不配置”，不创建任何 GitHub/Gitee 配置、不要求 OAuth/令牌，并通过网络拦截测试证明整个本地挂载、刷新、校验和解密流程没有 DNS/HTTP 请求；

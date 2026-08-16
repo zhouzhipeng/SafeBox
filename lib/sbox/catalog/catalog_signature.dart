@@ -13,15 +13,20 @@ import 'catalog_models.dart';
 import 'strict_json.dart';
 
 final class SignedCatalog {
-  SignedCatalog._({required this.catalog, required this.signatureValue});
+  SignedCatalog._({
+    required this.catalog,
+    required this.signatureAlgorithm,
+    required this.signatureValue,
+  });
 
   final SboxCatalog catalog;
+  final String signatureAlgorithm;
   final String signatureValue;
 
   Map<String, Object?> toJson() => <String, Object?>{
     'catalog': catalog.toJson(),
     'signature': <String, Object?>{
-      'algorithm': 'Ed25519',
+      'algorithm': signatureAlgorithm,
       'value': signatureValue,
     },
   };
@@ -49,8 +54,10 @@ final class VerifiedCatalog {
   }
 }
 
-/// An entry that can only be obtained from a successfully authenticated and
-/// signature-verified [VerifiedCatalog].
+/// An entry that can only be obtained from a successfully authenticated
+/// [VerifiedCatalog]. Legacy Ed25519 catalogs are signature-verified; new
+/// public-key-only catalogs are authenticated by the outer RSA-OAEP and
+/// AES-256-GCM container and identity-bound catalog fields.
 final class VerifiedCatalogEntry {
   const VerifiedCatalogEntry._(this.entry);
 
@@ -98,11 +105,44 @@ final class CatalogSignatureCodec {
         publicKey: publicKey,
       );
       final value = base64Url.encode(signature.bytes).replaceAll('=', '');
-      return SignedCatalog._(catalog: catalog, signatureValue: value);
+      return SignedCatalog._(
+        catalog: catalog,
+        signatureAlgorithm: 'Ed25519',
+        signatureValue: value,
+      );
     } finally {
       signedBytes.fillRange(0, signedBytes.length, 0);
     }
   }
+
+  /// Encodes a catalog that can be created with the recipient public key only.
+  ///
+  /// The outer SBOX container still authenticates the plaintext with
+  /// AES-256-GCM after the DEK is wrapped by RSA-OAEP.  This mode deliberately
+  /// omits the Ed25519 author signature because producing that signature would
+  /// require the mnemonic/private key during an encryption-only operation.
+  SignedCatalog publicKeyOnly({
+    required SboxCatalog catalog,
+    required PublicIdentity expectedIdentity,
+  }) {
+    if (catalog.recipientKeyId != hexLower(expectedIdentity.recipientKeyId) ||
+        catalog.signerKeyId != hexLower(expectedIdentity.catalogSignerKeyId)) {
+      throw const SboxException(SboxErrorCode.keyMismatch, 'Catalog 公钥身份不匹配');
+    }
+    return SignedCatalog._(
+      catalog: catalog,
+      signatureAlgorithm: 'public-key-only',
+      signatureValue: '',
+    );
+  }
+
+  Uint8List encodePublicKeyOnly({
+    required SboxCatalog catalog,
+    required PublicIdentity expectedIdentity,
+  }) => publicKeyOnly(
+    catalog: catalog,
+    expectedIdentity: expectedIdentity,
+  ).encodePlaintext();
 
   Future<VerifiedCatalog> verify({
     required List<int> plaintext,
@@ -130,12 +170,12 @@ final class CatalogSignatureCodec {
       final catalogObject = _asMap(root['catalog']);
       final signatureObject = _asMap(root['signature']);
       if (signatureObject.length != 2 ||
-          signatureObject['algorithm'] != 'Ed25519' ||
+          signatureObject['algorithm'] is! String ||
           signatureObject['value'] is! String) {
         throw _catalogError();
       }
+      final algorithm = signatureObject['algorithm']! as String;
       final signatureValue = signatureObject['value']! as String;
-      final signatureBytes = _decodeSignature(signatureValue);
       final catalog = SboxCatalog.fromJson(catalogObject);
       if (catalog.recipientKeyId != hexLower(expectedIdentity.recipientKeyId) ||
           catalog.signerKeyId !=
@@ -148,17 +188,26 @@ final class CatalogSignatureCodec {
         );
       }
 
-      final signedBytes = signedBytesForCatalogObject(catalogObject);
-      final publicKey = SimplePublicKey(
-        expectedIdentity.catalogSigningPublicKey,
-        type: KeyPairType.ed25519,
-      );
-      final valid = await _ed25519.verify(
-        signedBytes,
-        signature: Signature(signatureBytes, publicKey: publicKey),
-      );
-      signedBytes.fillRange(0, signedBytes.length, 0);
-      if (!valid) {
+      if (algorithm == 'Ed25519') {
+        final signatureBytes = _decodeSignature(signatureValue);
+        final signedBytes = signedBytesForCatalogObject(catalogObject);
+        final publicKey = SimplePublicKey(
+          expectedIdentity.catalogSigningPublicKey,
+          type: KeyPairType.ed25519,
+        );
+        final valid = await _ed25519.verify(
+          signedBytes,
+          signature: Signature(signatureBytes, publicKey: publicKey),
+        );
+        signedBytes.fillRange(0, signedBytes.length, 0);
+        if (!valid) {
+          throw _catalogError();
+        }
+      } else if (algorithm == 'public-key-only') {
+        if (signatureValue.isNotEmpty) {
+          throw _catalogError();
+        }
+      } else {
         throw _catalogError();
       }
       return VerifiedCatalog._(

@@ -272,7 +272,7 @@ class _MnemonicOnboardingState extends State<MnemonicOnboarding>
           ),
           const SizedBox(height: 10),
           Text(
-            '12 个 BIP39 英文单词会确定性恢复同一组 RSA-3072 与 Catalog 签名公钥。',
+            '12 个 BIP39 英文单词会确定性恢复同一组 RSA-3072 与 Catalog 身份公钥。',
             textAlign: TextAlign.center,
             style: Theme.of(context).textTheme.bodyLarge
                 ?.copyWith(color: SboxColors.textMuted),

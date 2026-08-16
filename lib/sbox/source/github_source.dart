@@ -55,6 +55,20 @@ final class GitHubDataSource extends RepositoryDataSource {
   );
 
   @override
+  Uri repositoryProbeUri() => Uri(
+    scheme: 'https',
+    host: 'api.github.com',
+    pathSegments: <String>[
+      'repos',
+      config.owner,
+      config.repository,
+      'contents',
+      if (config.pathPrefix.isNotEmpty) ...config.pathPrefix.split('/'),
+    ],
+    queryParameters: <String, String>{'ref': config.branch},
+  );
+
+  @override
   Map<String, String> publicHeaders({required bool raw}) => <String, String>{
     'Accept': raw
         ? 'application/vnd.github.raw+json'

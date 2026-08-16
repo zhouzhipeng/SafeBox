@@ -67,6 +67,7 @@ final class CatalogCommitTaskResult {
     required this.encryptedCatalogSha256,
     required this.entryId,
     required this.generation,
+    this.catalogJson,
   });
 
   final String catalogId;
@@ -77,6 +78,7 @@ final class CatalogCommitTaskResult {
   final Uint8List encryptedCatalogSha256;
   final String entryId;
   final int generation;
+  final Map<String, Object?>? catalogJson;
 }
 
 final class CatalogEntryViewData {
@@ -113,6 +115,7 @@ final class CatalogViewTaskResult {
     required this.entries,
     required this.catalogPayloadsJson,
     required this.continuity,
+    this.catalogJson,
   });
 
   final String catalogId;
@@ -121,6 +124,7 @@ final class CatalogViewTaskResult {
   final List<CatalogEntryViewData> entries;
   final List<Map<String, Object?>> catalogPayloadsJson;
   final CatalogContinuity continuity;
+  final Map<String, Object?>? catalogJson;
 }
 
 final class CatalogConflictViewData {
@@ -160,6 +164,7 @@ final class CatalogMergedTaskResult extends CatalogMergeTaskResult {
     required this.encryptedCatalogSha256,
     required this.catalogPayloadsJson,
     required this.entries,
+    this.catalogJson,
   });
 
   final String catalogId;
@@ -167,6 +172,7 @@ final class CatalogMergedTaskResult extends CatalogMergeTaskResult {
   final Uint8List encryptedCatalogSha256;
   final List<Map<String, Object?>> catalogPayloadsJson;
   final List<CatalogEntryViewData> entries;
+  final Map<String, Object?>? catalogJson;
 }
 
 final class CatalogConflictsTaskResult extends CatalogMergeTaskResult {
@@ -383,8 +389,170 @@ abstract final class CryptoTaskRunner {
         encryptedCatalogSha256: encrypted.sha256,
         entryId: entryId,
         generation: catalog.generation,
+        catalogJson: catalog.toJson(),
       );
     }, debugName: 'sbox-encrypt-catalog-once');
+  }
+
+  /// Encrypts a new Catalog revision using only the persisted public
+  /// identity. The optional in-memory Catalog snapshot lets the caller append
+  /// entries without reopening the encrypted Catalog with a mnemonic.
+  static Future<CatalogCommitTaskResult> encryptAndCommitCatalogPublic({
+    String? inputPath,
+    String? text,
+    required String localCipherRoot,
+    required Map<String, Object?> publicIdentityJson,
+    Map<String, Object?>? catalogSnapshotJson,
+    String? previousCatalogSha256,
+    required int contentKind,
+    required String originalName,
+    required String mediaType,
+    required String title,
+    required String description,
+    required List<String> tags,
+    required Map<String, Object?> capabilitiesJson,
+  }) {
+    if ((inputPath == null) == (text == null)) {
+      throw ArgumentError('Exactly one plaintext input must be supplied');
+    }
+    return _runOneShot(() async {
+      final identity = PublicIdentityRecord.fromJson(publicIdentityJson)
+          .identity;
+      final store = await FileSystemLocalCipherStore.open(
+        Directory(localCipherRoot),
+      );
+      final catalogFile = File(
+        '$localCipherRoot${Platform.pathSeparator}catalog.sbox',
+      );
+
+      SboxCatalog? previous;
+      Uint8List? previousHash;
+      if (catalogSnapshotJson != null) {
+        previous = SboxCatalog.fromJson(catalogSnapshotJson);
+        if (previous.recipientKeyId != hexLower(identity.recipientKeyId) ||
+            previous.signerKeyId != hexLower(identity.catalogSignerKeyId)) {
+          throw const SboxException(
+            SboxErrorCode.keyMismatch,
+            'Catalog 公钥身份不匹配',
+          );
+        }
+        final previousHashText = previousCatalogSha256;
+        if (previousHashText == null) {
+          throw const SboxException(
+            SboxErrorCode.catalogRequired,
+            '已有 Catalog 快照但缺少上一版本摘要',
+          );
+        }
+        previousHash = decodeHex(previousHashText);
+        if (previousHash.length != 32) {
+          throw const SboxException(SboxErrorCode.catalog, '上一版本 Catalog 摘要无效');
+        }
+      } else if (await catalogFile.exists()) {
+        throw const SboxException(
+          SboxErrorCode.catalogRequired,
+          '已有加密 catalog.sbox；请先在资料库中解锁目录后再追加内容',
+        );
+      } else if (previousCatalogSha256 != null) {
+        throw const SboxException(
+          SboxErrorCode.catalog,
+          'Catalog 摘要与本地文件状态不一致',
+        );
+      }
+
+      final ReadableInputRef input;
+      final int inputLength;
+      if (inputPath != null) {
+        final file = File(inputPath);
+        input = FileReadableInputRef(file);
+        inputLength = await file.length();
+      } else {
+        final bytes = utf8Bytes(text!);
+        input = MemoryReadableInputRef(bytes);
+        inputLength = bytes.length;
+      }
+      final prepared = await encryptLogicalFile(
+        input: input,
+        inputLength: inputLength,
+        target: _capabilitiesFromMessage(capabilitiesJson),
+        cipherStore: store,
+        options: EncryptOptions(
+          recipient: identity,
+          contentKind: SboxContentKind.fromWireValue(contentKind),
+          originalName: originalName,
+          mediaType: mediaType,
+        ),
+        control: JobControl(),
+      );
+
+      final now = _utcSeconds(DateTime.now());
+      final entryId = hexLower(secureRandomBytes(16));
+      final entry = CatalogEntry(
+        entryId: entryId,
+        revision: 1,
+        title: title,
+        description: description,
+        originalName: originalName,
+        mediaType: mediaType,
+        payload: prepared.catalogPayload,
+        tags: tags,
+        createdAt: now,
+        updatedAt: now,
+      );
+      final catalog = SboxCatalog(
+        catalogId: previous?.catalogId ?? hexLower(secureRandomBytes(16)),
+        generation: (previous?.generation ?? 0) + 1,
+        previousCatalogSha256: previousHash == null
+            ? null
+            : hexLower(previousHash),
+        recipientKeyId: hexLower(identity.recipientKeyId),
+        signerKeyId: hexLower(identity.catalogSignerKeyId),
+        createdAt: previous?.createdAt ?? now,
+        updatedAt: now,
+        entries: <CatalogEntry>[...?previous?.entries, entry],
+        tombstones: previous?.tombstones ?? const <CatalogTombstone>[],
+      );
+      final encrypted = await createCatalogContainerWithPublicKey(
+        catalog: catalog,
+        expectedIdentity: identity,
+      );
+      final staged = await store.createStaging(SourcePath('catalog.sbox'));
+      try {
+        final sink = staged.openSink();
+        sink.add(encrypted.bytes);
+        await sink.flush();
+        await sink.close();
+        if (previousHash == null) {
+          await store.commitDownloaded(
+            staged,
+            expectedLength: encrypted.bytes.length,
+            expectedSha256: encrypted.sha256,
+          );
+        } else {
+          await store.replaceDownloadedCatalog(
+            staged,
+            expectedLength: encrypted.bytes.length,
+            expectedSha256: encrypted.sha256,
+            expectedCurrentSha256: previousHash,
+          );
+        }
+      } on Object {
+        await staged.discard();
+        rethrow;
+      }
+      return CatalogCommitTaskResult(
+        catalogId: catalog.catalogId,
+        catalogEntryJson: entry.toJson(),
+        catalogPayloadJson: prepared.catalogPayload.toJson(),
+        catalogPayloadsJson: catalog.entries
+            .map((value) => value.payload.toJson())
+            .toList(growable: false),
+        entries: _viewEntries(catalog),
+        encryptedCatalogSha256: encrypted.sha256,
+        entryId: entryId,
+        generation: catalog.generation,
+        catalogJson: catalog.toJson(),
+      );
+    }, debugName: 'sbox-encrypt-catalog-public-once');
   }
 
   static Future<CatalogViewTaskResult> unlockCatalog({
@@ -427,9 +595,29 @@ abstract final class CryptoTaskRunner {
             .map((entry) => entry.payload.toJson())
             .toList(growable: false),
         entries: _viewEntries(opened.catalog.catalog),
+        catalogJson: opened.catalog.catalog.toJson(),
       );
     }, debugName: 'sbox-unlock-catalog-once');
   }
+
+  /// Rehydrates a view from a locally persisted, already decrypted Catalog.
+  /// The caller must bind the cache to the current catalog.sbox hash and
+  /// public identity before calling this helper.
+  static CatalogViewTaskResult viewCatalogSnapshot({
+    required SboxCatalog catalog,
+    required List<int> encryptedCatalogSha256,
+    CatalogContinuity continuity = CatalogContinuity.unchanged,
+  }) => CatalogViewTaskResult(
+    catalogId: catalog.catalogId,
+    generation: catalog.generation,
+    encryptedCatalogSha256: Uint8List.fromList(encryptedCatalogSha256),
+    entries: _viewEntries(catalog),
+    catalogPayloadsJson: catalog.entries
+        .map((entry) => entry.payload.toJson())
+        .toList(growable: false),
+    continuity: continuity,
+    catalogJson: catalog.toJson(),
+  );
 
   static Future<CatalogViewTaskResult> updateCatalogMetadata({
     required String localCipherRoot,
@@ -585,6 +773,7 @@ abstract final class CryptoTaskRunner {
             .map((entry) => entry.payload.toJson())
             .toList(growable: false),
         continuity: CatalogContinuity.advanced,
+        catalogJson: next.toJson(),
       );
     }, debugName: 'sbox-catalog-${kind.name}-once');
   }
@@ -731,6 +920,7 @@ abstract final class CryptoTaskRunner {
             .map((entry) => entry.payload.toJson())
             .toList(growable: false),
         entries: _viewEntries(catalog),
+        catalogJson: catalog.toJson(),
       );
     }, debugName: 'sbox-merge-catalog-once');
   }
@@ -943,6 +1133,7 @@ abstract final class CryptoTaskRunner {
             .map((entry) => entry.payload.toJson())
             .toList(growable: false),
         entries: _viewEntries(catalog),
+        catalogJson: catalog.toJson(),
       );
     }, debugName: 'sbox-resolve-catalog-once');
   }

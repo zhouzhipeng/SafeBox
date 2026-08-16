@@ -60,6 +60,25 @@ void main() {
   });
 
   test(
+    'Catalog encryption can use the public identity without a mnemonic',
+    () async {
+      final prepared = await createCatalogContainerWithPublicKey(
+        catalog: catalog,
+        expectedIdentity: identity.publicIdentity,
+      );
+      final opened = await openCatalogContainerWithMnemonic(
+        container: prepared.bytes,
+        mnemonic: EphemeralMnemonic.fromString(mnemonic),
+        expectedIdentity: identity.publicIdentity,
+        expectedCatalogId: catalog.catalogId,
+        control: JobControl(),
+      );
+      expect(opened.catalog.signatureValue, isEmpty);
+      expect(opened.catalog.catalog.catalogId, catalog.catalogId);
+    },
+  );
+
+  test(
     'tampered encrypted Catalog never reaches signed Catalog state',
     () async {
       final prepared = await createCatalogContainerWithMnemonic(

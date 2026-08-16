@@ -7,7 +7,6 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
 import '../../app/app_controller.dart';
-import '../../app/sbox_dialogs.dart';
 import '../../app/sbox_theme.dart';
 import '../../app/sbox_widgets.dart';
 import '../../sbox/constants.dart';
@@ -68,19 +67,11 @@ class _EncryptPageState extends State<EncryptPage> {
     final title = _title.text.trim();
     final originalName = _textMode ? _name.text.trim() : _file!.name;
     if (title.isEmpty || originalName.isEmpty) return;
-    final mnemonic = await showMnemonicPrompt(
-      context,
-      title: '确认身份并加密保存',
-      actionLabel: '加密保存',
-    );
-    if (mnemonic == null || !mounted) return;
     final plaintext = _textMode ? _text.text : null;
-    if (_textMode) _text.clear();
     try {
       await widget.controller.encryptAndSave(
         inputPath: _textMode ? null : _file!.path,
         text: plaintext,
-        mnemonic: mnemonic,
         originalName: originalName,
         title: title,
         description: _description.text.trim(),
@@ -94,6 +85,7 @@ class _EncryptPageState extends State<EncryptPage> {
       );
       if (mounted) {
         setState(() {
+          if (_textMode) _text.clear();
           _file = null;
           _fileLength = null;
           _title.clear();
@@ -396,7 +388,7 @@ class _EncryptPageState extends State<EncryptPage> {
         children: <Widget>[
           const SectionTitle(
             title: 'Catalog 项目信息',
-            subtitle: '这些字段只存在于加密并签名的 catalog.sbox 内',
+            subtitle: '这些字段只存在于加密的 catalog.sbox 内；新建目录只需公钥',
           ),
           const SizedBox(height: 16),
           TextField(

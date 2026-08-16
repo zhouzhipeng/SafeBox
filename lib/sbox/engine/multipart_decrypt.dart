@@ -48,7 +48,10 @@ Future<VerifiedTemporaryPlaintext> decryptCatalogEntry({
         );
       }
       if (BigInt.from(object.length) != part.sboxSize) {
-        throw const SboxException(SboxErrorCode.integrity, 'SBOX 分片大小与签名目录不一致');
+        throw const SboxException(
+          SboxErrorCode.integrity,
+          'SBOX 分片大小与已认证目录不一致',
+        );
       }
       final file = await object.file.open(mode: FileMode.read);
       late final SboxHeader header;
@@ -64,7 +67,10 @@ Future<VerifiedTemporaryPlaintext> decryptCatalogEntry({
             header.recipientKeyId,
             expectedIdentity.recipientKeyId,
           )) {
-        throw const SboxException(SboxErrorCode.integrity, 'SBOX 分片头部与签名目录不一致');
+        throw const SboxException(
+          SboxErrorCode.integrity,
+          'SBOX 分片头部与已认证目录不一致',
+        );
       }
       located.add(
         _LocatedPart(
@@ -91,7 +97,7 @@ Future<VerifiedTemporaryPlaintext> decryptCatalogEntry({
           verified.metadata.mediaType != entry.entry.mediaType ||
           BigInt.from(verified.plaintextLength) != payload.plaintextSize ||
           hexLower(verified.plaintextSha256) != payload.plaintextSha256) {
-        throw const SboxException(SboxErrorCode.catalog, 'SBOX 内容与签名目录不一致');
+        throw const SboxException(SboxErrorCode.catalog, 'SBOX 内容与已认证目录不一致');
       }
       staged.accept(verified);
       return await plaintextStore.publishVerified(staged);

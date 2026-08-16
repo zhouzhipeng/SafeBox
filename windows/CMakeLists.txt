@@ -32,6 +32,34 @@ set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 # Use Unicode for all projects.
 add_definitions(-DUNICODE -D_UNICODE)
 
+# flutter_secure_storage_windows uses the ATL string helpers.  Some Visual
+# Studio Build Tools installations do not include ATL even though another VS
+# installation on the same machine does.  Locate an installed ATL SDK without
+# assuming a particular drive or VS edition, so the Windows build remains
+# portable across the supported Visual Studio layouts.
+if(MSVC)
+  set(SAFEBOX_ATL_INCLUDE_CANDIDATES)
+  foreach(SAFEBOX_VS_ROOT
+      "C:/Program Files/Microsoft Visual Studio"
+      "C:/Program Files (x86)/Microsoft Visual Studio"
+      "D:/Program Files/Microsoft Visual Studio"
+      "D:/Program Files (x86)/Microsoft Visual Studio")
+    file(GLOB SAFEBOX_ATL_INCLUDE_GLOB
+      "${SAFEBOX_VS_ROOT}/*/*/VC/Tools/MSVC/*/atlmfc/include")
+    list(APPEND SAFEBOX_ATL_INCLUDE_CANDIDATES ${SAFEBOX_ATL_INCLUDE_GLOB})
+  endforeach()
+  list(LENGTH SAFEBOX_ATL_INCLUDE_CANDIDATES SAFEBOX_ATL_INCLUDE_COUNT)
+  if(SAFEBOX_ATL_INCLUDE_COUNT GREATER 0)
+    list(GET SAFEBOX_ATL_INCLUDE_CANDIDATES 0 SAFEBOX_ATL_INCLUDE_DIR)
+    include_directories(SYSTEM "${SAFEBOX_ATL_INCLUDE_DIR}")
+    get_filename_component(SAFEBOX_ATL_ROOT "${SAFEBOX_ATL_INCLUDE_DIR}" DIRECTORY)
+    set(SAFEBOX_ATL_LIB_DIR "${SAFEBOX_ATL_ROOT}/lib/x64")
+    if(EXISTS "${SAFEBOX_ATL_LIB_DIR}/atls.lib")
+      link_directories("${SAFEBOX_ATL_LIB_DIR}")
+    endif()
+  endif()
+endif()
+
 # Compilation settings that should be applied to most targets.
 #
 # Be cautious about adding new options here, as plugins use this function by
@@ -39,7 +67,9 @@ add_definitions(-DUNICODE -D_UNICODE)
 # of modifying this function.
 function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_features(${TARGET} PUBLIC cxx_std_17)
-  target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100")
+  # Flutter plugins are UTF-8 sources.  Explicitly select UTF-8 so builds do
+  # not turn MSVC's C4819 code-page warning into an error on Chinese Windows.
+  target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100" /utf-8)
   target_compile_options(${TARGET} PRIVATE /EHsc)
   target_compile_definitions(${TARGET} PRIVATE "_HAS_EXCEPTIONS=0")
   target_compile_definitions(${TARGET} PRIVATE "$<$<CONFIG:Debug>:_DEBUG>")

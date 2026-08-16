@@ -18,6 +18,7 @@ import '../platform/secure_credential_store.dart';
 import '../platform/source_configuration_store.dart';
 import '../sbox/bytes.dart';
 import '../sbox/catalog/catalog_models.dart';
+import '../sbox/catalog/catalog_plaintext_cache.dart';
 import '../sbox/catalog/catalog_state.dart';
 import '../sbox/constants.dart';
 import '../sbox/engine/crypto_task_runner.dart';
@@ -34,6 +35,7 @@ import '../sbox/source/https_source.dart';
 import '../sbox/source/local_directory_source.dart';
 import '../sbox/source/local_scanner.dart';
 import '../sbox/source/remote_config.dart';
+import '../sbox/source/repository_data_source.dart';
 import '../sbox/source/source_config.dart';
 import '../sbox/source/source_path.dart';
 import '../sbox/storage/local_cipher_store.dart';
@@ -195,7 +197,7 @@ final class AppController extends ChangeNotifier {
       fileCount: 3,
       totalBytes: 31629312,
     );
-    _statusMessage = '目录签名与历史链已验证';
+    _statusMessage = '目录认证与历史链已验证';
   }
 
   final PublicIdentityStore _identityStore;
@@ -306,6 +308,10 @@ final class AppController extends ChangeNotifier {
       }
       if (_sources.isNotEmpty) {
         _selectedSourceId = _sources.first.sourceId;
+        _catalog = await _restoreCatalogPlaintextCache(_sources.first);
+        if (_catalog != null) {
+          _statusMessage = '已恢复本地明文 Catalog 缓存；当前目录无需再次输入助记词。';
+        }
       }
       await _discardIncompleteCipherStaging();
       await _discardIncompleteTemporaryJobs();
@@ -466,12 +472,14 @@ final class AppController extends ChangeNotifier {
       _sources = <SourceConfiguration>[..._sources, config];
       _selectedSourceId = config.sourceId;
       await _sourceStore.saveAll(_sources);
-      _catalog = null;
+      _catalog = await _restoreCatalogPlaintextCache(config);
       if (mode == ConfiguredLocalMode.looseReadOnly) {
         await _scanLoose(config);
-        _statusMessage = '已离线加载未编目本地 SBOX；multipart 必须有签名 Catalog 才能重组。';
+        _statusMessage = '已离线加载未编目本地 SBOX；multipart 必须有已认证 Catalog 才能重组。';
       } else if (probe.catalogHeader != null) {
-        _statusMessage = '已挂载规范本地目录；请输入助记词验证 catalog.sbox。';
+        _statusMessage = _catalog == null
+            ? '已挂载规范本地目录；请输入助记词解密 catalog.sbox。'
+            : '已从本地明文 Catalog 缓存恢复目录；无需再次输入助记词。';
       } else {
         _statusMessage = '已建立空的规范本地目录；首次加密将创建 catalog.sbox。';
       }
@@ -702,7 +710,7 @@ final class AppController extends ChangeNotifier {
         }
       }
       if (refreshed > 0) {
-        _statusMessage = '自动同步已更新 $refreshed 个加密 Catalog；输入助记词后才会展示目录。';
+        _statusMessage = '自动同步已更新 $refreshed 个加密 Catalog；没有匹配的本地明文缓存时才需要助记词。';
       }
       if (lastError != null) _errorMessage = _friendlyError(lastError);
     } finally {
@@ -727,48 +735,79 @@ final class AppController extends ChangeNotifier {
   };
 
   Future<bool> _pullEncryptedCatalogForConfig(
-    SourceConfiguration config,
-  ) async {
+    SourceConfiguration config, {
+    bool allowMissingCatalog = false,
+  }) async {
     if (!config.isRemote || config.hasPendingCatalog) return false;
-    return _withSource(config, (source) async {
-      final store = await FileSystemLocalCipherStore.open(
-        Directory(config.localSyncPath),
-      );
-      final synchronizer = CipherMirrorSynchronizer(
-        source: source,
-        localStore: store,
-        onProgress: _onSyncProgress,
-      );
-      final currentMirrorHash =
-          config.localCatalogMirrorSha256 ?? config.lastCatalogSha256;
-      final result = await synchronizer.pullEncryptedCatalog(
-        ifNoneMatch: config.lastProviderRevision,
-        expectedCurrentLocalSha256: currentMirrorHash == null
-            ? null
-            : decodeHex(currentMirrorHash),
-        expectedRecipientKeyId: recipientKeyId,
-      );
-      await _replaceSource(
-        config.copyWith(
-          lastProviderRevision: result.providerRevision,
-          localCatalogMirrorSha256: result.localObject == null
+    try {
+      return await _withSource(config, (source) async {
+        final store = await FileSystemLocalCipherStore.open(
+          Directory(config.localSyncPath),
+        );
+        final synchronizer = CipherMirrorSynchronizer(
+          source: source,
+          localStore: store,
+          onProgress: _onSyncProgress,
+        );
+        final currentMirrorHash =
+            config.localCatalogMirrorSha256 ?? config.lastCatalogSha256;
+        final result = await synchronizer.pullEncryptedCatalog(
+          ifNoneMatch: config.lastProviderRevision,
+          expectedCurrentLocalSha256: currentMirrorHash == null
               ? null
-              : hexLower(result.localObject!.sha256),
-          lastLocalSyncAt: DateTime.now().toUtc(),
-        ),
-      );
-      if (!result.notModified && _selectedSourceId == config.sourceId) {
-        _catalog = null;
-        _catalogConflicts = <CatalogConflictViewData>[];
+              : decodeHex(currentMirrorHash),
+          expectedRecipientKeyId: recipientKeyId,
+        );
+        await _replaceSource(
+          config.copyWith(
+            lastProviderRevision: result.providerRevision,
+            localCatalogMirrorSha256: result.localObject == null
+                ? null
+                : hexLower(result.localObject!.sha256),
+            lastLocalSyncAt: DateTime.now().toUtc(),
+          ),
+        );
+        if (!result.notModified && _selectedSourceId == config.sourceId) {
+          _catalog = null;
+          _catalogConflicts = <CatalogConflictViewData>[];
+        }
+        return !result.notModified;
+      });
+    } on SboxException catch (error) {
+      // A newly configured public repository may not have catalog.sbox yet.
+      // Never hide deletion of an established catalog or a pending local
+      // version: those states still fail closed as source errors.
+      if (allowMissingCatalog &&
+          error.code == SboxErrorCode.sourceNotFound &&
+          config.catalogId == null &&
+          config.lastCatalogSha256 == null &&
+          config.localCatalogMirrorSha256 == null &&
+          !config.hasPendingCatalog &&
+          !await File(p.join(config.localSyncPath, 'catalog.sbox')).exists()) {
+        return false;
       }
-      return !result.notModified;
+      rethrow;
+    }
+  }
+
+  Future<void> _verifyRemoteRepository(SourceConfiguration config) async {
+    if (!config.isRemote) return;
+    await _withSource(config, (source) async {
+      if (source is RepositoryDataSource) {
+        await source.verifyRepository();
+      }
+      // A generic HTTPS source has no repository metadata endpoint. Its
+      // catalog request below remains the authoritative connectivity check.
     });
   }
 
   Future<void> selectSource(SourceId id) async {
     if (!_sources.any((source) => source.sourceId == id)) return;
     _selectedSourceId = id;
-    _catalog = null;
+    _catalog = await _restoreCatalogPlaintextCache(selectedSource!);
+    if (_catalog != null) {
+      _statusMessage = '已恢复本地明文 Catalog 缓存；当前目录无需再次输入助记词。';
+    }
     _catalogConflicts = <CatalogConflictViewData>[];
     _looseCandidates = <ScannedSboxCandidate>[];
     _inspection = null;
@@ -790,7 +829,10 @@ final class AppController extends ChangeNotifier {
     }
   }
 
-  Future<void> refreshSelectedSource() async {
+  Future<void> refreshSelectedSource({
+    bool verifyRemoteRepository = false,
+    bool allowMissingRemoteCatalog = false,
+  }) async {
     final config = _requireSource();
     await _run(AppOperation.refreshing, () async {
       _catalogConflicts = <CatalogConflictViewData>[];
@@ -806,18 +848,28 @@ final class AppController extends ChangeNotifier {
           if (!await catalog.exists()) {
             _statusMessage = '规范目录尚未创建 catalog.sbox。';
           } else {
-            _statusMessage = '本地 catalog.sbox 已刷新；需要助记词完成签名验证。';
+            _statusMessage = '本地 catalog.sbox 已刷新；没有匹配的明文缓存时需要助记词完成解密与目录认证。';
           }
         }
         return;
       }
       if (config.hasPendingCatalog) {
-        _statusMessage = '本地有待同步 Catalog；不会用远端版本覆盖。请输入助记词后执行条件同步。';
+        _statusMessage = '本地有待同步 Catalog；不会用远端版本覆盖。没有匹配的明文缓存时请输入助记词执行条件同步。';
         return;
       }
-      final changed = await _pullEncryptedCatalogForConfig(config);
+      if (verifyRemoteRepository) {
+        await _verifyRemoteRepository(config);
+      }
+      final changed = await _pullEncryptedCatalogForConfig(
+        config,
+        allowMissingCatalog: allowMissingRemoteCatalog,
+      );
       _statusMessage = changed
-          ? '已下载加密目录；请输入助记词验证签名并同步所需分片。'
+          ? '已下载加密目录；请输入助记词解密并认证目录，再同步所需分片。'
+          : allowMissingRemoteCatalog &&
+                config.catalogId == null &&
+                config.lastCatalogSha256 == null
+          ? '数据源连接成功，但远端尚未初始化 catalog.sbox；首次加密并同步将创建它。'
           : '远端 catalog.sbox 未变化，本地密文镜像保持最新。';
     });
   }
@@ -851,6 +903,7 @@ final class AppController extends ChangeNotifier {
               },
       );
       _catalog = result;
+      await _persistCatalogPlaintextCache(config, result);
       _catalogConflicts = <CatalogConflictViewData>[];
       final openedHash = hexLower(result.encryptedCatalogSha256);
       final opensPending =
@@ -885,7 +938,7 @@ final class AppController extends ChangeNotifier {
         });
       }
       _statusMessage = opensPending
-          ? '本地待同步 Catalog 已通过解密与签名验证；远端检查点保持不变。'
+          ? '本地待同步 Catalog 已通过解密与目录认证；远端检查点保持不变。'
           : _continuityText(result.continuity);
     });
   }
@@ -893,7 +946,6 @@ final class AppController extends ChangeNotifier {
   Future<void> encryptAndSave({
     String? inputPath,
     String? text,
-    required String mnemonic,
     required String originalName,
     required String title,
     required String description,
@@ -905,6 +957,18 @@ final class AppController extends ChangeNotifier {
       throw const SboxException(SboxErrorCode.sourceAuthentication, '当前数据源只读');
     }
     final identity = _requireIdentity();
+    var catalogSnapshot = _catalog;
+    if (catalogSnapshot == null) {
+      catalogSnapshot = await _restoreCatalogPlaintextCache(config);
+      if (catalogSnapshot != null) {
+        _catalog = catalogSnapshot;
+        notifyListeners();
+      }
+    }
+    final catalogSnapshotJson = catalogSnapshot?.catalogJson;
+    final previousCatalogSha256 = catalogSnapshot == null
+        ? config.pendingCatalogSha256 ?? config.lastCatalogSha256
+        : hexLower(catalogSnapshot.encryptedCatalogSha256);
     await _run(AppOperation.encrypting, () async {
       final pendingBaseHash = config.isRemote
           ? await _preparePendingCatalogBase(config)
@@ -916,12 +980,13 @@ final class AppController extends ChangeNotifier {
       final mediaType = inputPath == null
           ? 'text/plain; charset=utf-8'
           : lookupMimeType(inputPath) ?? 'application/octet-stream';
-      final result = await CryptoTaskRunner.encryptAndCommitCatalog(
+      final result = await CryptoTaskRunner.encryptAndCommitCatalogPublic(
         inputPath: inputPath,
         text: text,
         localCipherRoot: config.localSyncPath,
         publicIdentityJson: identity.toJson(),
-        mnemonic: mnemonic,
+        catalogSnapshotJson: catalogSnapshotJson,
+        previousCatalogSha256: previousCatalogSha256,
         contentKind: inputPath == null
             ? SboxContentKind.text.wireValue
             : SboxContentKind.file.wireValue,
@@ -939,7 +1004,9 @@ final class AppController extends ChangeNotifier {
         continuity: CatalogContinuity.advanced,
         catalogPayloadsJson: result.catalogPayloadsJson,
         entries: result.entries,
+        catalogJson: result.catalogJson,
       );
+      await _persistCatalogPlaintextCache(config, _catalog!);
       _catalogConflicts = <CatalogConflictViewData>[];
 
       if (!config.isRemote) {
@@ -972,7 +1039,7 @@ final class AppController extends ChangeNotifier {
       }
       await _publishPendingCatalog(
         pending,
-        mnemonic,
+        null,
         identity.toJson(),
         pendingView: _catalog,
       );
@@ -1002,6 +1069,7 @@ final class AppController extends ChangeNotifier {
         );
       }
       _catalog = pendingView;
+      await _persistCatalogPlaintextCache(config, pendingView);
       await _publishPendingCatalog(
         config,
         mnemonic,
@@ -1103,6 +1171,7 @@ final class AppController extends ChangeNotifier {
               entries: merged.entries,
               catalogPayloadsJson: merged.catalogPayloadsJson,
               continuity: CatalogContinuity.advanced,
+              catalogJson: merged.catalogJson,
             );
             expectedRemoteRevision = remoteMirror.providerRevision;
             resolvedPending = config.copyWith(
@@ -1122,6 +1191,7 @@ final class AppController extends ChangeNotifier {
               await _deletePendingBaseHash(config, baseHash);
             }
             _catalog = resolvedView;
+            await _persistCatalogPlaintextCache(config, resolvedView!);
             _catalogConflicts = <CatalogConflictViewData>[];
 
             final localStore = await FileSystemLocalCipherStore.open(
@@ -1197,7 +1267,7 @@ final class AppController extends ChangeNotifier {
         mnemonic: mnemonic,
         publicIdentityJson: identity.toJson(),
         syncRemote: syncRemote,
-        localStatus: '条目元数据与签名 Catalog 已更新；永久密文对象未被改写。',
+        localStatus: '条目元数据与加密 Catalog 已更新；永久密文对象未被改写。',
         queuedStatus: '条目元数据已写入本地加密 Catalog，并进入待同步队列。',
       );
     });
@@ -1250,6 +1320,7 @@ final class AppController extends ChangeNotifier {
     required String queuedStatus,
   }) async {
     _catalog = result;
+    await _persistCatalogPlaintextCache(config, result);
     _catalogConflicts = <CatalogConflictViewData>[];
     if (!config.isRemote) {
       await _replaceSource(
@@ -1747,7 +1818,7 @@ final class AppController extends ChangeNotifier {
 
   Future<void> _publishPendingCatalog(
     SourceConfiguration config,
-    String mnemonic,
+    String? mnemonic,
     Map<String, Object?> publicIdentityJson, {
     required CatalogViewTaskResult? pendingView,
   }) async {
@@ -1800,7 +1871,7 @@ final class AppController extends ChangeNotifier {
           _catalogConflicts = <CatalogConflictViewData>[];
           _statusMessage = mergeAttempts == 0
               ? '加密对象已先上传，catalog.sbox 已完成条件提交。'
-              : '检测到远端并发新增，已三方合并、重新签名并完成条件提交。';
+              : '检测到远端并发新增，已三方合并、重新加密并完成条件提交。';
           return;
         } on SboxException catch (error) {
           if (error.code != SboxErrorCode.syncConflict) rethrow;
@@ -1830,6 +1901,12 @@ final class AppController extends ChangeNotifier {
             ),
           );
           try {
+            if (mnemonic == null) {
+              throw const SboxException(
+                SboxErrorCode.syncConflict,
+                '远端 Catalog 发生并发修改；请先解锁目录后重试同步',
+              );
+            }
             final remoteStore = await FileSystemLocalCipherStore.open(
               remoteRoot,
             );
@@ -1873,8 +1950,10 @@ final class AppController extends ChangeNotifier {
               entries: merged.entries,
               catalogPayloadsJson: merged.catalogPayloadsJson,
               continuity: CatalogContinuity.advanced,
+              catalogJson: merged.catalogJson,
             );
             _catalog = working;
+            await _persistCatalogPlaintextCache(workingConfig, working);
             final remoteBaseHash = hexLower(remoteCatalog.sha256);
             await _savePendingBaseSnapshot(
               workingConfig,
@@ -1929,6 +2008,81 @@ final class AppController extends ChangeNotifier {
       baseRevision: null,
       remoteRevision: null,
     );
+  }
+
+  String _catalogPlaintextCachePath(SourceConfiguration config) =>
+      p.join(config.localSyncPath, '.sbox-sync', 'catalog.json');
+
+  Future<void> _persistCatalogPlaintextCache(
+    SourceConfiguration config,
+    CatalogViewTaskResult result,
+  ) async {
+    final catalogJson = result.catalogJson;
+    if (catalogJson == null) return;
+    final catalogFile = File(p.join(config.localSyncPath, 'catalog.sbox'));
+    if (!await catalogFile.exists()) return;
+    final cipherSha256 = await sha256File(catalogFile);
+    if (!constantTimeBytesEqual(cipherSha256, result.encryptedCatalogSha256)) {
+      return;
+    }
+    final cache = CatalogPlaintextCache.fromCatalog(
+      catalog: SboxCatalog.fromJson(catalogJson),
+      catalogSha256: cipherSha256,
+    );
+    final bytes = cache.encode();
+    final target = File(_catalogPlaintextCachePath(config));
+    final staged = File('${target.path}.part');
+    await target.parent.create(recursive: true);
+    try {
+      await staged.writeAsBytes(bytes, flush: true);
+      if (await target.exists()) await target.delete();
+      await staged.rename(target.path);
+    } finally {
+      bytes.fillRange(0, bytes.length, 0);
+      if (await staged.exists()) await staged.delete();
+    }
+  }
+
+  Future<CatalogViewTaskResult?> _restoreCatalogPlaintextCache(
+    SourceConfiguration config,
+  ) async {
+    final identity = _identity?.identity;
+    if (identity == null ||
+        config.localDirectoryMode == ConfiguredLocalMode.looseReadOnly) {
+      return null;
+    }
+    final catalogFile = File(p.join(config.localSyncPath, 'catalog.sbox'));
+    final cacheFile = File(_catalogPlaintextCachePath(config));
+    if (!await catalogFile.exists() || !await cacheFile.exists()) return null;
+    try {
+      final cipherSha256 = await sha256File(catalogFile);
+      final cache = CatalogPlaintextCache.decode(await cacheFile.readAsBytes());
+      final expectedHashText =
+          config.pendingCatalogSha256 ?? config.lastCatalogSha256;
+      if (expectedHashText != null &&
+          !constantTimeBytesEqual(cipherSha256, decodeHex(expectedHashText))) {
+        return null;
+      }
+      final expectedGeneration =
+          config.pendingCatalogGeneration ?? config.highestGeneration;
+      if (!constantTimeBytesEqual(cipherSha256, cache.catalogSha256) ||
+          cache.catalog.recipientKeyId != hexLower(identity.recipientKeyId) ||
+          cache.catalog.signerKeyId != hexLower(identity.catalogSignerKeyId) ||
+          (expectedGeneration != null &&
+              cache.catalog.generation < expectedGeneration) ||
+          (config.effectiveCatalogId != null &&
+              config.effectiveCatalogId != cache.catalog.catalogId)) {
+        return null;
+      }
+      return CryptoTaskRunner.viewCatalogSnapshot(
+        catalog: cache.catalog,
+        encryptedCatalogSha256: cipherSha256,
+      );
+    } on Object {
+      // A stale or manually edited plaintext cache is never trusted and is
+      // intentionally left on disk for the user to inspect or remove.
+      return null;
+    }
   }
 
   String _pendingBaseCatalogPath(SourceConfiguration config) {
@@ -2186,10 +2340,10 @@ final class AppController extends ChangeNotifier {
 
   static String _continuityText(CatalogContinuity continuity) =>
       switch (continuity) {
-        CatalogContinuity.firstTrusted => '目录签名已验证；这是此设备首次信任的 Catalog。',
-        CatalogContinuity.unchanged => '目录签名与哈希已验证；Catalog 未变化。',
-        CatalogContinuity.advanced => '目录签名与历史链已验证。',
-        CatalogContinuity.historyGap => '目录签名有效，但历史链不连续；请人工核对检查点。',
+        CatalogContinuity.firstTrusted => '目录已认证；这是此设备首次信任的 Catalog。',
+        CatalogContinuity.unchanged => '目录认证与哈希已通过；Catalog 未变化。',
+        CatalogContinuity.advanced => '目录认证与历史链已通过。',
+        CatalogContinuity.historyGap => '目录认证有效，但历史链不连续；请人工核对检查点。',
       };
 
   static String _friendlyError(Object error) {
@@ -2200,7 +2354,7 @@ final class AppController extends ChangeNotifier {
         SboxErrorCode.identityDerivation => '助记词与当前身份或此密文不匹配。',
         SboxErrorCode.authentication ||
         SboxErrorCode.integrity => '密钥不匹配、文件损坏或认证失败；未发布明文。',
-        SboxErrorCode.catalogSignature => '目录签名无效，目录内容未展示。',
+        SboxErrorCode.catalogSignature => '目录签名/认证无效，目录内容未展示。',
         SboxErrorCode.catalogRollback => '检测到目录回滚，已停止同步。',
         SboxErrorCode.catalogFork ||
         SboxErrorCode.syncConflict => '目录发生并发分叉，需要刷新后处理冲突。',
@@ -2208,6 +2362,8 @@ final class AppController extends ChangeNotifier {
         SboxErrorCode.catalogRequired => '这是大文件分片，需要对应的 catalog.sbox。',
         SboxErrorCode.storageOverlap => '本地密文目录与临时明文目录不能相同或互相包含。',
         SboxErrorCode.sourceAuthentication => '数据源写入授权缺失、过期或权限不足。',
+        SboxErrorCode.sourceNotFound =>
+          '远端仓库、分支或 catalog.sbox 不存在；请检查配置。空仓库可先加密保存，再执行同步。',
         SboxErrorCode.sourceNetwork => '无法连接或访问数据源，请检查网络或目录授权。',
         SboxErrorCode.sourceRateLimit => '数据源正在限流，请稍后重试。',
         SboxErrorCode.sourceLimit ||

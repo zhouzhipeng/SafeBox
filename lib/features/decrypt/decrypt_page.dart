@@ -262,7 +262,7 @@ class _DecryptPageState extends State<DecryptPage> {
         children: <Widget>[
           SectionTitle(
             title: entry == null ? 'SBOX 公共头部' : '已验证 Catalog 项目',
-            subtitle: entry == null ? '这些字段不包含加密 Metadata' : '标题与文件名来自签名目录',
+            subtitle: entry == null ? '这些字段不包含加密 Metadata' : '标题与文件名来自已认证目录',
           ),
           const SizedBox(height: 16),
           if (entry != null) ...<Widget>[
@@ -338,8 +338,8 @@ class _DecryptPageState extends State<DecryptPage> {
             value: parts <= 1 ? '1/1 已就绪' : '$parts/$parts 已同步并待逐片认证',
           ),
           _InfoRow(
-            label: 'Catalog 签名',
-            value: entry == null ? '不适用（独立 single）' : 'Ed25519 已验证',
+            label: 'Catalog 认证',
+            value: entry == null ? '不适用（独立 single）' : '目录已认证',
           ),
           const SizedBox(height: 6),
           const StatusPill(
@@ -471,7 +471,7 @@ class _EntrySourceCard extends StatelessWidget {
         ),
         const SizedBox(width: 10),
         const StatusPill(
-          label: 'Catalog 签名有效',
+          label: 'Catalog 已认证',
           icon: Icons.verified_outlined,
           tone: SboxColors.success,
         ),
@@ -584,7 +584,7 @@ class _InfoRow extends StatelessWidget {
 
 String _decryptOperation(AppOperation operation) => switch (operation) {
   AppOperation.syncingObjects || AppOperation.refreshing => '正在同步全部密文分片到本地',
-  AppOperation.unlockingCatalog => '正在验证 Catalog 签名与历史链',
+  AppOperation.unlockingCatalog => '正在解密并验证 Catalog 与历史链',
   AppOperation.decrypting => '正在逐记录认证、解密与重组',
   AppOperation.exporting => '正在通过系统选择器导出已验证文件',
   _ => '正在准备安全任务',

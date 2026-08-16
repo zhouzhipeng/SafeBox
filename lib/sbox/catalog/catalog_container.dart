@@ -40,6 +40,39 @@ final class OpenedCatalogContainer {
   final Uint8List containerSha256;
 }
 
+/// Encrypts a Catalog with the recipient public key only.
+///
+/// The outer SBOX container still authenticates the plaintext with
+/// AES-256-GCM after the DEK is wrapped by RSA-OAEP. This path deliberately
+/// omits the legacy Ed25519 author signature because producing that signature
+/// would require the mnemonic/private key during an encryption-only task.
+Future<PreparedCatalogContainer> createCatalogContainerWithPublicKey({
+  required SboxCatalog catalog,
+  required PublicIdentity expectedIdentity,
+  SboxEncryptionRandomness? randomness,
+}) async {
+  Uint8List? plaintext;
+  try {
+    plaintext = CatalogSignatureCodec().encodePublicKeyOnly(
+      catalog: catalog,
+      expectedIdentity: expectedIdentity,
+    );
+    if (plaintext.length > 16 * 1024 * 1024) {
+      throw const SboxException(
+        SboxErrorCode.limits,
+        'Catalog JSON 超过 16 MiB 上限',
+      );
+    }
+    return await _encryptCatalogPlaintext(
+      plaintext: plaintext,
+      expectedIdentity: expectedIdentity,
+      randomness: randomness,
+    );
+  } finally {
+    plaintext?.fillRange(0, plaintext.length, 0);
+  }
+}
+
 Future<PreparedCatalogContainer> createCatalogContainerWithMnemonic({
   required SboxCatalog catalog,
   required EphemeralMnemonic mnemonic,
@@ -81,30 +114,42 @@ Future<PreparedCatalogContainer> createCatalogContainerWithMnemonic({
     ephemeral = null;
     mnemonic.dispose();
 
-    final bytes = await SboxContainerCodec().encryptBytes(
-      recipient: expectedIdentity,
-      contentKind: SboxContentKind.catalog,
-      originalName: 'catalog.json',
-      mediaType: 'application/vnd.sbox.catalog+json',
-      data: plaintext,
+    return await _encryptCatalogPlaintext(
+      plaintext: plaintext,
+      expectedIdentity: expectedIdentity,
       randomness: randomness,
-    );
-    if (bytes.length > 20 * 1024 * 1024) {
-      throw const SboxException(
-        SboxErrorCode.limits,
-        'catalog.sbox 超过 20 MiB 上限',
-      );
-    }
-    return PreparedCatalogContainer._(
-      bytes: bytes,
-      header: SboxHeader.parse(bytes),
-      sha256: sha256Bytes(bytes),
     );
   } finally {
     plaintext?.fillRange(0, plaintext.length, 0);
     ephemeral?.disposeControlledSecrets();
     mnemonic.dispose();
   }
+}
+
+Future<PreparedCatalogContainer> _encryptCatalogPlaintext({
+  required Uint8List plaintext,
+  required PublicIdentity expectedIdentity,
+  SboxEncryptionRandomness? randomness,
+}) async {
+  final bytes = await SboxContainerCodec().encryptBytes(
+    recipient: expectedIdentity,
+    contentKind: SboxContentKind.catalog,
+    originalName: 'catalog.json',
+    mediaType: 'application/vnd.sbox.catalog+json',
+    data: plaintext,
+    randomness: randomness,
+  );
+  if (bytes.length > 20 * 1024 * 1024) {
+    throw const SboxException(
+      SboxErrorCode.limits,
+      'catalog.sbox 超过 20 MiB 上限',
+    );
+  }
+  return PreparedCatalogContainer._(
+    bytes: bytes,
+    header: SboxHeader.parse(bytes),
+    sha256: sha256Bytes(bytes),
+  );
 }
 
 Future<OpenedCatalogContainer> openCatalogContainerWithMnemonic({

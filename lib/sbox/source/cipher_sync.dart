@@ -258,7 +258,7 @@ final class CipherMirrorSynchronizer {
     if (catalog == null) {
       throw const SboxException(
         SboxErrorCode.catalog,
-        '已签名加密的本地 catalog.sbox 不存在',
+        '已加密的本地 catalog.sbox 不存在',
       );
     }
     onProgress?.call(

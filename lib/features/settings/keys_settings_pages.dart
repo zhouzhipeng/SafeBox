@@ -139,7 +139,7 @@ class KeysPage extends StatelessWidget {
         const SizedBox(height: 16),
         const SecurityNotice(
           title: '没有私钥导入、导出或“保持解锁”',
-          message: '每次 OAEP 解封与 Catalog 签名都使用新的一次性 Crypto Isolate。完整退出并重启 Release 应用进程是 Dart Heap 的最终清理边界。',
+          message: '每次 OAEP 解封、目录解密或兼容签名都使用新的一次性 Crypto Isolate。加密保存不需要私钥；完整退出并重启 Release 应用进程是 Dart Heap 的最终清理边界。',
         ),
         const SizedBox(height: 16),
         SboxCard(
@@ -341,7 +341,7 @@ class SettingsPage extends StatelessWidget {
               const _SettingLine(
                 icon: Icons.analytics_outlined,
                 title: '敏感遥测与日志',
-                subtitle: '助记词、DEK、令牌、路径和解密 Catalog 不会进入遥测',
+                    subtitle: '助记词、DEK、令牌、路径和 Catalog 内容不会进入遥测；本地明文缓存按用户选择保留',
                 state: '关闭',
               ),
               const _SettingLine(

@@ -64,6 +64,22 @@ final class GiteeDataSource extends RepositoryDataSource {
   }
 
   @override
+  Uri repositoryProbeUri() => Uri(
+    scheme: 'https',
+    host: 'gitee.com',
+    pathSegments: <String>[
+      'api',
+      'v5',
+      'repos',
+      config.owner,
+      config.repository,
+      'contents',
+      if (config.pathPrefix.isNotEmpty) ...config.pathPrefix.split('/'),
+    ],
+    queryParameters: <String, String>{'ref': config.branch},
+  );
+
+  @override
   Map<String, String> publicHeaders({required bool raw}) => <String, String>{
     'Accept': raw ? 'application/octet-stream' : 'application/json',
     'User-Agent': 'SafeBox-v1',

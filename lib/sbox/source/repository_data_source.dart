@@ -39,7 +39,31 @@ abstract base class RepositoryDataSource implements DataSource {
   Uri metadataUri(SourcePath path);
   Uri writeUri(SourcePath path);
   Uri rawUri(SourcePath path, RepositoryObjectMetadata metadata);
+
+  /// URI used by the connection test to validate the repository and branch
+  /// independently from the optional `catalog.sbox` object.
+  Uri repositoryProbeUri();
   Map<String, String> publicHeaders({required bool raw});
+
+  /// Verifies that the repository and configured branch are reachable.
+  ///
+  /// A repository can be valid but not initialized yet (for example, an
+  /// otherwise empty public GitHub repository).  Keeping this probe separate
+  /// from [get] lets the UI distinguish that state from a missing repository,
+  /// branch, or directory prefix.
+  Future<void> verifyRepository() async {
+    final response = await httpTransport.get(
+      repositoryProbeUri(),
+      headers: publicHeaders(raw: false),
+    );
+    if (response.statusCode != 200) {
+      await httpTransport.throwForStatus(response, RemoteFailureContext.read);
+    }
+    await httpTransport.readBounded(
+      response.stream,
+      maximumBytes: RemoteHttp.maximumMetadataBytes,
+    );
+  }
 
   @override
   Future<SourceRead> get(SourcePath path, {RevisionToken? ifNoneMatch}) async {

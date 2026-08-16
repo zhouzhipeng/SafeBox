@@ -29,6 +29,65 @@ void main() {
     },
   );
 
+  test(
+    'public-key-only encryption creates and appends Catalog without a mnemonic',
+    () async {
+      final temporary = await Directory.systemTemp.createTemp('sbox-public-');
+      addTearDown(() => temporary.delete(recursive: true));
+      final cipherRoot = Directory(
+        '${temporary.path}${Platform.pathSeparator}cipher',
+      );
+      final identity = await CryptoTaskRunner.derivePublicIdentity(
+        _vectorMnemonic,
+      );
+
+      final first = await CryptoTaskRunner.encryptAndCommitCatalogPublic(
+        text: 'public-key-only first\n',
+        localCipherRoot: cipherRoot.path,
+        publicIdentityJson: identity.publicIdentityJson,
+        contentKind: 2,
+        originalName: 'first.txt',
+        mediaType: 'text/plain; charset=utf-8',
+        title: 'First',
+        description: '',
+        tags: const <String>[],
+        capabilitiesJson: CryptoTaskRunner.capabilitiesToMessage(
+          SourceCapabilities.localReadWrite,
+        ),
+      );
+      final catalogPath =
+          '${cipherRoot.path}${Platform.pathSeparator}catalog.sbox';
+      final unlocked = await CryptoTaskRunner.unlockCatalog(
+        catalogPath: catalogPath,
+        mnemonic: _vectorMnemonic,
+        publicIdentityJson: identity.publicIdentityJson,
+        expectedCatalogId: first.catalogId,
+      );
+      final second = await CryptoTaskRunner.encryptAndCommitCatalogPublic(
+        text: 'public-key-only second\n',
+        localCipherRoot: cipherRoot.path,
+        publicIdentityJson: identity.publicIdentityJson,
+        catalogSnapshotJson: unlocked.catalogJson,
+        previousCatalogSha256: hexLower(first.encryptedCatalogSha256),
+        contentKind: 2,
+        originalName: 'second.txt',
+        mediaType: 'text/plain; charset=utf-8',
+        title: 'Second',
+        description: '',
+        tags: const <String>[],
+        capabilitiesJson: CryptoTaskRunner.capabilitiesToMessage(
+          SourceCapabilities.localReadWrite,
+        ),
+      );
+
+      expect(first.generation, 1);
+      expect(second.generation, 2);
+      expect(second.catalogJson, isNotNull);
+      expect(second.catalogPayloadsJson, hasLength(2));
+    },
+    timeout: const Timeout(Duration(seconds: 90)),
+  );
+
   test('application task round trip commits Catalog and publishes plaintext', () async {
     final temporary = await Directory.systemTemp.createTemp('sbox-task-');
     addTearDown(() => temporary.delete(recursive: true));

@@ -77,6 +77,36 @@ void main() {
       },
     );
 
+    test(
+      'repository probe validates the configured branch and prefix',
+      () async {
+        final client = MockClient.streaming((request, body) async {
+          expect(request.method, 'GET');
+          expect(request.url.path, '/repos/alice/vault/contents/sbox');
+          expect(request.url.queryParameters['ref'], 'main');
+          expect(
+            request.headers['accept'],
+            'application/vnd.github.object+json',
+          );
+          return _jsonResponse(<String, Object?>{
+            'type': 'dir',
+            'entries': const <Object?>[],
+          });
+        });
+        final source = GitHubDataSource(
+          config: RepositorySourceConfig(
+            owner: 'alice',
+            repository: 'vault',
+            branch: 'main',
+            pathPrefix: 'sbox',
+          ),
+          client: client,
+        );
+
+        await source.verifyRepository();
+      },
+    );
+
     test('GitHub create streams Base64 JSON and disposes the token', () async {
       final store = _CredentialStore('github-token');
       var calls = 0;
