@@ -64,6 +64,27 @@ Android 的“打开本地目录”使用 Storage Access Framework 并持久保�
 
 项目固定于 `.metadata` 中记录的 Flutter stable revision `4cf24164269a5ebf0c16a028a00727d0e77bbb05`（Flutter 3.47.0 / Dart 3.13.0）。
 
+### 运行 Windows 桌面应用
+
+使用项目自带的 [`run_safebox.py`](run_safebox.py) 启动 Windows 桌面版：
+
+```powershell
+python run_safebox.py
+```
+
+运行 Release 模式：
+
+```powershell
+python run_safebox.py --release
+```
+
+脚本会依次从 `PATH`、项目 Flutter 配置和常见 SDK 路径查找 Flutter。若 Flutter 安装在其他位置，可先设置：
+
+```powershell
+$env:FLUTTER_ROOT = 'C:\src\flutter'
+python run_safebox.py
+```
+
 ```powershell
 flutter pub get
 flutter analyze --no-pub
