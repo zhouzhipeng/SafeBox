@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:path/path.dart' as p;
 
 import '../../app/app_controller.dart';
 import '../../app/sbox_dialogs.dart';
@@ -92,6 +93,9 @@ class _DecryptPageState extends State<DecryptPage> {
     final controller = widget.controller;
     final entry = _entry;
     final inspection = controller.inspection;
+    final catalogVerified =
+        inspection != null &&
+        controller.lastUnlockedCatalogPath == inspection.path;
     final hasInput = entry != null || inspection != null;
     final parts = entry?.partCount ?? (inspection == null ? 0 : 1);
     return ListView(
@@ -103,7 +107,7 @@ class _DecryptPageState extends State<DecryptPage> {
         ),
         const SizedBox(height: 22),
         _StepStrip(
-          active: controller.lastDecryptedPath != null
+          active: catalogVerified || controller.lastDecryptedPath != null
               ? 3
               : controller.isBusy
               ? 2
@@ -142,11 +146,14 @@ class _DecryptPageState extends State<DecryptPage> {
             },
           ),
           const SizedBox(height: 16),
-          const SecurityNotice(
-            title: '临时解密目录',
-            message:
-                '认证通过的明文会保留到你导出、单独删除或执行“全部删除”。普通删除不等于物理安全擦除；本地 .sbox 原件始终保留。',
-            icon: Icons.folder_special_outlined,
+          SecurityNotice(
+            title: catalogVerified ? 'Catalog 验证结果' : '临时解密目录',
+            message: catalogVerified
+                ? 'Catalog 已在解密后完成目录结构与身份认证；它不会作为普通临时明文发布。请前往“资料库”查看已验证条目。'
+                : '认证通过的明文会保留到你导出、单独删除或执行“全部删除”。普通删除不等于物理安全擦除；本地 .sbox 原件始终保留。',
+            icon: catalogVerified
+                ? Icons.fact_check_outlined
+                : Icons.folder_special_outlined,
           ),
           if (controller.isBusy) ...<Widget>[
             const SizedBox(height: 16),
@@ -169,7 +176,7 @@ class _DecryptPageState extends State<DecryptPage> {
             ),
           ],
           const SizedBox(height: 18),
-          if (controller.lastDecryptedPath == null)
+          if (controller.lastDecryptedPath == null && !catalogVerified)
             SizedBox(
               width: double.infinity,
               child: ElevatedButton.icon(
@@ -178,9 +185,15 @@ class _DecryptPageState extends State<DecryptPage> {
                     ? null
                     : _decrypt,
                 icon: const Icon(Icons.lock_open_outlined),
-                label: const Text('验证并解密'),
+                label: Text(
+                  _isCatalogInspection(inspection)
+                      ? '验证并打开 Catalog'
+                      : '验证并解密',
+                ),
               ),
             )
+          else if (catalogVerified)
+            _verifiedCatalogResult(context)
           else
             _verifiedResult(context),
         ],
@@ -313,6 +326,8 @@ class _DecryptPageState extends State<DecryptPage> {
     int parts,
   ) {
     final source = widget.controller.selectedSource;
+    final standaloneCatalog =
+        entry == null && _isCatalogInspection(widget.controller.inspection);
     return SboxCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -339,7 +354,11 @@ class _DecryptPageState extends State<DecryptPage> {
           ),
           _InfoRow(
             label: 'Catalog 认证',
-            value: entry == null ? '不适用（独立 single）' : '目录已认证',
+            value: entry != null
+                ? '目录已认证'
+                : standaloneCatalog
+                ? '当前文件为 Catalog，待验证'
+                : '不适用（独立 single）',
           ),
           const SizedBox(height: 6),
           const StatusPill(
@@ -426,7 +445,54 @@ class _DecryptPageState extends State<DecryptPage> {
       ),
     );
   }
+
+  Widget _verifiedCatalogResult(BuildContext context) {
+    final controller = widget.controller;
+    final catalog = controller.catalog;
+    return SboxCard(
+      color: const Color(0xFF0D2420),
+      borderColor: SboxColors.success.withValues(alpha: 0.35),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          const SectionTitle(
+            title: 'Catalog 认证通过',
+            subtitle: '目录已解密并验证；没有把 catalog.json 当作普通临时文件发布',
+          ),
+          const SizedBox(height: 14),
+          _InfoRow(
+            label: 'Catalog ID',
+            value: catalog?.catalogId ?? '已验证',
+            mono: true,
+          ),
+          _InfoRow(
+            label: '代数',
+            value: '${catalog?.generation ?? 0}',
+          ),
+          _InfoRow(
+            label: '已认证条目',
+            value: '${catalog?.entries.length ?? 0}',
+          ),
+          _InfoRow(
+            label: '密文原件',
+            value: controller.inspection?.path ?? '',
+            mono: true,
+          ),
+          const SizedBox(height: 8),
+          const StatusPill(
+            label: '目录内容已认证',
+            icon: Icons.verified_outlined,
+            tone: SboxColors.success,
+          ),
+        ],
+      ),
+    );
+  }
 }
+
+bool _isCatalogInspection(StandaloneSboxInspection? inspection) =>
+    inspection != null &&
+    p.basename(inspection.path).toLowerCase() == 'catalog.sbox';
 
 class _EntrySourceCard extends StatelessWidget {
   const _EntrySourceCard({required this.controller, required this.entry});

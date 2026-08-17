@@ -227,6 +227,7 @@ final class AppController extends ChangeNotifier {
   String? _temporaryRoot;
   String? _lastDecryptedPath;
   String? _lastDecryptedName;
+  String? _lastUnlockedCatalogPath;
   String? _errorMessage;
   String? _statusMessage;
   bool _clearPlaintextOnExit = false;
@@ -273,6 +274,7 @@ final class AppController extends ChangeNotifier {
   String? get temporaryRoot => _temporaryRoot;
   String? get lastDecryptedPath => _lastDecryptedPath;
   String? get lastDecryptedName => _lastDecryptedName;
+  String? get lastUnlockedCatalogPath => _lastUnlockedCatalogPath;
   String? get errorMessage => _errorMessage;
   String? get statusMessage => _statusMessage;
   AppOperation get operation => _operation;
@@ -1465,6 +1467,9 @@ final class AppController extends ChangeNotifier {
     final header = SboxHeader.parse(bytes);
     final hash = await sha256RandomAccessFile(handle);
     final keyId = hexLower(header.recipientKeyId);
+    _lastDecryptedPath = null;
+    _lastDecryptedName = null;
+    _lastUnlockedCatalogPath = null;
     _inspection = StandaloneSboxInspection(
       path: path,
       version: '${SboxV1.versionMajor}.${SboxV1.versionMinor}',
@@ -1481,19 +1486,54 @@ final class AppController extends ChangeNotifier {
     if (inspected == null) throw StateError('请先选择 SBOX 文件');
     final identity = _requireIdentity();
     await _run(AppOperation.decrypting, () async {
-      final result = await CryptoTaskRunner.decryptStandalone(
-        sboxPath: inspected.path,
-        temporaryPlaintextRoot: _temporaryRoot!,
-        cipherRoots: _sources.map((source) => source.localSyncPath).toList(),
-        mnemonic: mnemonic,
-        publicIdentityJson: identity.toJson(),
-        expectedCiphertextSha256: inspected.ciphertextSha256,
-      );
-      _lastDecryptedPath = result.plaintextPath;
-      _lastDecryptedName = result.originalName;
-      await refreshTemporaryStats();
-      _statusMessage = 'GCM 与 Final 完整认证通过；明文已发布到受管理临时目录。';
+      // catalog.sbox is a complete encrypted Catalog, not a user file. It
+      // must be authenticated through the Catalog path instead of being
+      // published into the managed ordinary-plaintext directory.
+      if (p.basename(inspected.path).toLowerCase() == 'catalog.sbox') {
+        await _unlockStandaloneCatalog(inspected, mnemonic, identity);
+        return;
+      }
+
+      try {
+        final result = await CryptoTaskRunner.decryptStandalone(
+          sboxPath: inspected.path,
+          temporaryPlaintextRoot: _temporaryRoot!,
+          cipherRoots: _sources.map((source) => source.localSyncPath).toList(),
+          mnemonic: mnemonic,
+          publicIdentityJson: identity.toJson(),
+          expectedCiphertextSha256: inspected.ciphertextSha256,
+        );
+        _lastDecryptedPath = result.plaintextPath;
+        _lastDecryptedName = result.originalName;
+        _lastUnlockedCatalogPath = null;
+        await refreshTemporaryStats();
+        _statusMessage = 'GCM 与 Final 完整认证通过；明文已发布到受管理临时目录。';
+      } on SboxException catch (error) {
+        // A renamed Catalog still has to work: the external filename is not
+        // a cryptographic input. The authenticated Metadata tells us that
+        // this is a Catalog, so retry it through the Catalog verifier.
+        if (error.code != SboxErrorCode.catalog) rethrow;
+        await _unlockStandaloneCatalog(inspected, mnemonic, identity);
+      }
     });
+  }
+
+  Future<void> _unlockStandaloneCatalog(
+    StandaloneSboxInspection inspected,
+    String mnemonic,
+    PublicIdentityRecord identity,
+  ) async {
+    final result = await CryptoTaskRunner.unlockCatalog(
+      catalogPath: inspected.path,
+      mnemonic: mnemonic,
+      publicIdentityJson: identity.toJson(),
+      expectedCiphertextSha256: inspected.ciphertextSha256,
+    );
+    _catalog = result;
+    _lastDecryptedPath = null;
+    _lastDecryptedName = null;
+    _lastUnlockedCatalogPath = inspected.path;
+    _statusMessage = 'Catalog 已解密并通过目录认证；未将 catalog.json 发布为普通临时明文。';
   }
 
   Future<void> decryptEntry(String entryId, String mnemonic) async {

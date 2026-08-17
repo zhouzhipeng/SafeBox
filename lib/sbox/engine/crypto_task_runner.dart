@@ -561,11 +561,29 @@ abstract final class CryptoTaskRunner {
     required Map<String, Object?> publicIdentityJson,
     String? expectedCatalogId,
     Map<String, Object?>? checkpointJson,
+    Uint8List? expectedCiphertextSha256,
   }) {
     return _runOneShot(() async {
       final identity = PublicIdentityRecord.fromJson(publicIdentityJson)
           .identity;
-      final bytes = Uint8List.fromList(await File(catalogPath).readAsBytes());
+      final catalogFile = File(catalogPath);
+      if (await catalogFile.length() > SboxV1.maxCatalogCiphertextSize) {
+        throw const SboxException(
+          SboxErrorCode.limits,
+          'catalog.sbox 超过 20 MiB 上限',
+        );
+      }
+      final bytes = Uint8List.fromList(await catalogFile.readAsBytes());
+      if (expectedCiphertextSha256 != null &&
+          !constantTimeBytesEqual(
+            sha256Bytes(bytes),
+            expectedCiphertextSha256,
+          )) {
+        throw const SboxException(
+          SboxErrorCode.remoteChanged,
+          '所选 Catalog 在检查后发生变化',
+        );
+      }
       final opened = await openCatalogContainerWithMnemonic(
         container: bytes,
         mnemonic: EphemeralMnemonic.fromString(mnemonic),

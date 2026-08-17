@@ -1,8 +1,10 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:safebox/sbox/bytes.dart';
 import 'package:safebox/sbox/catalog/catalog_models.dart';
 import 'package:safebox/sbox/engine/crypto_task_runner.dart';
+import 'package:safebox/sbox/errors.dart';
 import 'package:safebox/sbox/source/data_source.dart';
 import 'package:test/test.dart';
 
@@ -126,11 +128,32 @@ void main() {
       mnemonic: _vectorMnemonic,
       publicIdentityJson: identity.publicIdentityJson,
       expectedCatalogId: committed.catalogId,
+      expectedCiphertextSha256: committed.encryptedCatalogSha256,
     );
     expect(view.generation, 1);
     expect(view.entries.single.title, 'Application round trip');
     expect(view.entries.single.revision, 1);
     expect(view.entries.single.originalName, 'note.txt');
+
+    final wrongCatalogHash = Uint8List.fromList(
+      committed.encryptedCatalogSha256,
+    )..[0] ^= 1;
+    await expectLater(
+      CryptoTaskRunner.unlockCatalog(
+        catalogPath: catalog.path,
+        mnemonic: _vectorMnemonic,
+        publicIdentityJson: identity.publicIdentityJson,
+        expectedCatalogId: committed.catalogId,
+        expectedCiphertextSha256: wrongCatalogHash,
+      ),
+      throwsA(
+        isA<SboxException>().having(
+          (error) => error.code,
+          'code',
+          SboxErrorCode.remoteChanged,
+        ),
+      ),
+    );
 
     final updated = await CryptoTaskRunner.updateCatalogMetadata(
       localCipherRoot: cipherRoot.path,
