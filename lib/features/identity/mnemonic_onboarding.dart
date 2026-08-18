@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../app/app_controller.dart';
+import '../../app/sbox_feedback.dart';
 import '../../app/sbox_theme.dart';
 import '../../app/sbox_widgets.dart';
 
@@ -167,7 +168,7 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
               ? null
               : widget.controller.hasIdentity
               ? () => setState(() => _step = 2)
-              : () => _showFeedback('请先创建或恢复安全身份。'),
+              : () => _showFeedback('请先创建或恢复安全身份。', error: true),
         ),
       ],
     );
@@ -247,7 +248,7 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
               TextButton(
                 onPressed: widget.controller.hasIdentity
                     ? (widget.onOpenSettings ?? widget.onFinished)
-                    : () => _showFeedback('请先创建或恢复安全身份。'),
+                    : () => _showFeedback('请先创建或恢复安全身份。', error: true),
                 child: const Text('稍后设置  ›'),
               ),
             ],
@@ -509,7 +510,7 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
     } catch (error) {
       if (mounted) {
         setState(() => _busy = false);
-        _showFeedback('安全身份创建失败，请重试。');
+        _showFeedback('安全身份创建失败，请重试。', error: true);
       }
     }
   }
@@ -519,7 +520,7 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
       (controller) => controller.text.trim(),
     );
     if (words.any((word) => word.isEmpty)) {
-      _showFeedback('请按顺序填写全部 12 个恢复词。');
+      _showFeedback('请按顺序填写全部 12 个恢复词。', error: true);
       return;
     }
     setState(() => _busy = true);
@@ -533,7 +534,7 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
     } catch (error) {
       if (mounted) {
         setState(() => _busy = false);
-        _showFeedback('恢复词不正确，请检查后重试。');
+        _showFeedback('恢复词不正确，请检查后重试。', error: true);
       }
     }
   }
@@ -550,7 +551,7 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
     final text = data?.text ?? '';
     final words = text.trim().split(RegExp(r'\s+'));
     if (words.length != 12) {
-      _showFeedback('剪贴板中没有找到 12 个恢复词。');
+      _showFeedback('剪贴板中没有找到 12 个恢复词。', error: true);
       return;
     }
     for (var index = 0; index < words.length; index++) {
@@ -559,11 +560,9 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
     if (mounted) setState(() {});
   }
 
-  void _showFeedback(String message) {
+  void _showFeedback(String message, {bool error = false}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+    showSboxFeedback(context, message, error: error);
   }
 }
 

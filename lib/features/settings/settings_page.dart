@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
 import '../../app/app_controller.dart';
+import '../../app/sbox_feedback.dart';
 import '../../app/sbox_theme.dart';
 import '../../app/sbox_widgets.dart';
 import '../../platform/app_settings_store.dart';
@@ -597,7 +598,10 @@ final class _SettingsPageState extends State<SettingsPage> {
       }
       _clearOnExit = await _appSettingsStore.loadClearPlaintextOnExit();
     } catch (error) {
-      if (mounted) widget.controller.setError(error, operation: '读取设置失败');
+      if (mounted) {
+        widget.controller.setError(error, operation: '读取设置失败');
+        _showFeedback('设置暂时无法读取，请稍后重试。', error: true);
+      }
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -608,7 +612,7 @@ final class _SettingsPageState extends State<SettingsPage> {
     final githubUrl = _githubAddressController.text;
     final giteeUrl = _giteeAddressController.text;
     if (githubUrl.trim().isEmpty || giteeUrl.trim().isEmpty) {
-      _showFeedback('请填写 GitHub 和 Gitee 的完整地址。');
+      _showFeedback('请填写 GitHub 和 Gitee 的完整地址。', error: true);
       return;
     }
     late final CloudBackupConfiguration configuration;
@@ -629,7 +633,7 @@ final class _SettingsPageState extends State<SettingsPage> {
         ),
       );
     } catch (_) {
-      _showFeedback('请填写有效的 GitHub / Gitee 完整地址。');
+      _showFeedback('请填写有效的 GitHub / Gitee 完整地址。', error: true);
       return;
     }
     setState(() => _saving = true);
@@ -649,7 +653,7 @@ final class _SettingsPageState extends State<SettingsPage> {
     } catch (error) {
       if (mounted) {
         widget.controller.setError(error, operation: '保存云端备份设置失败');
-        _showFeedback('设置暂时没有保存成功，请稍后重试。');
+        _showFeedback('设置暂时没有保存成功，请稍后重试。', error: true);
       }
     } finally {
       if (mounted) setState(() => _saving = false);
@@ -673,7 +677,7 @@ final class _SettingsPageState extends State<SettingsPage> {
         expectedHost: isGithub ? 'github.com' : 'gitee.com',
       );
     } catch (_) {
-      _showFeedback('请先填写有效的完整地址。');
+      _showFeedback('请先填写有效的完整地址。', error: true);
       return;
     }
     setState(() => _testingProvider = provider);
@@ -713,7 +717,7 @@ final class _SettingsPageState extends State<SettingsPage> {
           '$provider：测试连接失败',
           detail: error.toString(),
         );
-        _showFeedback('$provider 暂时无法连接，请检查地址和凭证。');
+        _showFeedback('$provider 暂时无法连接，请检查地址和凭证。', error: true);
       }
     } finally {
       client.close();
@@ -768,7 +772,7 @@ final class _SettingsPageState extends State<SettingsPage> {
     } catch (error) {
       if (mounted) {
         widget.controller.setError(error, operation: '移除安全身份失败');
-        _showFeedback('身份相关数据没有完全清理，请稍后重试。');
+        _showFeedback('身份相关数据没有完全清理，请稍后重试。', error: true);
       }
     } finally {
       if (mounted) setState(() => _removingIdentity = false);
@@ -817,7 +821,7 @@ final class _SettingsPageState extends State<SettingsPage> {
     } catch (error) {
       if (mounted) {
         widget.controller.setError(error, operation: '清理临时文件失败');
-        _showFeedback('临时文件没有完全清理，请稍后重试。');
+        _showFeedback('临时文件没有完全清理，请稍后重试。', error: true);
       }
     }
   }
@@ -832,15 +836,14 @@ final class _SettingsPageState extends State<SettingsPage> {
       widget.controller.setError(error, operation: '打开缓存目录失败');
       _showFeedback(
         error is UnsupportedError ? '当前平台不支持打开缓存目录。' : '缓存目录暂时无法打开，请稍后重试。',
+        error: true,
       );
     }
   }
 
-  void _showFeedback(String message) {
+  void _showFeedback(String message, {bool error = false}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+    showSboxFeedback(context, message, error: error);
   }
 }
 

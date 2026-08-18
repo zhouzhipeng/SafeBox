@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 
 import '../../app/app_controller.dart';
 import '../../app/app_logger.dart';
+import '../../app/sbox_feedback.dart';
 import '../../app/sbox_theme.dart';
 import '../../app/sbox_widgets.dart';
 import '../../platform/cloud_backup_configuration_store.dart';
@@ -904,7 +905,7 @@ final class _LibraryPageState extends State<LibraryPage> {
           '读取云端文件失败',
           detail: AppLogger.describeError(error),
         );
-        _showFeedback('暂时无法读取云端文件，请稍后重试。');
+        _showFeedback('暂时无法读取云端文件，请稍后重试。', error: true);
       }
     } finally {
       nextClient?.close();
@@ -999,7 +1000,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     if (path.isEmpty ||
         await FileSystemEntity.type(path, followLinks: false) !=
             FileSystemEntityType.file) {
-      _showFeedback('请选择一个文件。');
+      _showFeedback('请选择一个文件。', error: true);
       return;
     }
     final length = await File(path).length();
@@ -1019,17 +1020,17 @@ final class _LibraryPageState extends State<LibraryPage> {
       return;
     }
     if (record == null) {
-      _showFeedback('请先完成安全身份设置。');
+      _showFeedback('请先完成安全身份设置。', error: true);
       return;
     }
     if (configuration == null || !_credentialsReady) {
-      _showFeedback('请先在设置中完成云端备份。');
+      _showFeedback('请先在设置中完成云端备份。', error: true);
       widget.onOpenCloudSettings?.call();
       return;
     }
     final sourceFile = File(file.path);
     if (!await sourceFile.exists()) {
-      _showFeedback('找不到要上传的文件，请重新选择。');
+      _showFeedback('找不到要上传的文件，请重新选择。', error: true);
       return;
     }
     setState(() {
@@ -1181,7 +1182,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     if (bundle == null) return;
     final configuration = _configuration ?? await _configurationStore.load();
     if (configuration == null) {
-      _showFeedback('未找到本地加密备份，请使用下载并解密。');
+      _showFeedback('未找到本地加密备份，请使用下载并解密。', error: true);
       return;
     }
     final mnemonic = await _askMnemonic(title: '解密文件', actionLabel: '解密文件');
@@ -1222,7 +1223,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     } catch (error) {
       if (mounted) {
         widget.controller.setError(error, operation: '解密文件失败');
-        _showFeedback('文件暂时无法解密，请检查本地备份和恢复词。');
+        _showFeedback('文件暂时无法解密，请检查本地备份和恢复词。', error: true);
       }
     } finally {
       if (mounted) {
@@ -1238,7 +1239,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     final bundle = row.bundle;
     final plaintext = bundle?.plaintextFile;
     if (bundle == null || plaintext == null) {
-      _showFeedback('本地明文不存在，请先解密文件或下载并解密。');
+      _showFeedback('本地明文不存在，请先解密文件或下载并解密。', error: true);
       return;
     }
     try {
@@ -1247,7 +1248,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     } catch (error) {
       if (mounted) {
         widget.controller.setError(error, operation: '打开文件失败');
-        _showFeedback('文件暂时无法打开，请稍后重试。');
+        _showFeedback('文件暂时无法打开，请稍后重试。', error: true);
       }
     }
   }
@@ -1256,7 +1257,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     final bundle = row.bundle;
     final plaintext = bundle?.plaintextFile;
     if (bundle == null || plaintext == null) {
-      _showFeedback('本地明文不存在，请先解密文件或下载并解密。');
+      _showFeedback('本地明文不存在，请先解密文件或下载并解密。', error: true);
       return;
     }
     try {
@@ -1265,7 +1266,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     } catch (error) {
       if (mounted) {
         widget.controller.setError(error, operation: '打开文件夹失败');
-        _showFeedback('文件夹暂时无法打开，请稍后重试。');
+        _showFeedback('文件夹暂时无法打开，请稍后重试。', error: true);
       }
     }
   }
@@ -1391,14 +1392,7 @@ final class _LibraryPageState extends State<LibraryPage> {
 
   void _showFeedback(String message, {bool error = false}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        SnackBar(
-          content: Text(message),
-          backgroundColor: error ? Theme.of(context).colorScheme.error : null,
-        ),
-      );
+    showSboxFeedback(context, message, error: error);
   }
 
   static String _formatBytes(BigInt bytes) {
