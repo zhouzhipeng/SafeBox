@@ -53,6 +53,12 @@ abstract base class RepositoryDataSource
   Uri listUri({String? cursor, int pageSize = 1000});
   Uri writeUri(SourcePath path);
   Uri rawUri(SourcePath path, RepositoryObjectMetadata metadata);
+
+  /// Providers may expose a raw endpoint whose response headers contain all
+  /// information needed for a read. This avoids metadata endpoints that
+  /// inline the entire file as Base64 content.
+  Uri? rawUriWithoutMetadata(SourcePath path) => null;
+
   Uri repositoryProbeUri();
   Map<String, String> publicHeaders({required bool raw});
 
@@ -84,6 +90,44 @@ abstract base class RepositoryDataSource
 
   @override
   Future<SourceRead> get(SourcePath path, {RevisionToken? ifNoneMatch}) async {
+    final directUri = rawUriWithoutMetadata(path);
+    if (directUri != null) {
+      final headers = await _requestHeaders(raw: true);
+      if (ifNoneMatch != null) {
+        headers['If-None-Match'] = _revisionString(ifNoneMatch);
+      }
+      final response = await httpTransport.get(directUri, headers: headers);
+      if (response.statusCode == 304 && ifNoneMatch != null) {
+        await httpTransport.discard(response.stream);
+        return SourceRead(
+          body: const Stream<List<int>>.empty(),
+          length: 0,
+          revision: ifNoneMatch,
+          notModified: true,
+        );
+      }
+      if (response.statusCode != 200) {
+        await httpTransport.throwForStatus(response, RemoteFailureContext.read);
+      }
+      final size = _responseSize(response);
+      final revision = _responseRevision(response);
+      if (size == null ||
+          size < 0 ||
+          revision == null ||
+          capabilities.maxObjectBytes != null &&
+              size > capabilities.maxObjectBytes!) {
+        await httpTransport.discard(response.stream);
+        throw const SboxException(
+          SboxErrorCode.sourceNetwork,
+          '鏁版嵁婧愯繑鍥炰簡鏃犳晥瀵硅薄鍝嶅簲',
+        );
+      }
+      return SourceRead(
+        body: _verifiedStream(response.stream, size),
+        length: size,
+        revision: revision,
+      );
+    }
     final metadata = await _readMetadata(path);
     final revision = RevisionToken(ascii.encode(metadata.revision));
     if (ifNoneMatch != null && revision.matches(ifNoneMatch)) {
@@ -119,21 +163,36 @@ abstract base class RepositoryDataSource
       throw const SboxException(SboxErrorCode.invalidHeader, '范围读取边界无效');
     }
     logger?.info('$sourceName：读取对象范围', detail: '读取公共头范围');
-    final metadata =
-        objectInfo == null ||
-            objectInfo.length == 0 ||
-            objectInfo.downloadUri == null
-        ? await _readMetadata(path)
-        : RepositoryObjectMetadata(
-            revision: _revisionString(objectInfo.revision),
-            size: objectInfo.length,
-            downloadUri: objectInfo.downloadUri,
-          );
-    if (endExclusive > metadata.size) {
+    final directUri = rawUriWithoutMetadata(path);
+    late final Uri requestUri;
+    late final RevisionToken? knownRevision;
+    int? knownSize;
+    if (directUri != null) {
+      requestUri = directUri;
+      knownRevision = objectInfo?.revision;
+      if (objectInfo != null && objectInfo.length > 0) {
+        knownSize = objectInfo.length;
+      }
+    } else {
+      final metadata =
+          objectInfo == null ||
+              objectInfo.length == 0 ||
+              objectInfo.downloadUri == null
+          ? await _readMetadata(path)
+          : RepositoryObjectMetadata(
+              revision: _revisionString(objectInfo.revision),
+              size: objectInfo.length,
+              downloadUri: objectInfo.downloadUri,
+            );
+      requestUri = rawUri(path, metadata);
+      knownRevision = RevisionToken(ascii.encode(metadata.revision));
+      knownSize = metadata.size;
+    }
+    if (knownSize != null && endExclusive > knownSize) {
       throw const SboxException(SboxErrorCode.truncated, '范围读取超过对象长度');
     }
     final response = await httpTransport.get(
-      rawUri(path, metadata),
+      requestUri,
       headers: <String, String>{
         ...await _requestHeaders(raw: true),
         'Range': 'bytes=$start-${endExclusive - 1}',
@@ -143,14 +202,18 @@ abstract base class RepositoryDataSource
       await httpTransport.throwForStatus(response, RemoteFailureContext.read);
     }
     final requestedLength = endExclusive - start;
+    final revision = knownRevision ?? _responseRevision(response);
+    if (revision == null) {
+      await httpTransport.discard(response.stream);
+      throw const SboxException(
+        SboxErrorCode.sourceNetwork,
+        '鏁版嵁婧愯繑鍥炰簡鏃犳晥瀵硅薄鍝嶅簲',
+      );
+    }
     final body = response.statusCode == 200
         ? _sliceStream(response.stream, start: start, length: requestedLength)
         : _verifiedStream(response.stream, requestedLength);
-    return SourceRead(
-      body: body,
-      length: requestedLength,
-      revision: RevisionToken(ascii.encode(metadata.revision)),
-    );
+    return SourceRead(body: body, length: requestedLength, revision: revision);
   }
 
   @override
@@ -189,9 +252,9 @@ abstract base class RepositoryDataSource
         objects.add(
           SourceObjectInfo(
             path: path,
-            // Some Gitee directory responses omit size even for files. The
-            // per-object metadata request used by range/read operations still
-            // supplies and verifies the exact size.
+            // Some provider directory responses omit size even for files.
+            // Providers with a direct raw endpoint can read without it;
+            // other providers retrieve metadata on demand.
             length: size is int ? size : 0,
             revision: RevisionToken(ascii.encode(revision)),
             downloadUri: downloadUri,
@@ -549,6 +612,24 @@ abstract base class RepositoryDataSource
     } on FormatException {
       throw const SboxException(SboxErrorCode.shardConflict, '数据源修订令牌无效');
     }
+  }
+
+  static RevisionToken? _responseRevision(http.StreamedResponse response) {
+    final etag = response.headers['etag'];
+    if (etag == null || etag.isEmpty) return null;
+    try {
+      return RevisionToken(ascii.encode(etag));
+    } on FormatException {
+      return null;
+    }
+  }
+
+  static int? _responseSize(http.StreamedResponse response) {
+    final size = response.contentLength;
+    if (size != null) return size;
+    final header = response.headers['content-length'];
+    final parsed = header == null ? null : int.tryParse(header);
+    return parsed != null && parsed >= 0 ? parsed : null;
   }
 }
 

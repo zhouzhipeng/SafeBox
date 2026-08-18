@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:safebox/sbox/bytes.dart';
 import 'package:safebox/sbox/source/credential.dart';
+import 'package:safebox/sbox/source/data_source.dart';
 import 'package:safebox/sbox/source/gitee_source.dart';
 import 'package:safebox/sbox/source/remote_config.dart';
 import 'package:safebox/sbox/source/source_path.dart';
@@ -73,9 +74,50 @@ void main() {
         SourcePath('0123456789abcdef0123456789abcdef-0-of-1.sbox'),
         start: 1,
         endExclusive: 3,
+        objectInfo: SourceObjectInfo(
+          path: SourcePath('0123456789abcdef0123456789abcdef-0-of-1.sbox'),
+          length: 0,
+          revision: RevisionToken(ascii.encode('revision')),
+          downloadUri: Uri.parse(
+            'https://gitee.com/zzp/sbox-files/raw/master/object.sbox',
+          ),
+        ),
       );
 
       expect(await read.body.expand((chunk) => chunk).toList(), <int>[2, 3]);
+      expect(client.metadataRequests, 0);
+      expect(
+        client.rawRequest?.url.path,
+        '/api/v5/repos/zzp/sbox-files/raw/0123456789abcdef0123456789abcdef-0-of-1.sbox',
+      );
+      expect(client.rawRequest?.url.queryParameters, isEmpty);
+    },
+  );
+
+  test(
+    'Gitee full reads bypass the large contents metadata response',
+    () async {
+      final client = _FullObjectRawClient();
+      final source = GiteeDataSource(
+        config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
+        client: client,
+      );
+
+      final read = await source.get(
+        SourcePath('0123456789abcdef0123456789abcdef-0-of-1.sbox'),
+      );
+
+      expect(await read.body.expand((chunk) => chunk).toList(), <int>[
+        1,
+        2,
+        3,
+        4,
+      ]);
+      expect(client.metadataRequests, 0);
+      expect(
+        client.rawRequest?.url.path,
+        '/api/v5/repos/zzp/sbox-files/raw/0123456789abcdef0123456789abcdef-0-of-1.sbox',
+      );
     },
   );
 }
@@ -103,6 +145,13 @@ final class _RecordingClient extends http.BaseClient {
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
     if (request.method == 'GET') {
       readRequest = request;
+      if (request.url.path.contains('/raw/')) {
+        return http.StreamedResponse(
+          const Stream<List<int>>.empty(),
+          404,
+          request: request,
+        );
+      }
       return http.StreamedResponse(
         Stream<List<int>>.value(utf8.encode('[]')),
         200,
@@ -122,10 +171,15 @@ final class _RecordingClient extends http.BaseClient {
 }
 
 final class _FullObjectRawClient extends http.BaseClient {
+  http.BaseRequest? rawRequest;
+  var metadataRequests = 0;
+
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
     if (request.url.host == 'gitee.com' &&
-        request.url.path.contains('/api/v5/repos/')) {
+        request.url.path.contains('/api/v5/repos/') &&
+        request.url.path.contains('/contents/')) {
+      metadataRequests++;
       return http.StreamedResponse(
         Stream<List<int>>.value(
           utf8.encode(
@@ -134,6 +188,18 @@ final class _FullObjectRawClient extends http.BaseClient {
           ),
         ),
         200,
+        request: request,
+      );
+    }
+    if (request.url.host == 'gitee.com' &&
+        request.url.path.contains('/api/v5/repos/') &&
+        request.url.path.contains('/raw/')) {
+      rawRequest = request;
+      return http.StreamedResponse(
+        Stream<List<int>>.value(Uint8List.fromList(<int>[1, 2, 3, 4])),
+        200,
+        contentLength: 4,
+        headers: const <String, String>{'etag': '"revision"'},
         request: request,
       );
     }

@@ -62,9 +62,28 @@ final class GiteeDataSource extends RepositoryDataSource {
   @override
   Uri writeUri(SourcePath path) => _contentsUri(path);
 
+  // Gitee's web download_url can reject large objects even with an API
+  // token. The API raw endpoint accepts the token and uses the repository's
+  // default branch when ref is omitted.
   @override
-  Uri rawUri(SourcePath path, RepositoryObjectMetadata metadata) =>
-      resolvedDownloadUri(metadata);
+  Uri rawUri(SourcePath path, RepositoryObjectMetadata _) => _rawUri(path);
+
+  @override
+  Uri? rawUriWithoutMetadata(SourcePath path) => _rawUri(path);
+
+  Uri _rawUri(SourcePath path) => Uri(
+    scheme: 'https',
+    host: 'gitee.com',
+    pathSegments: <String>[
+      'api',
+      'v5',
+      'repos',
+      config.owner,
+      config.repository,
+      'raw',
+      ...config.resolveBasename(path).split('/'),
+    ],
+  );
 
   @override
   Uri repositoryProbeUri() => listUri();
