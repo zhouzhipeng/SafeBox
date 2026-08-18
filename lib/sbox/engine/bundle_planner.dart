@@ -34,21 +34,27 @@ abstract final class BundlePlanner {
   static int dataRecordCount(int plaintextLength) {
     if (plaintextLength < 0) throw ArgumentError.value(plaintextLength);
     if (plaintextLength == 0) return 0;
-    return (plaintextLength + SboxProtocol.chunkSize - 1) ~/
-        SboxProtocol.chunkSize;
+    return _ceilDiv(plaintextLength, SboxProtocol.chunkSize);
   }
 
   static int continuationUpperBound(int plaintextLength) {
-    return 128 + plaintextLength + 29 * dataRecordCount(plaintextLength) + 77;
+    if (plaintextLength < 0) throw ArgumentError.value(plaintextLength);
+    return _checkedSum(<int>[
+      SboxProtocol.commonHeaderLength,
+      plaintextLength,
+      29 * dataRecordCount(plaintextLength),
+      77,
+    ]);
   }
 
-  static int rootUpperBound(int plaintextLength, int manifestLength) {
-    return 512 +
-        manifestLength +
-        29 +
-        plaintextLength +
-        29 * dataRecordCount(plaintextLength) +
-        77;
+  static int rootUpperBound(int plaintextLength) {
+    if (plaintextLength < 0) throw ArgumentError.value(plaintextLength);
+    return _checkedSum(<int>[
+      SboxProtocol.rootHeaderLength,
+      plaintextLength,
+      29 * dataRecordCount(plaintextLength),
+      77,
+    ]);
   }
 
   static BundlePlan plan({
@@ -56,19 +62,16 @@ abstract final class BundlePlanner {
     int targetNominalShardPlaintextSize =
         SboxProtocol.defaultNominalShardPlaintextSize,
     int? maxObjectBytes,
-    int manifestLength = SboxProtocol.maxManifestBytes,
   }) {
     if (logicalLength < 0 ||
         targetNominalShardPlaintextSize <
             SboxProtocol.minNominalShardPlaintextSize ||
         targetNominalShardPlaintextSize >
             SboxProtocol.maxNominalShardPlaintextSize ||
-        targetNominalShardPlaintextSize % (1024 * 1024) != 0 ||
-        manifestLength < 1 ||
-        manifestLength > SboxProtocol.maxManifestBytes) {
+        targetNominalShardPlaintextSize % (1024 * 1024) != 0) {
       throw const SboxException(
         SboxErrorCode.sourceLimit,
-        '分片大小或 Manifest 大小无效',
+        '分片大小无效',
       );
     }
     final unit = 1024 * 1024;
@@ -78,12 +81,10 @@ abstract final class BundlePlanner {
       candidate <= SboxProtocol.maxNominalShardPlaintextSize;
       candidate += unit
     ) {
-      final count = logicalLength == 0
-          ? 1
-          : (logicalLength + candidate - 1) ~/ candidate;
+      final count = logicalLength == 0 ? 1 : _ceilDiv(logicalLength, candidate);
       if (count > SboxProtocol.maxShardCount) continue;
       if (maxObjectBytes != null &&
-          (rootUpperBound(math.min(candidate, logicalLength), manifestLength) >
+          (rootUpperBound(math.min(candidate, logicalLength)) >
                   maxObjectBytes ||
               (count > 1 &&
                   continuationUpperBound(math.min(candidate, logicalLength)) >
@@ -101,9 +102,7 @@ abstract final class BundlePlanner {
     final selected = belowOrEqual.isNotEmpty
         ? belowOrEqual.last
         : candidates.first;
-    final count = logicalLength == 0
-        ? 1
-        : (logicalLength + selected - 1) ~/ selected;
+    final count = logicalLength == 0 ? 1 : _ceilDiv(logicalLength, selected);
     final shards = <BundleShardPlan>[
       for (var index = 0; index < count; index++)
         BundleShardPlan(
@@ -117,5 +116,22 @@ abstract final class BundlePlanner {
       nominalShardPlaintextSize: selected,
       shards: List<BundleShardPlan>.unmodifiable(shards),
     );
+  }
+
+  static int _ceilDiv(int value, int divisor) {
+    final quotient = value ~/ divisor;
+    return value % divisor == 0 ? quotient : quotient + 1;
+  }
+
+  static int _checkedSum(List<int> values) {
+    const maxInt = 0x7fffffffffffffff;
+    var result = 0;
+    for (final value in values) {
+      if (value < 0 || result > maxInt - value) {
+        throw const SboxException(SboxErrorCode.sourceLimit, '对象大小计算溢出');
+      }
+      result += value;
+    }
+    return result;
   }
 }

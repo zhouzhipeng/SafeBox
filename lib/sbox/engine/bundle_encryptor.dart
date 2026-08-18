@@ -7,12 +7,16 @@ import 'package:crypto/crypto.dart' as crypto;
 
 import '../bytes.dart';
 import '../constants.dart';
+import '../crypto/metadata_cipher.dart';
+import '../crypto/metadata_kdf.dart';
 import '../crypto/rsa_oaep.dart';
 import '../crypto/shard_kdf.dart';
 import '../errors.dart';
 import '../format/bundle_header.dart';
 import '../format/bundle_manifest.dart';
 import '../format/bundle_record.dart';
+import '../format/manifest_block.dart';
+import '../identity/der.dart';
 import '../identity/rsa_models.dart';
 import '../storage/io_hash.dart';
 import 'bundle_planner.dart';
@@ -27,6 +31,9 @@ final class MemoryBundleInput implements BundleInput {
   MemoryBundleInput(List<int> bytes) : _bytes = Uint8List.fromList(bytes);
 
   final Uint8List _bytes;
+
+  /// Returns a copy that can be handed to a background isolate.
+  Uint8List get bytes => Uint8List.fromList(_bytes);
 
   @override
   Future<int> length() async => _bytes.length;
@@ -72,15 +79,25 @@ final class BundleEncryptionRandomness {
     required List<int> bundleDek,
     required Iterable<List<int>> noncePrefixes,
     required List<int> oaepSeed,
+    List<int>? metadataSalt,
+    List<int>? metadataNonce,
   }) : bundleId = Uint8List.fromList(bundleId),
        bundleDek = Uint8List.fromList(bundleDek),
        noncePrefixes = List<Uint8List>.unmodifiable(
          noncePrefixes.map(Uint8List.fromList),
        ),
-       oaepSeed = Uint8List.fromList(oaepSeed) {
+       oaepSeed = Uint8List.fromList(oaepSeed),
+       metadataSalt = Uint8List.fromList(
+         metadataSalt ?? secureRandomBytes(SboxProtocol.metadataSaltLength),
+       ),
+       metadataNonce = Uint8List.fromList(
+         metadataNonce ?? secureRandomBytes(SboxProtocol.metadataNonceLength),
+       ) {
     if (this.bundleId.length != SboxProtocol.bundleIdLength ||
         this.bundleDek.length != SboxProtocol.bundleDekLength ||
         this.oaepSeed.length != 32 ||
+        this.metadataSalt.length != SboxProtocol.metadataSaltLength ||
+        this.metadataNonce.length != SboxProtocol.metadataNonceLength ||
         this.noncePrefixes.isEmpty ||
         this.noncePrefixes.any(
           (prefix) => prefix.length != SboxProtocol.noncePrefixLength,
@@ -104,6 +121,8 @@ final class BundleEncryptionRandomness {
           secureRandomBytes(SboxProtocol.noncePrefixLength),
       ],
       oaepSeed: secureRandomBytes(32),
+      metadataSalt: secureRandomBytes(SboxProtocol.metadataSaltLength),
+      metadataNonce: secureRandomBytes(SboxProtocol.metadataNonceLength),
     );
   }
 
@@ -111,11 +130,15 @@ final class BundleEncryptionRandomness {
   final Uint8List bundleDek;
   final List<Uint8List> noncePrefixes;
   final Uint8List oaepSeed;
+  final Uint8List metadataSalt;
+  final Uint8List metadataNonce;
 
   void dispose() {
     bundleId.fillRange(0, bundleId.length, 0);
     bundleDek.fillRange(0, bundleDek.length, 0);
     oaepSeed.fillRange(0, oaepSeed.length, 0);
+    metadataSalt.fillRange(0, metadataSalt.length, 0);
+    metadataNonce.fillRange(0, metadataNonce.length, 0);
     for (final prefix in noncePrefixes) {
       prefix.fillRange(0, prefix.length, 0);
     }
@@ -181,7 +204,7 @@ final class EncryptedBundle {
       objects.firstWhere((object) => object.header.isRoot);
 }
 
-/// One unified writer for empty, small and multipart Bundles.
+/// One unified v3 writer for empty, small and multipart Bundles.
 final class BundleEncryptor {
   BundleEncryptor({BundleRecordCodec? records})
     : _records = records ?? BundleRecordCodec();
@@ -198,10 +221,6 @@ final class BundleEncryptor {
   );
 
   /// Returns the MD5 of the original bytes used as the public Bundle ID.
-  ///
-  /// MD5 is used here only as a content address for de-duplication. The
-  /// encrypted Bundle still uses SHA-256 and authenticated encryption for
-  /// integrity and confidentiality.
   Future<Uint8List> md5ForInput({
     required BundleInput input,
     required int declaredLength,
@@ -227,22 +246,10 @@ final class BundleEncryptor {
     required int declaredLength,
     required BundleEncryptionOptions options,
   }) async {
-    if (declaredLength < 0) {
-      throw const SboxException(SboxErrorCode.sourceLimit, '输入长度无效');
-    }
-    final actualDeclaredLength = await input.length();
-    if (actualDeclaredLength != declaredLength) {
-      throw const SboxException(SboxErrorCode.inputChanged, '输入在加密前发生变化');
-    }
-    final plan = BundlePlanner.plan(
-      logicalLength: declaredLength,
-      targetNominalShardPlaintextSize: options.targetNominalShardPlaintextSize,
-      maxObjectBytes: options.maxObjectBytes,
-    );
-    _validateStreamingOptions(
-      options,
-      logicalLength: declaredLength,
-      plan: plan,
+    final plan = await _preflight(
+      input: input,
+      declaredLength: declaredLength,
+      options: options,
     );
     final firstPass = await _hashRange(
       input,
@@ -254,197 +261,61 @@ final class BundleEncryptor {
       throw const SboxException(SboxErrorCode.inputChanged, '输入长度与声明不一致');
     }
 
-    final preflightRandomness =
-        options.randomness ??
-        BundleEncryptionRandomness.secure(
-          plan.shardCount,
-          bundleId: firstPass.md5,
-        );
-    final preflightOwnsRandomness = options.randomness == null;
-
-    final randomness = preflightRandomness;
-    final ownsRandomness = preflightOwnsRandomness;
-    if (randomness.noncePrefixes.length != plan.shardCount) {
-      if (ownsRandomness) randomness.dispose();
-      throw const SboxException(SboxErrorCode.sourceLimit, '随机材料与分片数量不一致');
-    }
-
-    Uint8List? manifestBytes;
-    Uint8List? wrapped;
+    final prepared = await _prepare(
+      options: options,
+      plan: plan,
+      firstPass: firstPass,
+    );
+    final secondAccumulator = HashDigestSink();
+    final secondHashSink = crypto.sha256.startChunkedConversion(
+      secondAccumulator,
+    );
+    var secondLength = 0;
+    final objects = <EncryptedBundleObject>[];
     try {
-      if (options.recipient.rsaPublicKey.modulus.bitLength !=
-              SboxProtocol.rsaBits ||
-          options.recipient.rsaPublicKey.exponent !=
-              BigInt.from(SboxProtocol.rsaPublicExponent)) {
-        throw const SboxException(SboxErrorCode.keyMismatch, '接收者 RSA 公钥参数无效');
-      }
-      final manifest = BundleManifest(
-        bundleId: hexLower(randomness.bundleId),
-        recipientKeyId: hexLower(options.recipient.recipientKeyId),
-        contentKind: options.contentKind,
-        originalName: options.originalName,
-        mediaType: options.mediaType,
-        title: options.title ?? options.originalName,
-        description: options.description,
-        tags: options.tags,
-        createdAt: options.createdAt ?? _utcSeconds(DateTime.now().toUtc()),
-        logicalPlaintextSize: BigInt.from(declaredLength),
-        logicalPlaintextSha256: firstPass.sha256,
-        nominalShardPlaintextSize: plan.nominalShardPlaintextSize,
-        shardCount: plan.shardCount,
-      );
-      manifestBytes = manifest.encode();
-      final manifestData = manifestBytes;
-      final label = RsaOaepSha256.buildBundleDekLabel(
-        bundleId: randomness.bundleId,
-        recipientKeyId: options.recipient.recipientKeyId,
-      );
-      wrapped = RsaOaepSha256().encrypt(
-        message: randomness.bundleDek,
-        publicKey: options.recipient.rsaPublicKey,
-        label: label,
-        seed: randomness.oaepSeed,
-      );
-      final wrappedData = wrapped;
-      final objects = <EncryptedBundleObject>[];
-      // DigestSink is kept separately so the sink can be finalized after
-      // all data records, without retaining plaintext bytes.
-      final secondAccumulator = HashDigestSink();
-      final secondHashSink = crypto.sha256.startChunkedConversion(
-        secondAccumulator,
-      );
-      var secondLength = 0;
       for (final shard in plan.shards) {
-        final isRoot = shard.index == 0;
-        final header = isRoot
-            ? BundleHeader.root(
-                bundleId: randomness.bundleId,
-                shardCount: plan.shardCount,
-                shardPlaintextSize: BigInt.from(shard.length),
-                recipientKeyId: options.recipient.recipientKeyId,
-                noncePrefix: randomness.noncePrefixes[shard.index],
-                wrappedBundleDek: wrappedData,
-              )
-            : BundleHeader.continuation(
-                bundleId: randomness.bundleId,
-                shardIndex: shard.index,
-                shardCount: plan.shardCount,
-                shardPlaintextSize: BigInt.from(shard.length),
-                recipientKeyId: options.recipient.recipientKeyId,
-                noncePrefix: randomness.noncePrefixes[shard.index],
-              );
-        final headerBytes = header.encode();
-        final headerHash = sha256Bytes(headerBytes);
-        final shardKey = ShardKdf.derive(
-          bundleDek: randomness.bundleDek,
-          bundleId: randomness.bundleId,
-          recipientKeyId: options.recipient.recipientKeyId,
-          shardIndex: shard.index,
+        final result = await _encryptShard(
+          input: input,
+          shard: shard,
+          prepared: prepared,
+          overallHashSink: secondHashSink,
         );
-        final output = BytesBuilder(copy: false)..add(headerBytes);
-        if (isRoot) {
-          output.add(
-            await _records.encrypt(
-              type: BundleRecordType.manifest,
-              index: BigInt.zero,
-              plaintext: manifestData,
-              shardKey: shardKey,
-              noncePrefix: header.noncePrefix,
-              headerHash: headerHash,
-            ),
-          );
-        }
-        final shardAccumulator = HashDigestSink();
-        final shardHashSink = crypto.sha256.startChunkedConversion(
-          shardAccumulator,
-        );
-        var shardDataLength = 0;
-        var dataRecordCount = 0;
-        await for (final plainChunk in _rangeChunks(
-          input,
-          start: shard.offset,
-          length: shard.length,
-          chunkSize: SboxProtocol.chunkSize,
-        )) {
-          shardHashSink.add(plainChunk);
-          secondHashSink.add(plainChunk);
-          secondLength += plainChunk.length;
-          final recordIndex = BigInt.from(dataRecordCount + (isRoot ? 1 : 1));
-          output.add(
-            await _records.encrypt(
-              type: BundleRecordType.data,
-              index: recordIndex,
-              plaintext: plainChunk,
-              shardKey: shardKey,
-              noncePrefix: header.noncePrefix,
-              headerHash: headerHash,
-            ),
-          );
-          shardDataLength += plainChunk.length;
-          dataRecordCount++;
-        }
-        shardHashSink.close();
-        if (shardDataLength != shard.length) {
-          throw const SboxException(SboxErrorCode.inputChanged, '输入在加密期间发生变化');
-        }
-        final shardHash = Uint8List.fromList(shardAccumulator.value.bytes);
-        final finalPlaintext = Uint8List(SboxProtocol.finalPlaintextLength);
-        writeUint64BigEndian(finalPlaintext, 0, BigInt.from(shardDataLength));
-        writeUint64BigEndian(finalPlaintext, 8, BigInt.from(dataRecordCount));
-        finalPlaintext.setRange(16, 48, shardHash);
-        output.add(
-          await _records.encrypt(
-            type: BundleRecordType.finalRecord,
-            index: BigInt.from(dataRecordCount + 1),
-            plaintext: finalPlaintext,
-            shardKey: shardKey,
-            noncePrefix: header.noncePrefix,
-            headerHash: headerHash,
-          ),
-        );
-        finalPlaintext.fillRange(0, finalPlaintext.length, 0);
-        shardHash.fillRange(0, shardHash.length, 0);
-        shardKey.fillRange(0, shardKey.length, 0);
-        final objectBytes = output.takeBytes();
+        secondLength += result.plaintextLength;
         if (options.maxObjectBytes != null &&
-            objectBytes.length > options.maxObjectBytes!) {
+            result.bytes.length > options.maxObjectBytes!) {
           throw const SboxException(SboxErrorCode.sourceLimit, '对象超过数据源上限');
         }
         objects.add(
           EncryptedBundleObject(
-            basename: header.canonicalBasename,
-            header: header,
-            bytes: objectBytes,
-            sha256: sha256Bytes(objectBytes),
+            basename: result.header.canonicalBasename,
+            header: result.header,
+            bytes: result.bytes,
+            sha256: sha256Bytes(result.bytes),
           ),
         );
       }
       secondHashSink.close();
       final secondDigest = Uint8List.fromList(secondAccumulator.value.bytes);
-      if (secondLength != declaredLength ||
-          !constantTimeBytesEqual(secondDigest, firstPass.sha256) ||
-          await input.length() != declaredLength) {
-        throw const SboxException(SboxErrorCode.inputChanged, '输入在加密期间发生变化');
+      try {
+        if (secondLength != declaredLength ||
+            !constantTimeBytesEqual(secondDigest, firstPass.sha256) ||
+            await input.length() != declaredLength) {
+          throw const SboxException(SboxErrorCode.inputChanged, '输入在加密期间发生变化');
+        }
+      } finally {
+        secondDigest.fillRange(0, secondDigest.length, 0);
       }
       objects.sort(
         (left, right) =>
             left.header.shardIndex.compareTo(right.header.shardIndex),
       );
       return EncryptedBundle(
-        manifest: manifest,
+        manifest: prepared.manifest,
         objects: List<EncryptedBundleObject>.unmodifiable(objects),
         plaintextSha256: firstPass.sha256,
       );
     } finally {
-      if (ownsRandomness) randomness.dispose();
-      final wrappedSecret = wrapped;
-      if (wrappedSecret != null) {
-        wrappedSecret.fillRange(0, wrappedSecret.length, 0);
-      }
-      final manifestSecret = manifestBytes;
-      if (manifestSecret != null) {
-        manifestSecret.fillRange(0, manifestSecret.length, 0);
-      }
+      prepared.dispose();
     }
   }
 
@@ -454,32 +325,12 @@ final class BundleEncryptor {
     required BundleEncryptionOptions options,
     required Directory root,
   }) async {
-    if (declaredLength < 0) {
-      throw const SboxException(
-        SboxErrorCode.sourceLimit,
-        'Input length is invalid',
-      );
-    }
-    if (await input.length() != declaredLength) {
-      throw const SboxException(
-        SboxErrorCode.inputChanged,
-        'Input changed before encryption',
-      );
-    }
-    final plan = BundlePlanner.plan(
-      logicalLength: declaredLength,
-      targetNominalShardPlaintextSize: options.targetNominalShardPlaintextSize,
-      maxObjectBytes: options.maxObjectBytes,
-    );
-    _validateStreamingOptions(
-      options,
-      logicalLength: declaredLength,
-      plan: plan,
+    final plan = await _preflight(
+      input: input,
+      declaredLength: declaredLength,
+      options: options,
     );
     final canonicalRoot = await _prepareRoot(root);
-    final staged = <_StagedShard>[];
-    Uint8List? manifestBytes;
-    Uint8List? wrapped;
     final firstPass = await _hashRange(
       input,
       0,
@@ -492,157 +343,57 @@ final class BundleEncryptor {
         'Input length does not match its declaration',
       );
     }
-    final randomness =
-        options.randomness ??
-        BundleEncryptionRandomness.secure(
-          plan.shardCount,
-          bundleId: firstPass.md5,
-        );
-    final ownsRandomness = options.randomness == null;
-    try {
-      final createdAt =
-          options.createdAt ?? _utcSeconds(DateTime.now().toUtc());
-      final manifest = BundleManifest(
-        bundleId: hexLower(randomness.bundleId),
-        recipientKeyId: hexLower(options.recipient.recipientKeyId),
-        contentKind: options.contentKind,
-        originalName: options.originalName,
-        mediaType: options.mediaType,
-        title: options.title ?? options.originalName,
-        description: options.description,
-        tags: options.tags,
-        createdAt: createdAt,
-        logicalPlaintextSize: BigInt.from(declaredLength),
-        logicalPlaintextSha256: firstPass.sha256,
-        nominalShardPlaintextSize: plan.nominalShardPlaintextSize,
-        shardCount: plan.shardCount,
-      );
-      manifestBytes = manifest.encode();
-      wrapped = RsaOaepSha256().encrypt(
-        message: randomness.bundleDek,
-        publicKey: options.recipient.rsaPublicKey,
-        label: RsaOaepSha256.buildBundleDekLabel(
-          bundleId: randomness.bundleId,
-          recipientKeyId: options.recipient.recipientKeyId,
-        ),
-        seed: randomness.oaepSeed,
-      );
 
-      final secondAccumulator = HashDigestSink();
-      final secondHashSink = crypto.sha256.startChunkedConversion(
-        secondAccumulator,
-      );
-      var secondLength = 0;
+    final prepared = await _prepare(
+      options: options,
+      plan: plan,
+      firstPass: firstPass,
+    );
+    final staged = <_StagedShard>[];
+    final secondAccumulator = HashDigestSink();
+    final secondHashSink = crypto.sha256.startChunkedConversion(
+      secondAccumulator,
+    );
+    var secondLength = 0;
+    try {
       for (final shard in plan.shards) {
-        final isRoot = shard.index == 0;
-        final header = isRoot
-            ? BundleHeader.root(
-                bundleId: randomness.bundleId,
-                shardCount: plan.shardCount,
-                shardPlaintextSize: BigInt.from(shard.length),
-                recipientKeyId: options.recipient.recipientKeyId,
-                noncePrefix: randomness.noncePrefixes[shard.index],
-                wrappedBundleDek: wrapped,
-              )
-            : BundleHeader.continuation(
-                bundleId: randomness.bundleId,
-                shardIndex: shard.index,
-                shardCount: plan.shardCount,
-                shardPlaintextSize: BigInt.from(shard.length),
-                recipientKeyId: options.recipient.recipientKeyId,
-                noncePrefix: randomness.noncePrefixes[shard.index],
-              );
-        final headerBytes = header.encode();
-        final headerHash = sha256Bytes(headerBytes);
-        final shardKey = ShardKdf.derive(
-          bundleDek: randomness.bundleDek,
-          bundleId: randomness.bundleId,
-          recipientKeyId: options.recipient.recipientKeyId,
-          shardIndex: shard.index,
-        );
+        final header = prepared.headerFor(shard.index, shard.length);
         final stage = File(
           '${canonicalRoot.path}${Platform.pathSeparator}.${header.canonicalBasename}.${hexLower(secureRandomBytes(8))}.part',
         );
-        final output = stage.openWrite();
+        IOSink? output;
+        var stagedSuccessfully = false;
         try {
+          output = stage.openWrite();
+          final headerBytes = header.encode();
           output.add(headerBytes);
           await output.flush();
-          if (isRoot) {
-            final record = await _records.encrypt(
-              type: BundleRecordType.manifest,
-              index: BigInt.zero,
-              plaintext: manifestBytes,
-              shardKey: shardKey,
-              noncePrefix: header.noncePrefix,
-              headerHash: headerHash,
-            );
-            output.add(record);
-            await output.flush();
-            record.fillRange(0, record.length, 0);
-          }
-
-          final shardAccumulator = HashDigestSink();
-          final shardHashSink = crypto.sha256.startChunkedConversion(
-            shardAccumulator,
+          final headerHash = sha256Bytes(headerBytes);
+          final shardKey = ShardKdf.derive(
+            bundleDek: prepared.randomness.bundleDek,
+            bundleId: header.bundleId,
+            recipientKeyId: header.recipientKeyId,
+            shardIndex: header.shardIndex,
           );
-          var shardDataLength = 0;
-          var dataRecordCount = 0;
-          await for (final plainChunk in _rangeChunks(
-            input,
-            start: shard.offset,
-            length: shard.length,
-            chunkSize: SboxProtocol.chunkSize,
-          )) {
-            try {
-              shardHashSink.add(plainChunk);
-              secondHashSink.add(plainChunk);
-              secondLength += plainChunk.length;
-              final record = await _records.encrypt(
-                type: BundleRecordType.data,
-                index: BigInt.from(dataRecordCount + 1),
-                plaintext: plainChunk,
-                shardKey: shardKey,
-                noncePrefix: header.noncePrefix,
-                headerHash: headerHash,
-              );
-              output.add(record);
-              await output.flush();
-              record.fillRange(0, record.length, 0);
-              shardDataLength += plainChunk.length;
-              dataRecordCount++;
-            } finally {
-              plainChunk.fillRange(0, plainChunk.length, 0);
-            }
-          }
-          shardHashSink.close();
-          if (shardDataLength != shard.length) {
-            throw const SboxException(
-              SboxErrorCode.inputChanged,
-              'Input changed during encryption',
-            );
-          }
-          final shardDigest = Uint8List.fromList(shardAccumulator.value.bytes);
-          final finalPlaintext = Uint8List(SboxProtocol.finalPlaintextLength);
-          writeUint64BigEndian(finalPlaintext, 0, BigInt.from(shardDataLength));
-          writeUint64BigEndian(finalPlaintext, 8, BigInt.from(dataRecordCount));
-          finalPlaintext.setRange(16, 48, shardDigest);
           try {
-            final record = await _records.encrypt(
-              type: BundleRecordType.finalRecord,
-              index: BigInt.from(dataRecordCount + 1),
-              plaintext: finalPlaintext,
-              shardKey: shardKey,
-              noncePrefix: header.noncePrefix,
+            final shardResult = await _writeShardRecords(
+              input: input,
+              shard: shard,
+              header: header,
               headerHash: headerHash,
+              shardKey: shardKey,
+              output: output,
+              overallHashSink: secondHashSink,
             );
-            output.add(record);
-            await output.flush();
-            record.fillRange(0, record.length, 0);
+            secondLength += shardResult;
           } finally {
-            finalPlaintext.fillRange(0, finalPlaintext.length, 0);
-            shardDigest.fillRange(0, shardDigest.length, 0);
+            shardKey.fillRange(0, shardKey.length, 0);
+            headerHash.fillRange(0, headerHash.length, 0);
+            headerBytes.fillRange(0, headerBytes.length, 0);
           }
+          await output.flush();
           await output.close();
+          output = null;
           final length = await stage.length();
           if (options.maxObjectBytes != null &&
               length > options.maxObjectBytes!) {
@@ -660,11 +411,10 @@ final class BundleEncryptor {
               shardIndex: header.shardIndex,
             ),
           );
+          stagedSuccessfully = true;
         } finally {
-          shardKey.fillRange(0, shardKey.length, 0);
-          await output.close();
-          if (await stage.exists() &&
-              !staged.any((item) => item.stage.path == stage.path)) {
+          await output?.close();
+          if (!stagedSuccessfully && await stage.exists()) {
             await stage.delete();
           }
         }
@@ -706,35 +456,31 @@ final class BundleEncryptor {
       committed.add(rootObject.basename);
       return List<String>.unmodifiable(committed);
     } finally {
-      if (ownsRandomness) randomness.dispose();
-      final manifestSecret = manifestBytes;
-      if (manifestSecret != null) {
-        manifestSecret.fillRange(0, manifestSecret.length, 0);
-      }
-      final wrappedSecret = wrapped;
-      if (wrappedSecret != null) {
-        wrappedSecret.fillRange(0, wrappedSecret.length, 0);
-      }
+      prepared.dispose();
       for (final shard in staged) {
         if (await shard.stage.exists()) await shard.stage.delete();
       }
     }
   }
 
-  static void _validateStreamingOptions(
-    BundleEncryptionOptions options, {
-    required int logicalLength,
-    required BundlePlan plan,
-  }) {
-    if (options.recipient.rsaPublicKey.modulus.bitLength !=
-            SboxProtocol.rsaBits ||
-        options.recipient.rsaPublicKey.exponent !=
-            BigInt.from(SboxProtocol.rsaPublicExponent)) {
-      throw const SboxException(
-        SboxErrorCode.keyMismatch,
-        'Recipient RSA parameters are invalid',
-      );
+  Future<BundlePlan> _preflight({
+    required BundleInput input,
+    required int declaredLength,
+    required BundleEncryptionOptions options,
+  }) async {
+    if (declaredLength < 0) {
+      throw const SboxException(SboxErrorCode.sourceLimit, '输入长度无效');
     }
+    if (await input.length() != declaredLength) {
+      throw const SboxException(SboxErrorCode.inputChanged, '输入在加密前发生变化');
+    }
+    _validateRecipient(options.recipient);
+    final plan = BundlePlanner.plan(
+      logicalLength: declaredLength,
+      targetNominalShardPlaintextSize: options.targetNominalShardPlaintextSize,
+      maxObjectBytes: options.maxObjectBytes,
+    );
+    // Validate all user metadata before allocating encrypted objects.
     BundleManifest(
       bundleId: '0' * 32,
       recipientKeyId: hexLower(options.recipient.recipientKeyId),
@@ -745,11 +491,307 @@ final class BundleEncryptor {
       description: options.description,
       tags: options.tags,
       createdAt: options.createdAt ?? _utcSeconds(DateTime.now().toUtc()),
-      logicalPlaintextSize: BigInt.from(logicalLength),
+      logicalPlaintextSize: BigInt.from(declaredLength),
       logicalPlaintextSha256: Uint8List(32),
       nominalShardPlaintextSize: plan.nominalShardPlaintextSize,
       shardCount: plan.shardCount,
     );
+    return plan;
+  }
+
+  Future<_PreparedBundle> _prepare({
+    required BundleEncryptionOptions options,
+    required BundlePlan plan,
+    required _HashedRange firstPass,
+  }) async {
+    final randomness =
+        options.randomness ??
+        BundleEncryptionRandomness.secure(
+          plan.shardCount,
+          bundleId: firstPass.md5,
+        );
+    final ownsRandomness = options.randomness == null;
+    Uint8List? manifestBytes;
+    Uint8List? manifestBlock;
+    Uint8List? wrapped;
+    Uint8List? metadataKey;
+    MetadataCiphertext? encryptedMetadata;
+    try {
+      if (!constantTimeBytesEqual(randomness.bundleId, firstPass.md5) ||
+          randomness.noncePrefixes.length != plan.shardCount) {
+        throw const SboxException(
+          SboxErrorCode.inputChanged,
+          '随机材料与输入 Bundle 不匹配',
+        );
+      }
+      final manifest = BundleManifest(
+        bundleId: hexLower(firstPass.md5),
+        recipientKeyId: hexLower(options.recipient.recipientKeyId),
+        contentKind: options.contentKind,
+        originalName: options.originalName,
+        mediaType: options.mediaType,
+        title: options.title ?? options.originalName,
+        description: options.description,
+        tags: options.tags,
+        createdAt: options.createdAt ?? _utcSeconds(DateTime.now().toUtc()),
+        logicalPlaintextSize: BigInt.from(firstPass.length),
+        logicalPlaintextSha256: firstPass.sha256,
+        nominalShardPlaintextSize: plan.nominalShardPlaintextSize,
+        shardCount: plan.shardCount,
+      );
+      // This is the only protocol Manifest serialization performed by the
+      // generator. The block is also constructed exactly once.
+      manifestBytes = manifest.encode();
+      manifestBlock = ManifestBlock.pack(manifestBytes);
+      wrapped = RsaOaepSha256().encrypt(
+        message: randomness.bundleDek,
+        publicKey: options.recipient.rsaPublicKey,
+        label: RsaOaepSha256.buildBundleDekLabel(
+          bundleId: firstPass.md5,
+          recipientKeyId: options.recipient.recipientKeyId,
+        ),
+        seed: randomness.oaepSeed,
+      );
+      final placeholderRoot = BundleHeader.root(
+        bundleId: firstPass.md5,
+        shardCount: plan.shardCount,
+        shardPlaintextSize: BigInt.from(plan.shards.first.length),
+        recipientKeyId: options.recipient.recipientKeyId,
+        noncePrefix: randomness.noncePrefixes.first,
+        wrappedBundleDek: wrapped,
+        metadataSalt: randomness.metadataSalt,
+        metadataNonce: randomness.metadataNonce,
+        metadataCiphertext: Uint8List(SboxProtocol.metadataCiphertextLength),
+        metadataTag: Uint8List(SboxProtocol.gcmTagLength),
+      );
+      final placeholderBytes = placeholderRoot.encode();
+      metadataKey = MetadataKdf.derive(
+        spkiDer: options.recipient.spkiDer,
+        metadataSalt: randomness.metadataSalt,
+        bundleId: firstPass.md5,
+        recipientKeyId: options.recipient.recipientKeyId,
+        formatId: SboxProtocol.metadataFormatId,
+      );
+      encryptedMetadata = await MetadataCipher().encrypt(
+        key: metadataKey,
+        nonce: randomness.metadataNonce,
+        plaintext: manifestBlock,
+        aad: MetadataCipher.buildAad(
+          placeholderBytes.sublist(0, SboxProtocol.metadataAadHeaderLength),
+        ),
+      );
+      final rootHeader = BundleHeader.root(
+        bundleId: firstPass.md5,
+        shardCount: plan.shardCount,
+        shardPlaintextSize: BigInt.from(plan.shards.first.length),
+        recipientKeyId: options.recipient.recipientKeyId,
+        noncePrefix: randomness.noncePrefixes.first,
+        wrappedBundleDek: wrapped,
+        metadataSalt: randomness.metadataSalt,
+        metadataNonce: randomness.metadataNonce,
+        metadataCiphertext: encryptedMetadata.ciphertext,
+        metadataTag: encryptedMetadata.tag,
+      );
+      return _PreparedBundle(
+        manifest: manifest,
+        randomness: randomness,
+        ownsRandomness: ownsRandomness,
+        rootHeader: rootHeader,
+        manifestBytes: manifestBytes,
+        wrapped: wrapped,
+      );
+    } catch (_) {
+      manifestBytes?.fillRange(0, manifestBytes.length, 0);
+      manifestBlock?.fillRange(0, manifestBlock.length, 0);
+      wrapped?.fillRange(0, wrapped.length, 0);
+      metadataKey?.fillRange(0, metadataKey.length, 0);
+      encryptedMetadata?.dispose();
+      if (ownsRandomness) randomness.dispose();
+      rethrow;
+    } finally {
+      manifestBytes?.fillRange(0, manifestBytes.length, 0);
+      manifestBlock?.fillRange(0, manifestBlock.length, 0);
+      wrapped?.fillRange(0, wrapped.length, 0);
+      metadataKey?.fillRange(0, metadataKey.length, 0);
+      encryptedMetadata?.dispose();
+    }
+  }
+
+  Future<_EncryptedShard> _encryptShard({
+    required BundleInput input,
+    required BundleShardPlan shard,
+    required _PreparedBundle prepared,
+    required ByteConversionSink overallHashSink,
+  }) async {
+    final header = prepared.headerFor(shard.index, shard.length);
+    final headerBytes = header.encode();
+    final headerHash = sha256Bytes(headerBytes);
+    final shardKey = ShardKdf.derive(
+      bundleDek: prepared.randomness.bundleDek,
+      bundleId: header.bundleId,
+      recipientKeyId: header.recipientKeyId,
+      shardIndex: header.shardIndex,
+    );
+    final output = BytesBuilder(copy: false)..add(headerBytes);
+    final shardAccumulator = HashDigestSink();
+    final shardHashSink = crypto.sha256.startChunkedConversion(
+      shardAccumulator,
+    );
+    var shardLength = 0;
+    var dataCount = 0;
+    try {
+      await for (final plainChunk in _rangeChunks(
+        input,
+        start: shard.offset,
+        length: shard.length,
+        chunkSize: SboxProtocol.chunkSize,
+      )) {
+        try {
+          shardHashSink.add(plainChunk);
+          overallHashSink.add(plainChunk);
+          final record = await _records.encrypt(
+            type: BundleRecordType.data,
+            index: BigInt.from(dataCount + 1),
+            plaintext: plainChunk,
+            shardKey: shardKey,
+            noncePrefix: header.noncePrefix,
+            headerHash: headerHash,
+          );
+          output.add(record);
+          shardLength += plainChunk.length;
+          dataCount++;
+        } finally {
+          plainChunk.fillRange(0, plainChunk.length, 0);
+        }
+      }
+      shardHashSink.close();
+      if (shardLength != shard.length ||
+          (shard.length == 0 && dataCount != 0)) {
+        throw const SboxException(SboxErrorCode.inputChanged, '输入在加密期间发生变化');
+      }
+      final shardDigest = Uint8List.fromList(shardAccumulator.value.bytes);
+      final finalPlaintext = BundleFinalRecord(
+        totalDataLength: BigInt.from(shardLength),
+        dataRecordCount: BigInt.from(dataCount),
+        dataSha256: shardDigest,
+      ).encode();
+      try {
+        final record = await _records.encrypt(
+          type: BundleRecordType.finalRecord,
+          index: BigInt.from(dataCount + 1),
+          plaintext: finalPlaintext,
+          shardKey: shardKey,
+          noncePrefix: header.noncePrefix,
+          headerHash: headerHash,
+        );
+        output.add(record);
+      } finally {
+        finalPlaintext.fillRange(0, finalPlaintext.length, 0);
+        shardDigest.fillRange(0, shardDigest.length, 0);
+      }
+      return _EncryptedShard(
+        header: header,
+        bytes: output.takeBytes(),
+        plaintextLength: shardLength,
+      );
+    } finally {
+      shardKey.fillRange(0, shardKey.length, 0);
+      headerHash.fillRange(0, headerHash.length, 0);
+    }
+  }
+
+  Future<int> _writeShardRecords({
+    required BundleInput input,
+    required BundleShardPlan shard,
+    required BundleHeader header,
+    required List<int> headerHash,
+    required List<int> shardKey,
+    required IOSink output,
+    required ByteConversionSink overallHashSink,
+  }) async {
+    final shardAccumulator = HashDigestSink();
+    final shardHashSink = crypto.sha256.startChunkedConversion(
+      shardAccumulator,
+    );
+    var shardLength = 0;
+    var dataCount = 0;
+    await for (final plainChunk in _rangeChunks(
+      input,
+      start: shard.offset,
+      length: shard.length,
+      chunkSize: SboxProtocol.chunkSize,
+    )) {
+      try {
+        shardHashSink.add(plainChunk);
+        overallHashSink.add(plainChunk);
+        final record = await _records.encrypt(
+          type: BundleRecordType.data,
+          index: BigInt.from(dataCount + 1),
+          plaintext: plainChunk,
+          shardKey: shardKey,
+          noncePrefix: header.noncePrefix,
+          headerHash: headerHash,
+        );
+        output.add(record);
+        await output.flush();
+        record.fillRange(0, record.length, 0);
+        shardLength += plainChunk.length;
+        dataCount++;
+      } finally {
+        plainChunk.fillRange(0, plainChunk.length, 0);
+      }
+    }
+    shardHashSink.close();
+    if (shardLength != shard.length || (shard.length == 0 && dataCount != 0)) {
+      throw const SboxException(
+        SboxErrorCode.inputChanged,
+        'Input changed during encryption',
+      );
+    }
+    final shardDigest = Uint8List.fromList(shardAccumulator.value.bytes);
+    final finalPlaintext = BundleFinalRecord(
+      totalDataLength: BigInt.from(shardLength),
+      dataRecordCount: BigInt.from(dataCount),
+      dataSha256: shardDigest,
+    ).encode();
+    try {
+      final record = await _records.encrypt(
+        type: BundleRecordType.finalRecord,
+        index: BigInt.from(dataCount + 1),
+        plaintext: finalPlaintext,
+        shardKey: shardKey,
+        noncePrefix: header.noncePrefix,
+        headerHash: headerHash,
+      );
+      output.add(record);
+      await output.flush();
+      record.fillRange(0, record.length, 0);
+    } finally {
+      finalPlaintext.fillRange(0, finalPlaintext.length, 0);
+      shardDigest.fillRange(0, shardDigest.length, 0);
+    }
+    return shardLength;
+  }
+
+  static void _validateRecipient(PublicIdentity identity) {
+    if (identity.rsaPublicKey.modulus.bitLength != SboxProtocol.rsaBits ||
+        identity.rsaPublicKey.exponent !=
+            BigInt.from(SboxProtocol.rsaPublicExponent)) {
+      throw const SboxException(SboxErrorCode.keyMismatch, '接收者 RSA 公钥参数无效');
+    }
+    try {
+      final parsed = parseRsaSubjectPublicKeyInfo(identity.spkiDer);
+      if (parsed.modulus != identity.rsaPublicKey.modulus ||
+          parsed.exponent != identity.rsaPublicKey.exponent ||
+          !constantTimeBytesEqual(
+            sha256Bytes(identity.spkiDer),
+            identity.recipientKeyId,
+          )) {
+        throw const FormatException('Public identity mismatch');
+      }
+    } on FormatException {
+      throw const SboxException(SboxErrorCode.keyMismatch, '接收者 RSA 公共身份无效');
+    }
   }
 
   static Future<Directory> _prepareRoot(Directory root) async {
@@ -770,10 +812,7 @@ final class BundleEncryptor {
     final type = await FileSystemEntity.type(target.path, followLinks: false);
     if (type == FileSystemEntityType.link ||
         type == FileSystemEntityType.directory) {
-      throw const SboxException(
-        SboxErrorCode.storageOverlap,
-        '鏁版嵁婧愮洰鏍囦笉鏄畨鍏ㄦ枃浠?',
-      );
+      throw const SboxException(SboxErrorCode.storageOverlap, '数据源目标不是安全文件');
     }
     if (type == FileSystemEntityType.file) {
       final existing = await target.readAsBytes();
@@ -805,8 +844,6 @@ final class BundleEncryptor {
     await for (final chunk in input.openRange(start, length)) {
       count += chunk.length;
       if (count > length) {
-        sink.close();
-        md5Sink.close();
         throw const SboxException(SboxErrorCode.inputChanged, '输入范围超过声明长度');
       }
       sink.add(chunk);
@@ -814,10 +851,7 @@ final class BundleEncryptor {
       try {
         utf8Validator?.add(chunk);
       } on FormatException {
-        throw const SboxException(
-          SboxErrorCode.integrity,
-          '鏂囨湰杈撳叆涓嶆槸涓ユ牸 UTF-8',
-        );
+        throw const SboxException(SboxErrorCode.integrity, '文本输入不是严格 UTF-8');
       }
     }
     sink.close();
@@ -825,7 +859,7 @@ final class BundleEncryptor {
     try {
       utf8Validator?.close();
     } on FormatException {
-      throw const SboxException(SboxErrorCode.integrity, '鏂囨湰杈撳叆涓嶆槸涓ユ牸 UTF-8');
+      throw const SboxException(SboxErrorCode.integrity, '文本输入不是严格 UTF-8');
     }
     if (count != length) {
       throw const SboxException(SboxErrorCode.inputChanged, '输入范围提前结束');
@@ -883,6 +917,55 @@ final class BundleEncryptor {
     value.toUtc().minute,
     value.toUtc().second,
   ).toIso8601String().replaceFirst('.000Z', 'Z');
+}
+
+final class _PreparedBundle {
+  _PreparedBundle({
+    required this.manifest,
+    required this.randomness,
+    required this.ownsRandomness,
+    required this.rootHeader,
+    required List<int> manifestBytes,
+    required List<int> wrapped,
+  }) : manifestBytes = Uint8List.fromList(manifestBytes),
+       wrapped = Uint8List.fromList(wrapped);
+
+  final BundleManifest manifest;
+  final BundleEncryptionRandomness randomness;
+  final bool ownsRandomness;
+  final BundleHeader rootHeader;
+  final Uint8List manifestBytes;
+  final Uint8List wrapped;
+
+  BundleHeader headerFor(int shardIndex, int shardLength) {
+    if (shardIndex == 0) return rootHeader;
+    return BundleHeader.continuation(
+      bundleId: rootHeader.bundleId,
+      shardIndex: shardIndex,
+      shardCount: rootHeader.shardCount,
+      shardPlaintextSize: BigInt.from(shardLength),
+      recipientKeyId: rootHeader.recipientKeyId,
+      noncePrefix: randomness.noncePrefixes[shardIndex],
+    );
+  }
+
+  void dispose() {
+    manifestBytes.fillRange(0, manifestBytes.length, 0);
+    wrapped.fillRange(0, wrapped.length, 0);
+    if (ownsRandomness) randomness.dispose();
+  }
+}
+
+final class _EncryptedShard {
+  const _EncryptedShard({
+    required this.header,
+    required this.bytes,
+    required this.plaintextLength,
+  });
+
+  final BundleHeader header;
+  final Uint8List bytes;
+  final int plaintextLength;
 }
 
 final class _HashedRange {

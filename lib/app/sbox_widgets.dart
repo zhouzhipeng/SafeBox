@@ -54,14 +54,14 @@ class SboxTopBar extends StatelessWidget {
   const SboxTopBar({
     super.key,
     required this.mobile,
-    required this.identityReady,
-    required this.cloudReady,
+    this.onFilesTap,
+    this.onSettingsTap,
     this.firstUse = false,
   });
 
   final bool mobile;
-  final bool identityReady;
-  final bool cloudReady;
+  final VoidCallback? onFilesTap;
+  final VoidCallback? onSettingsTap;
   final bool firstUse;
 
   @override
@@ -87,47 +87,29 @@ class SboxTopBar extends StatelessWidget {
               ),
             )
           else ...<Widget>[
-            if (!mobile)
-              StatusPill(
-                label: cloudReady ? '云端同步已开启' : '云端同步未设置',
-                icon: Icons.cloud_upload_outlined,
-                tone: cloudReady ? SboxColors.accent : SboxColors.warning,
+            if (onFilesTap != null) ...<Widget>[
+              IconButton(
+                onPressed: onFilesTap,
+                tooltip: '文件',
+                icon: const Icon(Icons.folder_outlined),
+                color: SboxColors.textMuted,
+                iconSize: 28,
+                padding: const EdgeInsets.all(10),
+                constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
               ),
-            if (!mobile) const SizedBox(width: 24),
-            if (mobile)
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: <Widget>[
-                  Icon(
-                    identityReady
-                        ? Icons.verified_user_rounded
-                        : Icons.shield_outlined,
-                    color: identityReady
-                        ? SboxColors.accent
-                        : SboxColors.warning,
-                    size: 29,
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    identityReady ? '已保护' : '待设置',
-                    style: TextStyle(
-                      color: identityReady
-                          ? SboxColors.accent
-                          : SboxColors.warning,
-                      fontSize: 17,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ],
-              )
-            else
-              StatusPill(
-                label: identityReady ? '已保护' : '待设置',
-                icon: identityReady
-                    ? Icons.verified_user_rounded
-                    : Icons.shield_outlined,
-                tone: identityReady ? SboxColors.accent : SboxColors.warning,
+              const SizedBox(width: 12),
+            ],
+            if (onSettingsTap != null) ...<Widget>[
+              IconButton(
+                onPressed: onSettingsTap,
+                tooltip: '设置',
+                icon: const Icon(Icons.settings_outlined),
+                color: SboxColors.textMuted,
+                iconSize: 28,
+                padding: const EdgeInsets.all(10),
+                constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
               ),
+            ],
           ],
         ],
       ),
@@ -630,12 +612,14 @@ class SboxProgressCard extends StatelessWidget {
     required this.title,
     required this.detail,
     this.value,
+    this.progressLabel,
     this.onCancel,
   });
 
   final String title;
   final String detail;
   final double? value;
+  final String? progressLabel;
   final VoidCallback? onCancel;
 
   @override
@@ -672,7 +656,24 @@ class SboxProgressCard extends StatelessWidget {
             color: SboxColors.accent,
           ),
           const SizedBox(height: 10),
-          Text(detail, style: Theme.of(context).textTheme.bodyMedium),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Expanded(
+                child: Text(detail, style: Theme.of(context).textTheme.bodyMedium),
+              ),
+              if (progressLabel != null) ...<Widget>[
+                const SizedBox(width: 12),
+                Text(
+                  progressLabel!,
+                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                    color: SboxColors.accent,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ],
+          ),
         ],
       ),
     );

@@ -51,11 +51,13 @@ final class SourceObjectInfo {
     required this.path,
     required this.length,
     required this.revision,
+    this.downloadUri,
   });
 
   final SourcePath path;
   final int length;
   final RevisionToken revision;
+  final Uri? downloadUri;
 }
 
 final class SourceListPage {
@@ -89,5 +91,6 @@ abstract interface class RangeReadableDataSource implements DataSource {
     SourcePath path, {
     required int start,
     required int endExclusive,
+    SourceObjectInfo? objectInfo,
   });
 }

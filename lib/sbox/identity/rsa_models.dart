@@ -45,7 +45,7 @@ final class RsaGenerationResult {
   final int outerAttemptCount;
 }
 
-/// RSA-only public identity. No signing identity is part of SBOX 2.0.
+/// RSA-only public identity. No signing identity is part of SBOX 3.0.
 final class PublicIdentity {
   PublicIdentity({
     required this.rsaPublicKey,

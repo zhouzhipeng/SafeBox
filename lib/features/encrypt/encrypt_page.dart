@@ -15,6 +15,7 @@ import '../../platform/secure_credential_store.dart';
 import '../../sbox/bytes.dart';
 import '../../sbox/constants.dart';
 import '../../sbox/engine/bundle_encryptor.dart';
+import '../../sbox/errors.dart';
 import '../../sbox/identity/public_identity_record.dart';
 import '../../sbox/source/cloud_backup_config.dart';
 import '../../sbox/source/cloud_bundle_uploader.dart';
@@ -46,6 +47,7 @@ final class _EncryptPageState extends State<EncryptPage> {
   bool _dragging = false;
   XFile? _selectedFile;
   int? _selectedFileLength;
+  CloudBundleUploadProgress? _uploadProgress;
 
   @override
   void initState() {
@@ -146,9 +148,15 @@ final class _EncryptPageState extends State<EncryptPage> {
         ),
         const SizedBox(height: 14),
         if (_busy)
-          const SboxProgressCard(
-            title: '正在加密并同步双云',
-            detail: '先写入本地加密副本，再通过 GitHub、Gitee API 同时创建文件。相同 MD5 文件不会重新生成或上传。',
+          SboxProgressCard(
+            title: _uploadProgress == null
+                ? '正在加密并同步双云'
+                : _uploadStageTitle(_uploadProgress!),
+            detail: _uploadProgress == null
+                ? '先写入本地加密副本，再通过 GitHub、Gitee API 同时创建文件。相同 MD5 文件不会重新生成或上传。'
+                : _uploadProgress!.detailLabel,
+            value: _uploadProgress?.fraction,
+            progressLabel: _uploadProgress?.overallLabel,
           )
         else
           const SecurityNotice(
@@ -426,7 +434,10 @@ final class _EncryptPageState extends State<EncryptPage> {
       mediaType = 'text/plain; charset=utf-8';
     }
 
-    setState(() => _busy = true);
+    setState(() {
+      _busy = true;
+      _uploadProgress = null;
+    });
     try {
       final identity = PublicIdentityRecord(
         spkiDer: record.spkiDer,
@@ -451,6 +462,7 @@ final class _EncryptPageState extends State<EncryptPage> {
                 title: originalName,
               ),
               configuration: configuration,
+              onProgress: _handleUploadProgress,
             );
       } finally {
         client.close();
@@ -471,12 +483,49 @@ final class _EncryptPageState extends State<EncryptPage> {
         );
       }
     } catch (error) {
-      if (mounted) widget.controller.setError(error, operation: '加密并上传文件失败');
+      if (mounted) {
+        widget.controller.setError(error, operation: '加密并上传文件失败');
+        final message = error is SboxException
+            ? error.message
+            : '发生未知错误，请稍后重试。';
+        _showErrorFeedback('上传失败：$message');
+      }
     } finally {
       final bytes = textBytes;
       if (bytes != null) bytes.fillRange(0, bytes.length, 0);
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _uploadProgress = null;
+        });
+      }
     }
+  }
+
+  void _handleUploadProgress(CloudBundleUploadProgress progress) {
+    if (!mounted) return;
+    setState(() => _uploadProgress = progress);
+  }
+
+  static String _uploadStageTitle(CloudBundleUploadProgress progress) {
+    return switch (progress.stage) {
+      CloudBundleUploadStage.preparing => '正在准备上传',
+      CloudBundleUploadStage.uploading => '正在上传加密分片',
+      CloudBundleUploadStage.verifying => '正在核对云端分片',
+      CloudBundleUploadStage.completed => '上传完成，正在收尾',
+    };
+  }
+
+  void _showErrorFeedback(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: Theme.of(context).colorScheme.error,
+        ),
+      );
   }
 
   static bool _isWellFormedUtf16(String value) {

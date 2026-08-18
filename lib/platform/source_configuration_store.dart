@@ -8,7 +8,8 @@ final class SourceConfigurationStore {
   SourceConfigurationStore({SharedPreferences? preferences})
     : _providedPreferences = preferences;
 
-  static const String _storageKey = 'sbox.v2.source_configurations';
+  static const String _storageKey = 'sbox.v3.source_configurations';
+  static const String _legacyStorageKey = 'sbox.v2.source_configurations';
   final SharedPreferences? _providedPreferences;
 
   Future<List<SourceConfiguration>> loadAll() async {
@@ -60,5 +61,12 @@ final class SourceConfigurationStore {
   Future<void> remove(SourceId id) async {
     final current = await loadAll();
     await saveAll(current.where((value) => value.sourceId != id));
+  }
+
+  Future<void> clear() async {
+    final preferences =
+        _providedPreferences ?? await SharedPreferences.getInstance();
+    await preferences.remove(_storageKey);
+    await preferences.remove(_legacyStorageKey);
   }
 }

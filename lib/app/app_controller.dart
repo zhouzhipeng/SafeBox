@@ -1,22 +1,54 @@
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 
+import '../platform/app_settings_store.dart';
+import '../platform/cloud_backup_configuration_store.dart';
+import '../platform/secure_credential_store.dart';
+import '../platform/source_configuration_store.dart';
 import '../platform/public_identity_store.dart';
+import '../platform/temporary_plaintext_platform.dart';
 import '../sbox/bytes.dart';
 import '../sbox/identity/bip39_identity.dart';
 import '../sbox/identity/public_identity_record.dart';
+import '../sbox/source/credential.dart';
+import '../sbox/storage/temporary_plaintext_store.dart';
 import 'app_logger.dart';
 
 enum AppSection { library, encrypt, decrypt, sources, keys, settings }
 
 final class AppController extends ChangeNotifier {
-  AppController({PublicIdentityStore? identityStore, AppLogger? logger})
-    : _identityStore = identityStore ?? PublicIdentityStore(),
-      _logger = logger ?? AppLogger(),
-      _ownsLogger = logger == null {
+  AppController({
+    PublicIdentityStore? identityStore,
+    CloudBackupConfigurationStore? cloudBackupConfigurationStore,
+    SourceConfigurationStore? sourceConfigurationStore,
+    CredentialStore? credentialStore,
+    TemporaryPlaintextStore? temporaryPlaintextStore,
+    AppSettingsStore? appSettingsStore,
+    AppLogger? logger,
+  }) : _identityStore = identityStore ?? PublicIdentityStore(),
+       _cloudBackupConfigurationStore =
+           cloudBackupConfigurationStore ?? CloudBackupConfigurationStore(),
+       _sourceConfigurationStore =
+           sourceConfigurationStore ?? SourceConfigurationStore(),
+       _credentialStore = credentialStore ?? PlatformCredentialStore(),
+       _temporaryPlaintextStore =
+           temporaryPlaintextStore ?? TemporaryPlaintextStore(),
+       _appSettingsStore = appSettingsStore ?? AppSettingsStore(),
+       _logger = logger ?? AppLogger(),
+       _ownsLogger = logger == null {
     _logger.addListener(_loggerChanged);
   }
 
+  static final _githubCredential = SourceCredentialId('safebox-github-token');
+  static final _giteeCredential = SourceCredentialId('safebox-gitee-token');
+
   final PublicIdentityStore _identityStore;
+  final CloudBackupConfigurationStore _cloudBackupConfigurationStore;
+  final SourceConfigurationStore _sourceConfigurationStore;
+  final CredentialStore _credentialStore;
+  final TemporaryPlaintextStore _temporaryPlaintextStore;
+  final AppSettingsStore _appSettingsStore;
   final AppLogger _logger;
   final bool _ownsLogger;
   PublicIdentityRecord? _identity;
@@ -75,6 +107,74 @@ final class AppController extends ChangeNotifier {
     } finally {
       identity.disposeControlledSecrets();
     }
+  }
+
+  /// Removes all SafeBox identity-related data stored on this device.
+  ///
+  /// Remote repository contents are deliberately not touched. Each local
+  /// cleanup is attempted even when another cleanup fails so a retry can make
+  /// progress instead of stopping at the first unavailable store.
+  Future<void> removeIdentity() async {
+    final credentialIds = <SourceCredentialId>{
+      _githubCredential,
+      _giteeCredential,
+    };
+    try {
+      final configuration = await _cloudBackupConfigurationStore.load();
+      if (configuration != null) {
+        credentialIds
+          ..add(configuration.github.credentialId)
+          ..add(configuration.gitee.credentialId);
+      }
+    } on Object {
+      // The raw configuration key is still removed below even if its value
+      // is corrupt and cannot be decoded.
+    }
+    try {
+      final configurations = await _sourceConfigurationStore.loadAll();
+      for (final configuration in configurations) {
+        final credential = configuration.credentialReference;
+        if (credential != null) credentialIds.add(credential);
+      }
+    } on Object {
+      // As above, clearing the raw source-configuration key is still useful.
+    }
+
+    final failures = <Object>[];
+    Future<void> attempt(Future<void> Function() action) async {
+      try {
+        await action();
+      } on Object catch (error) {
+        failures.add(error);
+      }
+    }
+
+    await attempt(() async {
+      for (final credentialId in credentialIds) {
+        await _credentialStore.deleteAccessToken(credentialId);
+      }
+    });
+    await attempt(_identityStore.clear);
+    await attempt(_cloudBackupConfigurationStore.clear);
+    await attempt(_sourceConfigurationStore.clear);
+    await attempt(_appSettingsStore.clear);
+    await attempt(() async {
+      final root = Directory(_temporaryPlaintextStore.path);
+      if (await root.exists()) {
+        await TemporaryPlaintextPlatform.protectRoot(root.path);
+      }
+      await _temporaryPlaintextStore.deleteRoot();
+    });
+    await attempt(_logger.clear);
+
+    if (failures.isNotEmpty) {
+      throw StateError('本机身份相关数据没有完全清理，请重试。');
+    }
+
+    _identity = null;
+    _statusMessage = '请创建或恢复 RSA 公开身份';
+    _errorMessage = null;
+    notifyListeners();
   }
 
   void setStatus(String message) {

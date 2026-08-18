@@ -71,7 +71,14 @@ SboxRsaPublicKey parseRsaSubjectPublicKeyInfo(List<int> input) {
       exponent != BigInt.from(RsaIdentityProfile1.publicExponent)) {
     throw const FormatException('Invalid RSA public key dimensions');
   }
-  return SboxRsaPublicKey(modulus: modulus, exponent: exponent);
+  final key = SboxRsaPublicKey(modulus: modulus, exponent: exponent);
+  // Parsing alone is not enough for the v3 Metadata KDF: the exact DER
+  // spelling is part of the key material. Reject alternate encodings of the
+  // same RSA modulus before the bytes can be used as an identity.
+  if (!constantTimeBytesEqual(encodeRsaSubjectPublicKeyInfo(key), input)) {
+    throw const FormatException('Non-canonical RSA SubjectPublicKeyInfo');
+  }
+  return key;
 }
 
 String encodePublicKeyPem(List<int> spkiDer) {

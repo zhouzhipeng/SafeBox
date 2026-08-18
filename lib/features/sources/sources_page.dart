@@ -28,7 +28,6 @@ final class _SourcesPageState extends State<SourcesPage> {
   final _githubRepositoryController = TextEditingController();
   final _giteeOwnerController = TextEditingController();
   final _giteeRepositoryController = TextEditingController();
-  final _branchController = TextEditingController(text: 'main');
   final _pathPrefixController = TextEditingController();
   final _githubTokenController = TextEditingController();
   final _giteeTokenController = TextEditingController();
@@ -53,7 +52,6 @@ final class _SourcesPageState extends State<SourcesPage> {
       _githubRepositoryController,
       _giteeOwnerController,
       _giteeRepositoryController,
-      _branchController,
       _pathPrefixController,
       _githubTokenController,
       _giteeTokenController,
@@ -129,15 +127,6 @@ final class _SourcesPageState extends State<SourcesPage> {
         SboxCard(
           child: Column(
             children: <Widget>[
-              TextField(
-                controller: _branchController,
-                decoration: const InputDecoration(
-                  labelText: '分支',
-                  hintText: 'main',
-                  prefixIcon: Icon(Icons.account_tree_outlined),
-                ),
-              ),
-              const SizedBox(height: 14),
               TextField(
                 controller: _pathPrefixController,
                 decoration: const InputDecoration(
@@ -261,7 +250,6 @@ final class _SourcesPageState extends State<SourcesPage> {
         _githubRepositoryController.text = configuration.github.repository;
         _giteeOwnerController.text = configuration.gitee.owner;
         _giteeRepositoryController.text = configuration.gitee.repository;
-        _branchController.text = configuration.github.branch;
         _pathPrefixController.text = configuration.github.pathPrefix;
         _githubTokenSaved = await _hasToken(configuration.github.credentialId);
         _giteeTokenSaved = await _hasToken(configuration.gitee.credentialId);
@@ -281,15 +269,13 @@ final class _SourcesPageState extends State<SourcesPage> {
     final repositoryGithub = _githubRepositoryController.text.trim();
     final ownerGitee = _giteeOwnerController.text.trim();
     final repositoryGitee = _giteeRepositoryController.text.trim();
-    final branch = _branchController.text.trim();
     final prefix = _pathPrefixController.text.trim();
     if (directory.isEmpty ||
         ownerGithub.isEmpty ||
         repositoryGithub.isEmpty ||
         ownerGitee.isEmpty ||
-        repositoryGitee.isEmpty ||
-        branch.isEmpty) {
-      widget.controller.setError('本地目录、两个仓库地址和分支都不能为空。');
+        repositoryGitee.isEmpty) {
+      widget.controller.setError('本地目录和两个仓库地址都不能为空。');
       return;
     }
     late final CloudBackupConfiguration configuration;
@@ -299,14 +285,12 @@ final class _SourcesPageState extends State<SourcesPage> {
         github: CloudRepositoryEndpoint(
           owner: ownerGithub,
           repository: repositoryGithub,
-          branch: branch,
           pathPrefix: prefix,
           credentialId: _githubCredential,
         ),
         gitee: CloudRepositoryEndpoint(
           owner: ownerGitee,
           repository: repositoryGitee,
-          branch: branch,
           pathPrefix: prefix,
           credentialId: _giteeCredential,
         ),
@@ -381,14 +365,12 @@ final class _SourcesPageState extends State<SourcesPage> {
         github: CloudRepositoryEndpoint(
           owner: _githubOwnerController.text.trim(),
           repository: _githubRepositoryController.text.trim(),
-          branch: _branchController.text.trim(),
           pathPrefix: _pathPrefixController.text.trim(),
           credentialId: _githubCredential,
         ),
         gitee: CloudRepositoryEndpoint(
           owner: _giteeOwnerController.text.trim(),
           repository: _giteeRepositoryController.text.trim(),
-          branch: _branchController.text.trim(),
           pathPrefix: _pathPrefixController.text.trim(),
           credentialId: _giteeCredential,
         ),

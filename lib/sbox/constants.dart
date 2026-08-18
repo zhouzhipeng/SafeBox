@@ -13,10 +13,25 @@ abstract final class SboxProtocol {
     0x0a,
   ]);
 
-  static const int versionMajor = 2;
+  static const int versionMajor = 3;
   static const int versionMinor = 0;
   static const int commonHeaderLength = 128;
-  static const int rootHeaderLength = 512;
+  static const int rootHeaderLength = 16992;
+  static const int wrappedBundleDekOffset = commonHeaderLength;
+  static const int metadataDescriptionOffset = 512;
+  static const int metadataDescriptionLength = 64;
+  static const int metadataAadHeaderLength = 576;
+  static const int metadataCiphertextOffset = 576;
+  static const int metadataBlockLength = 16400;
+  static const int metadataCiphertextLength = metadataBlockLength;
+  static const int metadataTagOffset = 16976;
+  static const int metadataSaltLength = 32;
+  static const int metadataNonceLength = 12;
+  static const int metadataAadPrefixLength = 16;
+  static const int metadataFormatId = 1;
+  static const int metadataKdfAlgorithm = 1;
+  static const int metadataAeadAlgorithm = 1;
+  static const int metadataFlags = 0;
   static const int keyProfileId = 1;
   static const int rootKeyWrapAlgorithm = 1;
   static const int continuationKeyWrapAlgorithm = 0;
@@ -65,7 +80,6 @@ enum SboxContentKind {
 }
 
 enum BundleRecordType {
-  manifest(0x01),
   data(0x02),
   finalRecord(0xff);
 

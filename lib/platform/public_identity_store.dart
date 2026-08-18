@@ -15,8 +15,10 @@ final class PublicIdentityStore {
   PublicIdentityStore({SharedPreferences? preferences})
     : _providedPreferences = preferences;
 
-  static const String _storageKey = 'sbox.v2.public_identity';
-  static const String _historyKey = 'sbox.v2.public_identity_history';
+  static const String _storageKey = 'sbox.v3.public_identity';
+  static const String _historyKey = 'sbox.v3.public_identity_history';
+  static const String _legacyStorageKey = 'sbox.v2.public_identity';
+  static const String _legacyHistoryKey = 'sbox.v2.public_identity_history';
   final SharedPreferences? _providedPreferences;
 
   Future<PublicIdentityRecord?> load() async {
@@ -115,5 +117,7 @@ final class PublicIdentityStore {
         _providedPreferences ?? await SharedPreferences.getInstance();
     await preferences.remove(_storageKey);
     await preferences.remove(_historyKey);
+    await preferences.remove(_legacyStorageKey);
+    await preferences.remove(_legacyHistoryKey);
   }
 }

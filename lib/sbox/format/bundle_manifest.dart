@@ -45,7 +45,7 @@ final class BundleManifest {
   final int shardCount;
 
   Map<String, Object?> toJson() => <String, Object?>{
-    'schema': 'SBOX-MANIFEST-2',
+    'schema': 'SBOX-MANIFEST-3',
     'bundle_id': bundleId,
     'recipient_key_id': recipientKeyId,
     'content_kind': contentKind.wireName,
@@ -171,7 +171,7 @@ final class BundleManifest {
     final logicalHash = json['logical_plaintext_sha256'];
     final nominalSize = json['nominal_shard_plaintext_size'];
     final shardCount = json['shard_count'];
-    if (schema != 'SBOX-MANIFEST-2' ||
+    if (schema != 'SBOX-MANIFEST-3' ||
         bundleId is! String ||
         recipientKeyId is! String ||
         contentKindName is! String ||

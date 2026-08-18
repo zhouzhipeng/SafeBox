@@ -1,8 +1,13 @@
 import 'dart:typed_data';
 
+import '../constants.dart';
+import '../engine/background_bundle_crypto.dart';
+import '../engine/bundle_probe.dart';
 import '../errors.dart';
 import '../format/bundle_header.dart';
+import '../format/bundle_manifest.dart';
 import '../format/bundle_path.dart';
+import '../identity/rsa_models.dart';
 import 'data_source.dart';
 import 'source_path.dart';
 
@@ -11,17 +16,23 @@ final class ListedBundleRoot {
     required this.path,
     required this.info,
     required this.header,
+    this.manifest,
+    this.status = BundleTrustStatus.headerOnly,
   });
 
   final SourcePath path;
   final SourceObjectInfo info;
   final BundleHeader header;
+  final BundleManifest? manifest;
+  final BundleTrustStatus status;
 }
 
 abstract final class BundleListing {
   static Future<List<ListedBundleRoot>> listRoots(
     EnumerableDataSource source, {
     int pageSize = 1000,
+    PublicIdentity? identity,
+    int? maxParallelTransfers,
   }) async {
     if (!source.capabilities.canListObjects ||
         !source.capabilities.supportsRangeRead) {
@@ -39,12 +50,20 @@ abstract final class BundleListing {
     final rangeSource = source as RangeReadableDataSource;
     final roots = <ListedBundleRoot>[];
     final seenPaths = <String>{};
+    final parallelism =
+        (maxParallelTransfers ?? source.capabilities.maxParallelTransfers)
+            .clamp(1, SboxProtocol.defaultMaxParallelTransfers);
+    SboxException? recoverableCandidateError;
     String? cursor;
     do {
       final page = await source.listObjects(cursor: cursor, pageSize: pageSize);
+      final candidates = <SourceObjectInfo>[];
       for (final info in page.objects) {
         if (!seenPaths.add(info.path.value)) {
           throw const SboxException(SboxErrorCode.shardConflict, '数据源返回重复对象路径');
+        }
+        if (seenPaths.length > SboxProtocol.maxCandidateObjects) {
+          throw const SboxException(SboxErrorCode.sourceLimit, '候选对象超过安全上限');
         }
         BundlePathInfo path;
         try {
@@ -52,29 +71,113 @@ abstract final class BundleListing {
         } on SboxException {
           continue;
         }
-        if (path.shardIndex != 0) continue;
-        final prefix = await rangeSource.getRange(
-          info.path,
-          start: 0,
-          endExclusive: path.shardCount == 1 ? 512 : 512,
-        );
-        final headerBytes = await _readAtMost(prefix.body, prefix.length);
-        final header = BundleHeader.parse(headerBytes);
-        if (!header.isRoot) continue;
-        if (header.canonicalBasename != info.path.value) {
-          throw const SboxException(SboxErrorCode.shardMismatch, '对象路径与公共头不一致');
+        if (path.shardIndex == 0) {
+          // A repository can contain objects written by an older SafeBox
+          // version (or a partial upload).  When the provider gives us an
+          // exact size, avoid a range request that cannot possibly contain a
+          // v3 root header.  Gitee may omit the size, so zero means unknown.
+          if (info.length == 0 ||
+              info.length >= SboxProtocol.rootHeaderLength) {
+            candidates.add(info);
+          }
         }
-        roots.add(
-          ListedBundleRoot(path: info.path, info: info, header: header),
+      }
+
+      for (var offset = 0; offset < candidates.length; offset += parallelism) {
+        final end = (offset + parallelism).clamp(0, candidates.length);
+        final batch = candidates.sublist(offset, end);
+        final results = await Future.wait<ListedBundleRoot?>(
+          batch.map((info) async {
+            try {
+              return await _readRoot(rangeSource, info, identity: identity);
+            } on SboxException catch (error) {
+              if (_isIgnorableCandidateError(error.code)) return null;
+              if (_isRecoverableCandidateError(error.code)) {
+                // A provider may reject one raw object (for example a large
+                // public Gitee object) while the rest of the repository is
+                // readable. Do not discard roots already found for the page.
+                recoverableCandidateError ??= error;
+                return null;
+              }
+              rethrow;
+            }
+          }),
         );
+        roots.addAll(results.whereType<ListedBundleRoot>());
       }
       cursor = page.nextCursor;
     } while (cursor != null);
+    final listingError = recoverableCandidateError;
+    if (roots.isEmpty && listingError != null) throw listingError;
     roots.sort((left, right) => left.path.value.compareTo(right.path.value));
     return List<ListedBundleRoot>.unmodifiable(roots);
   }
 
-  static Future<Uint8List> _readAtMost(
+  static Future<ListedBundleRoot> _readRoot(
+    RangeReadableDataSource source,
+    SourceObjectInfo info, {
+    required PublicIdentity? identity,
+  }) async {
+    final path = parseCanonicalBundleBasename(info.path.value);
+    final prefix = await source.getRange(
+      info.path,
+      start: 0,
+      endExclusive: SboxProtocol.rootHeaderLength,
+      objectInfo: info,
+    );
+    if (prefix.notModified || prefix.length != SboxProtocol.rootHeaderLength) {
+      throw const SboxException(SboxErrorCode.remoteChanged, '公共头范围响应长度无效');
+    }
+    final headerBytes = await _readExact(prefix.body, prefix.length);
+    final header = BundleHeader.parse(headerBytes);
+    if (!header.isRoot || header.canonicalBasename != info.path.value) {
+      throw const SboxException(SboxErrorCode.shardMismatch, '对象路径与公共头不一致');
+    }
+    if (path.shardIndex != 0) {
+      throw const SboxException(SboxErrorCode.shardMismatch, '根对象路径无效');
+    }
+    if (identity == null) {
+      return ListedBundleRoot(path: info.path, info: info, header: header);
+    }
+    try {
+      final result = await BackgroundBundleCrypto.readManifest(
+        basename: info.path.value,
+        objectPrefix: headerBytes,
+        identity: identity,
+      );
+      return ListedBundleRoot(
+        path: info.path,
+        info: info,
+        header: header,
+        manifest: result.manifest,
+        status: result.status,
+      );
+    } on SboxException {
+      // A public key that does not match this recipient, or an unreadable
+      // Metadata block, does not make the public object disappear from the
+      // library. It remains a headerOnly candidate.
+      return ListedBundleRoot(path: info.path, info: info, header: header);
+    }
+  }
+
+  static bool _isIgnorableCandidateError(SboxErrorCode code) => switch (code) {
+    SboxErrorCode.invalidHeader ||
+    SboxErrorCode.unsupportedVersion ||
+    SboxErrorCode.truncated ||
+    SboxErrorCode.shardMismatch ||
+    SboxErrorCode.sourceNotFound ||
+    SboxErrorCode.remoteChanged => true,
+    _ => false,
+  };
+
+  static bool _isRecoverableCandidateError(SboxErrorCode code) =>
+      switch (code) {
+        SboxErrorCode.sourceAuthentication ||
+        SboxErrorCode.sourceNetwork => true,
+        _ => false,
+      };
+
+  static Future<Uint8List> _readExact(
     Stream<List<int>> body,
     int length,
   ) async {
@@ -86,6 +189,9 @@ abstract final class BundleListing {
         throw const SboxException(SboxErrorCode.remoteChanged, '公共头范围响应过长');
       }
       output.add(chunk);
+    }
+    if (count != length) {
+      throw const SboxException(SboxErrorCode.truncated, '公共头范围响应不完整');
     }
     return output.takeBytes();
   }

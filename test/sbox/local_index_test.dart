@@ -11,7 +11,7 @@ void main() {
   test(
     'local Bundle index is rebuildable and remains outside source objects',
     () async {
-      final root = await Directory.systemTemp.createTemp('sbox-v2-index-');
+    final root = await Directory.systemTemp.createTemp('sbox-v3-index-');
       try {
         final bundleId = List<int>.generate(16, (index) => 0xa0 + index);
         final recipientKeyId = List<int>.filled(32, 0x20);
@@ -46,7 +46,7 @@ void main() {
         final store = LocalBundleIndexStore(root);
         await store.save(index);
         expect(
-          await File(p.join(root.path, '.sbox-sync', 'index-v2.json')).exists(),
+          await File(p.join(root.path, '.sbox-sync', 'index-v3.json')).exists(),
           isTrue,
         );
         final loaded = await store.load(expectedSourceId: index.sourceId);

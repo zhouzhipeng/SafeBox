@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
@@ -154,7 +155,11 @@ final class RemoteHttp {
     http.StreamedResponse response, {
     int maximumBytes = maximumMetadataBytes,
   }) async {
-    final value = await readJsonValue(response, maximumBytes: maximumBytes);
+    final value = await readJsonValue(
+      response,
+      maximumBytes: maximumBytes,
+      parseInBackground: true,
+    );
     if (value is! List<Object?>) {
       logger?.warning('$sourceName：云端列表响应格式错误', detail: '期望 JSON 列表');
       throw const SboxException(SboxErrorCode.sourceNetwork, '数据源返回了无效列表响应');
@@ -165,16 +170,19 @@ final class RemoteHttp {
   Future<Object?> readJsonValue(
     http.StreamedResponse response, {
     int maximumBytes = maximumMetadataBytes,
+    bool parseInBackground = false,
   }) async {
     final bytes = await readBounded(
       response.stream,
       maximumBytes: maximumBytes,
     );
     try {
-      final value = StrictJsonParser(
-        utf8.decode(bytes, allowMalformed: false),
-        maximumStringCodeUnits: maximumBytes,
-      ).parse();
+      final value = parseInBackground
+          ? await Isolate.run<Object?>(
+              () => _parseJsonWorker(bytes, maximumBytes),
+              debugName: 'safebox-parse-file-list',
+            )
+          : _parseJsonWorker(bytes, maximumBytes);
       return value;
     } on Object catch (error) {
       _logError(
@@ -343,4 +351,11 @@ final class RemoteHttp {
 
   static SboxException _networkError() =>
       const SboxException(SboxErrorCode.sourceNetwork, '无法安全连接数据源');
+}
+
+Object? _parseJsonWorker(Uint8List bytes, int maximumStringCodeUnits) {
+  return StrictJsonParser(
+    utf8.decode(bytes, allowMalformed: false),
+    maximumStringCodeUnits: maximumStringCodeUnits,
+  ).parse();
 }

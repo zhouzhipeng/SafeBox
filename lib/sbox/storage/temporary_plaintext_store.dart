@@ -22,12 +22,26 @@ final class TemporaryPlaintextStore {
             ),
           );
 
-  static const String markerName = '.sbox-managed-temp-v2';
+  static const String markerName = '.sbox-managed-temp-v3';
   static const String defaultDirectoryName = 'SafeBox';
 
   final Directory root;
 
   String get path => p.normalize(p.absolute(root.path));
+
+  /// Ensures that the managed cache root exists and returns its canonical path.
+  Future<Directory> ensureRoot() async => Directory(await _ensureReady());
+
+  /// Deletes the entire application-owned plaintext cache root.
+  ///
+  /// The root must already carry a SafeBox management marker and remain below
+  /// the operating system temporary directory. A missing root is a no-op.
+  Future<void> deleteRoot() async {
+    final type = await FileSystemEntity.type(path, followLinks: false);
+    if (type == FileSystemEntityType.notFound) return;
+    final canonicalRoot = await _ensureReady();
+    await _deleteTreeNoFollow(Directory(canonicalRoot));
+  }
 
   Future<File> fileFor(BundleManifest manifest) async {
     final canonicalRoot = await _ensureReady();

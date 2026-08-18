@@ -30,7 +30,7 @@ final class GitHubDataSource extends RepositoryDataSource {
   String get apiAcceptHeader => 'application/vnd.github+json';
 
   @override
-  Uri metadataUri(SourcePath path) => _contentsUri(path, includeRef: true);
+  Uri metadataUri(SourcePath path) => _contentsUri(path);
 
   @override
   Uri listUri({String? cursor, int pageSize = 1000}) => Uri(
@@ -44,7 +44,6 @@ final class GitHubDataSource extends RepositoryDataSource {
       if (config.pathPrefix.isNotEmpty) ...config.pathPrefix.split('/'),
     ],
     queryParameters: <String, String>{
-      'ref': config.branch,
       'page': cursor ?? '1',
       'per_page': (pageSize < providerPageSize ? pageSize : providerPageSize)
           .toString(),
@@ -52,19 +51,11 @@ final class GitHubDataSource extends RepositoryDataSource {
   );
 
   @override
-  Uri writeUri(SourcePath path) => _contentsUri(path, includeRef: false);
+  Uri writeUri(SourcePath path) => _contentsUri(path);
 
   @override
-  Uri rawUri(SourcePath path, RepositoryObjectMetadata metadata) => Uri(
-    scheme: 'https',
-    host: 'raw.githubusercontent.com',
-    pathSegments: <String>[
-      config.owner,
-      config.repository,
-      config.branch,
-      ...config.resolveBasename(path).split('/'),
-    ],
-  );
+  Uri rawUri(SourcePath path, RepositoryObjectMetadata metadata) =>
+      resolvedDownloadUri(metadata);
 
   @override
   Uri repositoryProbeUri() => listUri();
@@ -76,7 +67,7 @@ final class GitHubDataSource extends RepositoryDataSource {
     'X-GitHub-Api-Version': '2022-11-28',
   };
 
-  Uri _contentsUri(SourcePath path, {required bool includeRef}) => Uri(
+  Uri _contentsUri(SourcePath path) => Uri(
     scheme: 'https',
     host: 'api.github.com',
     pathSegments: <String>[
@@ -86,6 +77,5 @@ final class GitHubDataSource extends RepositoryDataSource {
       'contents',
       ...config.resolveBasename(path).split('/'),
     ],
-    queryParameters: includeRef ? <String, String>{'ref': config.branch} : null,
   );
 }

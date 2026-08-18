@@ -87,6 +87,7 @@ final class LocalDirectoryDataSource
     SourcePath path, {
     required int start,
     required int endExclusive,
+    SourceObjectInfo? objectInfo,
   }) async {
     if (start < 0 || endExclusive < start) {
       throw const SboxException(SboxErrorCode.invalidHeader, '范围读取边界无效');

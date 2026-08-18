@@ -13,7 +13,7 @@ import 'package:test/test.dart';
 
 void main() {
   test('local source is direct-root, paged and immutable', () async {
-    final temporary = await Directory.systemTemp.createTemp('sbox-v2-source-');
+    final temporary = await Directory.systemTemp.createTemp('sbox-v3-source-');
     try {
       final source = await LocalDirectoryDataSource.attach(root: temporary);
       final rootHeader = BundleHeader.root(
@@ -23,6 +23,10 @@ void main() {
         recipientKeyId: List<int>.filled(32, 0x20),
         noncePrefix: <int>[1, 2, 3, 4],
         wrappedBundleDek: List<int>.filled(384, 0x44),
+        metadataSalt: List<int>.filled(32, 0x10),
+        metadataNonce: List<int>.filled(12, 0x20),
+        metadataCiphertext: List<int>.filled(16400, 0x30),
+        metadataTag: List<int>.filled(16, 0x40),
       );
       final rootPath = SourcePath(rootHeader.canonicalBasename);
       final rootBytes = rootHeader.encode();
@@ -71,6 +75,27 @@ void main() {
       );
       expect(secondPage.objects, hasLength(1));
       expect(secondPage.nextCursor, isNull);
+
+      // A repository may still contain v2 objects or partial uploads next to
+      // valid v3 bundles. They must not hide the valid root during listing.
+      await File(
+        p.join(temporary.path, '00000000000000000000000000000001.sbox'),
+      ).writeAsBytes(Uint8List(512));
+      final legacy = Uint8List(20000);
+      legacy.setRange(0, 8, <int>[
+        0x53,
+        0x42,
+        0x4f,
+        0x58,
+        0x0d,
+        0x0a,
+        0x1a,
+        0x0a,
+      ]);
+      legacy[8] = 2;
+      await File(
+        p.join(temporary.path, '00000000000000000000000000000002.sbox'),
+      ).writeAsBytes(legacy);
 
       final roots = await BundleListing.listRoots(source);
       expect(roots, hasLength(1));

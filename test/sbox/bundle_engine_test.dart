@@ -6,7 +6,6 @@ import 'package:safebox/sbox/constants.dart';
 import 'package:safebox/sbox/engine/bundle_encryptor.dart';
 import 'package:safebox/sbox/engine/bundle_decryptor.dart';
 import 'package:safebox/sbox/engine/bundle_probe.dart';
-import 'package:safebox/sbox/format/bundle_record.dart';
 import 'package:safebox/sbox/errors.dart';
 import 'package:safebox/sbox/identity/bip39_identity.dart';
 import 'package:safebox/sbox/identity/rsa_models.dart';
@@ -75,16 +74,11 @@ void main() {
         randomness: _randomness(1, 5),
       );
       final root = encrypted.root;
-      final manifestRecord = BundleRecordCodec().parseAt(
-        root.bytes,
-        root.header.headerLength,
-        maximumPlaintextLength: SboxProtocol.maxManifestBytes,
-      );
-      final prefix = root.bytes.sublist(0, manifestRecord.nextOffset);
-      final probe = await BundleProbe.authenticateManifest(
+      final prefix = root.bytes.sublist(0, root.header.headerLength);
+      final probe = await BundleProbe.readManifest(
         basename: root.basename,
         objectPrefix: prefix,
-        mnemonic: mnemonic,
+        identity: recipient,
       );
       expect(probe.manifestAuthenticated, isTrue);
       expect(probe.manifest?.originalName, 'sample.bin');
@@ -99,7 +93,7 @@ void main() {
         recipient: recipient,
         randomness: _randomness(1, 6),
       );
-      final temporary = await Directory.systemTemp.createTemp('sbox-v2-plain-');
+      final temporary = await Directory.systemTemp.createTemp('sbox-v3-plain-');
       final destination = File(
         '${temporary.path}${Platform.pathSeparator}out.bin',
       );
@@ -165,9 +159,13 @@ void main() {
       final plaintext = Uint8List(1024 * 1024 + 1);
       plaintext[0] = 0x31;
       plaintext[plaintext.length - 1] = 0x39;
-      final randomness = _randomness(2, 7);
+      final randomness = _randomness(
+        2,
+        7,
+        bundleId: crypto.md5.convert(plaintext).bytes,
+      );
       final directory = await Directory.systemTemp.createTemp(
-        'sbox-v2-stream-',
+        'sbox-v3-stream-',
       );
       try {
         final committed = await BundleEncryptor().encryptToDirectory(
@@ -289,7 +287,7 @@ void main() {
     final tampered = encrypted.objects
         .map((object) => Uint8List.fromList(object.bytes))
         .toList(growable: false);
-    tampered[0][512 + 13] ^= 1;
+    tampered[0][600] ^= 1;
     await expectLater(
       BundleDecryptor().decryptBytes(shardBytes: tampered, mnemonic: mnemonic),
       throwsA(isA<SboxException>()),
@@ -303,25 +301,44 @@ Future<EncryptedBundle> _encrypt(
   required BundleEncryptionRandomness randomness,
   int targetNominalShardPlaintextSize =
       SboxProtocol.defaultNominalShardPlaintextSize,
-}) => BundleEncryptor().encryptBytes(
-  plaintext: plaintext,
-  options: BundleEncryptionOptions(
-    recipient: recipient,
-    contentKind: SboxContentKind.file,
-    originalName: 'sample.bin',
-    mediaType: 'application/octet-stream',
-    createdAt: '2026-08-17T00:00:00Z',
-    targetNominalShardPlaintextSize: targetNominalShardPlaintextSize,
-    randomness: randomness,
-  ),
-);
-
-BundleEncryptionRandomness _randomness(int shardCount, int offset) =>
-    BundleEncryptionRandomness(
-      bundleId: List<int>.generate(
-        16,
-        (index) => (0xa0 + index + offset) & 0xff,
+}) async {
+  final effective = BundleEncryptionRandomness(
+    bundleId: crypto.md5.convert(plaintext).bytes,
+    bundleDek: randomness.bundleDek,
+    noncePrefixes: randomness.noncePrefixes,
+    oaepSeed: randomness.oaepSeed,
+    metadataSalt: randomness.metadataSalt,
+    metadataNonce: randomness.metadataNonce,
+  );
+  try {
+    return await BundleEncryptor().encryptBytes(
+      plaintext: plaintext,
+      options: BundleEncryptionOptions(
+        recipient: recipient,
+        contentKind: SboxContentKind.file,
+        originalName: 'sample.bin',
+        mediaType: 'application/octet-stream',
+        createdAt: '2026-08-17T00:00:00Z',
+        targetNominalShardPlaintextSize: targetNominalShardPlaintextSize,
+        randomness: effective,
       ),
+    );
+  } finally {
+    effective.dispose();
+  }
+}
+
+BundleEncryptionRandomness _randomness(
+  int shardCount,
+  int offset, {
+  List<int>? bundleId,
+}) =>
+    BundleEncryptionRandomness(
+      bundleId: bundleId ??
+          List<int>.generate(
+            16,
+            (index) => (0xa0 + index + offset) & 0xff,
+          ),
       bundleDek: List<int>.generate(32, (index) => (index + offset) & 0xff),
       noncePrefixes: <List<int>>[
         for (var index = 0; index < shardCount; index++)

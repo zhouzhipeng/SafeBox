@@ -36,7 +36,6 @@ final class SourceConfiguration {
     required this.localSyncPath,
     this.owner,
     this.repository,
-    this.branchOrRef,
     this.pathPrefix = '',
     this.httpsBaseUri,
     this.credentialReference,
@@ -53,7 +52,6 @@ final class SourceConfiguration {
   final String localSyncPath;
   final String? owner;
   final String? repository;
-  final String? branchOrRef;
   final String pathPrefix;
   final Uri? httpsBaseUri;
   final SourceCredentialId? credentialReference;
@@ -66,7 +64,6 @@ final class SourceConfiguration {
   RepositorySourceConfig get repositoryConfig => RepositorySourceConfig(
     owner: owner!,
     repository: repository!,
-    branch: branchOrRef!,
     pathPrefix: pathPrefix,
   );
 
@@ -82,7 +79,6 @@ final class SourceConfiguration {
     'sync_policy': syncPolicy.name,
     if (owner != null) 'owner': owner,
     if (repository != null) 'repository': repository,
-    if (branchOrRef != null) 'branch_or_ref': branchOrRef,
     if (pathPrefix.isNotEmpty) 'path_prefix': pathPrefix,
     if (httpsBaseUri != null) 'https_base_uri': httpsBaseUri.toString(),
     if (credentialReference != null)
@@ -101,7 +97,6 @@ final class SourceConfiguration {
       'sync_policy',
       'owner',
       'repository',
-      'branch_or_ref',
       'path_prefix',
       'https_base_uri',
       'credential_reference',
@@ -145,7 +140,6 @@ final class SourceConfiguration {
       localSyncPath: requiredString('local_sync_path'),
       owner: optionalString('owner'),
       repository: optionalString('repository'),
-      branchOrRef: optionalString('branch_or_ref'),
       pathPrefix: optionalString('path_prefix') ?? '',
       httpsBaseUri: https == null ? null : Uri.parse(https),
       credentialReference: optionalString('credential_reference') == null
@@ -171,7 +165,6 @@ final class SourceConfiguration {
       case SourceProvider.local:
         if (owner != null ||
             repository != null ||
-            branchOrRef != null ||
             pathPrefix.isNotEmpty ||
             httpsBaseUri != null ||
             credentialReference != null ||
@@ -180,23 +173,18 @@ final class SourceConfiguration {
           throw ArgumentError('Invalid local source configuration');
         }
       case SourceProvider.github || SourceProvider.gitee:
-        if (owner == null ||
-            repository == null ||
-            branchOrRef == null ||
-            httpsBaseUri != null) {
+        if (owner == null || repository == null || httpsBaseUri != null) {
           throw ArgumentError('Invalid repository source configuration');
         }
         RepositorySourceConfig(
           owner: owner!,
           repository: repository!,
-          branch: branchOrRef!,
           pathPrefix: pathPrefix,
         );
       case SourceProvider.https:
         if (mode != SourceMode.readOnly ||
             owner != null ||
             repository != null ||
-            branchOrRef != null ||
             pathPrefix.isNotEmpty ||
             httpsBaseUri == null ||
             credentialReference != null) {

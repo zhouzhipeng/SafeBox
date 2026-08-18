@@ -101,7 +101,7 @@ final class LocalBundleIndex {
   final List<LocalBundleIndexEntry> entries;
 
   Map<String, Object?> toJson() => <String, Object?>{
-    'schema': 'SBOX-LOCAL-INDEX-2',
+    'schema': 'SBOX-LOCAL-INDEX-3',
     'source_id': sourceId,
     'entries': entries.map((entry) => entry.toJson()).toList(growable: false),
   };
@@ -113,7 +113,7 @@ final class LocalBundleIndex {
 
   static LocalBundleIndex fromJson(Map<String, Object?> json) {
     if (json.length != 3 ||
-        json['schema'] != 'SBOX-LOCAL-INDEX-2' ||
+        json['schema'] != 'SBOX-LOCAL-INDEX-3' ||
         json['source_id'] is! String ||
         json['entries'] is! List<Object?>) {
       throw const FormatException('Invalid local Bundle index');
@@ -156,7 +156,7 @@ final class LocalBundleIndexStore {
 
   final Directory cipherRoot;
 
-  File get file => File(p.join(cipherRoot.path, '.sbox-sync', 'index-v2.json'));
+  File get file => File(p.join(cipherRoot.path, '.sbox-sync', 'index-v3.json'));
 
   Future<LocalBundleIndex?> load({String? expectedSourceId}) async {
     if (!await file.exists()) return null;
@@ -185,7 +185,7 @@ final class LocalBundleIndexStore {
     final stage = File(
       p.join(
         directory.path,
-        '.index-v2.${hexLower(secureRandomBytes(8))}.part',
+        '.index-v3.${hexLower(secureRandomBytes(8))}.part',
       ),
     );
     try {

@@ -8,9 +8,9 @@ import 'package:test/test.dart';
 
 void main() {
   test('managed plaintext cache validates content and clears only Bundle dirs', () async {
-    final root = await Directory.systemTemp.createTemp('sbox-v2-plaintext-');
+    final root = await Directory.systemTemp.createTemp('sbox-v3-plaintext-');
     final outside = File(
-      '${root.parent.path}${Platform.pathSeparator}sbox-v2-keep.txt',
+      '${root.parent.path}${Platform.pathSeparator}sbox-v3-keep.txt',
     );
     await outside.writeAsString('keep');
     try {
@@ -52,7 +52,7 @@ void main() {
   });
 
   test('managed plaintext cache rejects a path outside its Bundle directory', () async {
-    final root = await Directory.systemTemp.createTemp('sbox-v2-plaintext-');
+    final root = await Directory.systemTemp.createTemp('sbox-v3-plaintext-');
     try {
       final manifest = BundleManifest(
         bundleId: 'fedcba9876543210fedcba9876543210',

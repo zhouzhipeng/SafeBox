@@ -1,12 +1,13 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-import '../bytes.dart';
 import '../errors.dart';
+import '../engine/background_bundle_crypto.dart';
 import '../engine/bundle_decryptor.dart';
 import '../engine/bundle_encryptor.dart';
 import '../format/bundle_header.dart';
 import '../format/bundle_path.dart';
+import '../identity/rsa_models.dart';
 import 'data_source.dart';
 import 'source_path.dart';
 
@@ -15,43 +16,14 @@ abstract final class BundleSync {
     required DataSource source,
     required SourcePath rootPath,
     required String mnemonic,
+    PublicIdentity? expectedIdentity,
   }) async {
-    if (!source.capabilities.canRead) {
-      throw const SboxException(
-        SboxErrorCode.sourceAuthentication,
-        '褰撳墠鏁版嵁婧愪笉鏀寔璇诲彇',
-      );
-    }
-    final rootRead = await source.get(rootPath);
-    final rootBytes = await _readObject(source, rootRead);
-    final rootHeader = BundleHeader.parse(rootBytes);
-    validateBundlePathAgainstHeader(rootPath.value, rootHeader);
-    if (!rootHeader.isRoot) {
-      throw const SboxException(SboxErrorCode.rootRequired, '闇€瑕佹彁渚涙牴鍒嗙墖');
-    }
-    final objects = <String, List<int>>{rootPath.value: rootBytes};
-    for (var index = 1; index < rootHeader.shardCount; index++) {
-      final path = SourcePath(
-        canonicalBundleBasename(
-          bundleId: rootHeader.bundleId,
-          shardIndex: index,
-          shardCount: rootHeader.shardCount,
-        ),
-      );
-      try {
-        final read = await source.get(path);
-        objects[path.value] = await _readObject(source, read);
-      } on SboxException catch (error) {
-        if (error.code == SboxErrorCode.sourceNotFound) {
-          throw const SboxException(
-            SboxErrorCode.shardMissing,
-            'Bundle 缂哄皯蹇呰鍒嗙墖',
-          );
-        }
-        rethrow;
-      }
-    }
-    return BundleDecryptor().decrypt(objects: objects, mnemonic: mnemonic);
+    final objects = await _downloadObjects(source: source, rootPath: rootPath);
+    return BackgroundBundleCrypto.decrypt(
+      objects: objects,
+      mnemonic: mnemonic,
+      expectedIdentity: expectedIdentity,
+    );
   }
 
   static Future<void> fetchAndDecryptToFile({
@@ -59,55 +31,42 @@ abstract final class BundleSync {
     required SourcePath rootPath,
     required String mnemonic,
     required File destination,
-  }) async {
-    final decrypted = await fetchAndDecrypt(
-      source: source,
-      rootPath: rootPath,
-      mnemonic: mnemonic,
-    );
-    final parent = destination.parent;
-    await parent.create(recursive: true);
-    final destinationType = await FileSystemEntity.type(
-      destination.path,
-      followLinks: false,
-    );
-    if (destinationType != FileSystemEntityType.notFound) {
-      decrypted.plaintext.fillRange(0, decrypted.plaintext.length, 0);
-      throw const SboxException(
-        SboxErrorCode.immutableConflict,
-        'Destination already exists and will not be overwritten',
-      );
-    }
-    final stage = File(
-      '${parent.path}${Platform.pathSeparator}.sbox-plaintext-${hexLower(secureRandomBytes(8))}.part',
-    );
-    try {
-      await stage.writeAsBytes(decrypted.plaintext, flush: true);
-      await stage.rename(destination.path);
-    } on FileSystemException {
-      throw const SboxException(
-        SboxErrorCode.temporaryCleanup,
-        'Unable to publish the verified plaintext',
-      );
-    } finally {
-      decrypted.plaintext.fillRange(0, decrypted.plaintext.length, 0);
-      if (await stage.exists()) await stage.delete();
-    }
-  }
+    PublicIdentity? expectedIdentity,
+  }) => fetchAndDecryptToFileStreaming(
+    source: source,
+    rootPath: rootPath,
+    mnemonic: mnemonic,
+    destination: destination,
+    expectedIdentity: expectedIdentity,
+  );
 
-  /// Downloads ciphertext objects into managed memory and delegates plaintext
-  /// publication to the streaming decryptor. Plaintext is never returned to
-  /// this source layer.
+  /// Downloads ciphertext shards concurrently and performs authentication,
+  /// decryption and verified plaintext publication in a background isolate.
+  /// Plaintext is never returned to this source layer.
   static Future<void> fetchAndDecryptToFileStreaming({
     required DataSource source,
     required SourcePath rootPath,
     required String mnemonic,
     required File destination,
+    PublicIdentity? expectedIdentity,
+  }) async {
+    final objects = await _downloadObjects(source: source, rootPath: rootPath);
+    await BackgroundBundleCrypto.decryptToFile(
+      objects: objects,
+      mnemonic: mnemonic,
+      destination: destination,
+      expectedIdentity: expectedIdentity,
+    );
+  }
+
+  static Future<Map<String, List<int>>> _downloadObjects({
+    required DataSource source,
+    required SourcePath rootPath,
   }) async {
     if (!source.capabilities.canRead) {
       throw const SboxException(
         SboxErrorCode.sourceAuthentication,
-        'Source is not readable',
+        'The current data source is not readable',
       );
     }
     final rootRead = await source.get(rootPath);
@@ -120,33 +79,37 @@ abstract final class BundleSync {
         'A root shard is required',
       );
     }
+
     final objects = <String, List<int>>{rootPath.value: rootBytes};
-    for (var index = 1; index < rootHeader.shardCount; index++) {
-      final path = SourcePath(
-        canonicalBundleBasename(
-          bundleId: rootHeader.bundleId,
-          shardIndex: index,
-          shardCount: rootHeader.shardCount,
+    final paths = <SourcePath>[
+      for (var index = 1; index < rootHeader.shardCount; index++)
+        SourcePath(
+          canonicalBundleBasename(
+            bundleId: rootHeader.bundleId,
+            shardIndex: index,
+            shardCount: rootHeader.shardCount,
+          ),
         ),
-      );
-      try {
-        final read = await source.get(path);
-        objects[path.value] = await _readObject(source, read);
-      } on SboxException catch (error) {
-        if (error.code == SboxErrorCode.sourceNotFound) {
-          throw const SboxException(
-            SboxErrorCode.shardMissing,
-            'Bundle is missing a continuation shard',
-          );
+    ];
+    await _parallelForEach(
+      paths,
+      maxParallel: source.capabilities.maxParallelTransfers,
+      action: (path) async {
+        try {
+          final read = await source.get(path);
+          objects[path.value] = await _readObject(source, read);
+        } on SboxException catch (error) {
+          if (error.code == SboxErrorCode.sourceNotFound) {
+            throw const SboxException(
+              SboxErrorCode.shardMissing,
+              'Bundle is missing a continuation shard',
+            );
+          }
+          rethrow;
         }
-        rethrow;
-      }
-    }
-    await BundleDecryptor().decryptToFile(
-      objects: objects,
-      mnemonic: mnemonic,
-      destination: destination,
+      },
     );
+    return objects;
   }
 
   static Future<List<RevisionToken>> publish(
@@ -156,16 +119,18 @@ abstract final class BundleSync {
     if (!source.capabilities.canWrite) {
       throw const SboxException(
         SboxErrorCode.sourceAuthentication,
-        '当前数据源不允许写入',
+        'The current data source is not writable',
       );
     }
     if (source.capabilities.maxObjectBytes != null &&
         bundle.objects.any(
           (object) => object.bytes.length > source.capabilities.maxObjectBytes!,
         )) {
-      throw const SboxException(SboxErrorCode.sourceLimit, '对象超过数据源上限');
+      throw const SboxException(
+        SboxErrorCode.sourceLimit,
+        'An object exceeds the data source limit',
+      );
     }
-    final revisions = <RevisionToken>[];
     final continuation = bundle.objects
         .where((object) => !object.header.isRoot)
         .toList();
@@ -173,9 +138,12 @@ abstract final class BundleSync {
       (left, right) =>
           left.header.shardIndex.compareTo(right.header.shardIndex),
     );
-    for (final object in continuation) {
-      revisions.add(await _put(source, object));
-    }
+    final revisions = await _parallelMap(
+      continuation,
+      maxParallel: source.capabilities.maxParallelTransfers,
+      action: (object) => _put(source, object),
+    );
+    // The root object is the immutable Bundle commit marker.
     revisions.add(await _put(source, bundle.root));
     return List<RevisionToken>.unmodifiable(revisions);
   }
@@ -189,7 +157,7 @@ abstract final class BundleSync {
     if (roots.length != 1) {
       throw const SboxException(
         SboxErrorCode.rootRequired,
-        '删除 Bundle 需要唯一根对象',
+        'Deleting a Bundle requires exactly one root object',
       );
     }
     await source.deleteIfMatch(roots.single.path, roots.single.revision);
@@ -216,7 +184,10 @@ abstract final class BundleSync {
         read.length < 0 ||
         (source.capabilities.maxObjectBytes != null &&
             read.length > source.capabilities.maxObjectBytes!)) {
-      throw const SboxException(SboxErrorCode.remoteChanged, '鏁版嵁婧愯繑鍥炰簡鏃犳晥瀵硅薄');
+      throw const SboxException(
+        SboxErrorCode.remoteChanged,
+        'The remote object length is not acceptable',
+      );
     }
     final output = BytesBuilder(copy: false);
     var count = 0;
@@ -225,14 +196,73 @@ abstract final class BundleSync {
       if (count > read.length) {
         throw const SboxException(
           SboxErrorCode.remoteChanged,
-          '鏁版嵁婧愯繑鍥炰簡杩囬暱瀵硅薄',
+          'The remote object is longer than declared',
         );
       }
       output.add(chunk);
     }
     if (count != read.length) {
-      throw const SboxException(SboxErrorCode.remoteChanged, '鏁版嵁婧愯繑鍥炰簡涓嶅畬瀵硅薄');
+      throw const SboxException(
+        SboxErrorCode.remoteChanged,
+        'The remote object is incomplete',
+      );
     }
     return output.takeBytes();
   }
+}
+
+Future<void> _parallelForEach<T>(
+  Iterable<T> values, {
+  required int maxParallel,
+  required Future<void> Function(T value) action,
+}) async {
+  final items = values.toList(growable: false);
+  if (items.isEmpty) return;
+  final workerCount = maxParallel < 1
+      ? 1
+      : maxParallel > items.length
+      ? items.length
+      : maxParallel;
+  var next = 0;
+
+  Future<void> worker() async {
+    while (true) {
+      if (next >= items.length) return;
+      final index = next++;
+      await action(items[index]);
+    }
+  }
+
+  await Future.wait(<Future<void>>[
+    for (var index = 0; index < workerCount; index++) worker(),
+  ]);
+}
+
+Future<List<R>> _parallelMap<T, R>(
+  Iterable<T> values, {
+  required int maxParallel,
+  required Future<R> Function(T value) action,
+}) async {
+  final items = values.toList(growable: false);
+  if (items.isEmpty) return <R>[];
+  final results = List<R?>.filled(items.length, null);
+  final workerCount = maxParallel < 1
+      ? 1
+      : maxParallel > items.length
+      ? items.length
+      : maxParallel;
+  var next = 0;
+
+  Future<void> worker() async {
+    while (true) {
+      if (next >= items.length) return;
+      final index = next++;
+      results[index] = await action(items[index]);
+    }
+  }
+
+  await Future.wait(<Future<void>>[
+    for (var index = 0; index < workerCount; index++) worker(),
+  ]);
+  return <R>[for (final result in results) result as R];
 }

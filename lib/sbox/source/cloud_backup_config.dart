@@ -9,20 +9,21 @@ final class CloudRepositoryEndpoint {
   CloudRepositoryEndpoint({
     required this.owner,
     required this.repository,
-    required this.branch,
     required this.credentialId,
     this.pathPrefix = '',
+    this.repositoryUrl,
   }) {
     _sourceConfig();
   }
 
   final String owner;
   final String repository;
-  final String branch;
   final String pathPrefix;
   final SourceCredentialId credentialId;
+  final String? repositoryUrl;
 
-  String get webUrl => 'https://$owner/$repository';
+  String webUrl({required String host}) =>
+      repositoryUrl ?? 'https://$host/$owner/$repository';
 
   /// Parses the single repository address shown in the UI while retaining the
   /// existing provider model used by the sync engine.
@@ -53,8 +54,8 @@ final class CloudRepositoryEndpoint {
     return CloudRepositoryEndpoint(
       owner: parts[0],
       repository: repository,
-      branch: 'main',
       credentialId: credentialId,
+      repositoryUrl: value,
     );
   }
 
@@ -63,18 +64,18 @@ final class CloudRepositoryEndpoint {
   Map<String, Object?> toJson() => <String, Object?>{
     'owner': owner,
     'repository': repository,
-    'branch': branch,
     if (pathPrefix.isNotEmpty) 'path_prefix': pathPrefix,
     'credential_id': credentialId.value,
+    if (repositoryUrl != null) 'repository_url': repositoryUrl,
   };
 
   factory CloudRepositoryEndpoint.fromJson(Map<String, Object?> json) {
     const allowed = <String>{
       'owner',
       'repository',
-      'branch',
       'path_prefix',
       'credential_id',
+      'repository_url',
     };
     if (json.keys.any((key) => !allowed.contains(key))) {
       throw const FormatException('Unknown cloud repository field');
@@ -91,19 +92,23 @@ final class CloudRepositoryEndpoint {
     if (prefix is! String) {
       throw const FormatException('Invalid cloud repository path prefix');
     }
+    final repositoryUrlValue = json['repository_url'];
+    if (repositoryUrlValue != null && repositoryUrlValue is! String) {
+      throw const FormatException('Invalid cloud repository URL');
+    }
+    final String? repositoryUrl = repositoryUrlValue as String?;
     return CloudRepositoryEndpoint(
       owner: requiredString('owner'),
       repository: requiredString('repository'),
-      branch: requiredString('branch'),
       pathPrefix: prefix,
       credentialId: SourceCredentialId(requiredString('credential_id')),
+      repositoryUrl: repositoryUrl,
     );
   }
 
   RepositorySourceConfig _sourceConfig() => RepositorySourceConfig(
     owner: owner,
     repository: repository,
-    branch: branch,
     pathPrefix: pathPrefix,
   );
 }

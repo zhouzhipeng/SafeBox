@@ -1,6 +1,6 @@
 # SafeBox
 
-SafeBox 是 Flutter + Dart 实现的 SBOX 2.0 客户端，面向把隐私文件保存到公开云仓库的场景。
+SafeBox 是 Flutter + Dart 实现的 SBOX 3.0 客户端，面向把隐私文件保存到公开云仓库的场景。
 
 核心行为：
 
@@ -13,7 +13,7 @@ SafeBox 是 Flutter + Dart 实现的 SBOX 2.0 客户端，面向把隐私文件�
 
 SBOX 对象仍使用 RSA-OAEP、HKDF-SHA256、AES-256-GCM、分片 Final 记录和整体 SHA-256 校验。MD5 只用于内容寻址和去重，不承担完整性或保密性职责。
 
-协议定义见 [docs/SBOX-v2-SPEC.md](docs/SBOX-v2-SPEC.md)。
+协议定义见 [docs/SBOX-v3-METADATA-UPGRADE-SPEC.md](docs/SBOX-v3-METADATA-UPGRADE-SPEC.md)。
 
 运行 Windows 桌面版：
 

@@ -13,11 +13,7 @@ void main() {
   test('Gitee read requests use the provider token scheme', () async {
     final client = _RecordingClient();
     final source = GiteeDataSource(
-      config: RepositorySourceConfig(
-        owner: 'zzp',
-        repository: 'sbox-files',
-        branch: 'main',
-      ),
+      config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
       client: client,
       credentialStore: _CredentialStore(),
       credentialId: SourceCredentialId('gitee-test-token'),
@@ -26,16 +22,16 @@ void main() {
     await source.listObjects();
 
     expect(client.readRequest?.headers['authorization'], 'token test-token');
+    expect(client.readRequest?.url.queryParameters, <String, String>{
+      'page': '1',
+      'per_page': '100',
+    });
   });
 
   test('Gitee creates files with form-encoded API parameters', () async {
     final client = _RecordingClient();
     final source = GiteeDataSource(
-      config: RepositorySourceConfig(
-        owner: 'zzp',
-        repository: 'sbox-files',
-        branch: 'main',
-      ),
+      config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
       client: client,
       credentialStore: _CredentialStore(),
       credentialId: SourceCredentialId('gitee-test-token'),
@@ -59,7 +55,6 @@ void main() {
     expect(request.url.queryParameters, isEmpty);
     expect(request.bodyFields, <String, String>{
       'access_token': 'test-token',
-      'branch': 'main',
       'content': base64Encode(bytes),
       'message': 'sbox: add immutable object',
     });
@@ -70,11 +65,7 @@ void main() {
     () async {
       final client = _FullObjectRawClient();
       final source = GiteeDataSource(
-        config: RepositorySourceConfig(
-          owner: 'zzp',
-          repository: 'sbox-files',
-          branch: 'main',
-        ),
+        config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
         client: client,
       );
 
@@ -137,7 +128,10 @@ final class _FullObjectRawClient extends http.BaseClient {
         request.url.path.contains('/api/v5/repos/')) {
       return http.StreamedResponse(
         Stream<List<int>>.value(
-          utf8.encode('{"type":"file","size":4,"sha":"revision"}'),
+          utf8.encode(
+            '{"type":"file","size":4,"sha":"revision",'
+            '"download_url":"https://gitee.com/zzp/sbox-files/raw/main/object.sbox"}',
+          ),
         ),
         200,
         request: request,

@@ -4,16 +4,13 @@ final class RepositorySourceConfig {
   RepositorySourceConfig({
     required String owner,
     required String repository,
-    required String branch,
     String pathPrefix = '',
   }) : owner = _component(owner, 'owner'),
        repository = _component(repository, 'repository'),
-       branch = _branch(branch),
        pathPrefix = _prefix(pathPrefix);
 
   final String owner;
   final String repository;
-  final String branch;
   final String pathPrefix;
 
   String resolveBasename(SourcePath path) =>
@@ -27,21 +24,6 @@ final class RepositorySourceConfig {
         value == '.' ||
         value == '..') {
       throw ArgumentError.value(value, name, 'Invalid repository component');
-    }
-    return value;
-  }
-
-  static String _branch(String value) {
-    if (value.isEmpty ||
-        value.length > 255 ||
-        value.startsWith('/') ||
-        value.endsWith('/') ||
-        value.contains('..') ||
-        value.contains('@{') ||
-        value.endsWith('.') ||
-        value.endsWith('.lock') ||
-        RegExp(r'[\x00-\x20\x7f~^:?*\\\[]').hasMatch(value)) {
-      throw ArgumentError.value(value, 'branch', 'Invalid branch');
     }
     return value;
   }

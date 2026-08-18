@@ -9,6 +9,7 @@ import '../../app/sbox_theme.dart';
 import '../../app/sbox_widgets.dart';
 import '../../platform/app_settings_store.dart';
 import '../../platform/cloud_backup_configuration_store.dart';
+import '../../platform/file_opener.dart';
 import '../../platform/secure_credential_store.dart';
 import '../../platform/temporary_plaintext_platform.dart';
 import '../../sbox/bytes.dart';
@@ -57,6 +58,7 @@ final class _SettingsPageState extends State<SettingsPage> {
   bool _saving = false;
   bool _githubConnected = false;
   bool _giteeConnected = false;
+  bool _removingIdentity = false;
   String? _testingProvider;
   String? _activeTokenField;
 
@@ -98,8 +100,6 @@ final class _SettingsPageState extends State<SettingsPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
-                  const PageHeading(title: '设置', subtitle: '管理安全身份、云端备份和使用习惯'),
-                  SizedBox(height: mobile ? 28 : 24),
                   _buildIdentityCard(context, mobile),
                   const SizedBox(height: 14),
                   _buildCloudCard(context, mobile),
@@ -162,15 +162,17 @@ final class _SettingsPageState extends State<SettingsPage> {
       children: <Widget>[
         Expanded(
           child: OutlinedButton.icon(
-            onPressed: identityReady ? _showRecoveryPhraseNotice : null,
-            icon: const Icon(Icons.assignment_turned_in_outlined),
-            label: const Text('备份恢复词'),
+            onPressed: identityReady && !_removingIdentity
+                ? _removeIdentity
+                : null,
+            icon: const Icon(Icons.person_remove_outlined),
+            label: Text(_removingIdentity ? '正在移除…' : '移除身份'),
           ),
         ),
         const SizedBox(width: 14),
         Expanded(
           child: OutlinedButton.icon(
-            onPressed: widget.onOpenOnboarding,
+            onPressed: _removingIdentity ? null : widget.onOpenOnboarding,
             icon: const Icon(Icons.refresh_rounded),
             label: const Text('恢复身份'),
           ),
@@ -523,14 +525,15 @@ final class _SettingsPageState extends State<SettingsPage> {
             const SizedBox(height: 14),
             Align(
               alignment: Alignment.centerLeft,
-              child: OutlinedButton.icon(
-                onPressed: _clearTemporaryPlaintext,
-                icon: const Icon(Icons.delete_outline),
-                label: const Text('清理临时文件'),
+              child: Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: <Widget>[
+                  _openCacheDirectoryButton(),
+                  _clearTemporaryPlaintextButton(),
+                ],
               ),
             ),
-            const SizedBox(height: 18),
-            const _HealthyStatus(),
           ] else
             Row(
               crossAxisAlignment: CrossAxisAlignment.center,
@@ -544,13 +547,9 @@ final class _SettingsPageState extends State<SettingsPage> {
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.end,
                   children: <Widget>[
-                    OutlinedButton.icon(
-                      onPressed: _clearTemporaryPlaintext,
-                      icon: const Icon(Icons.delete_outline),
-                      label: const Text('清理临时文件'),
-                    ),
-                    const SizedBox(height: 16),
-                    const _HealthyStatus(),
+                    _openCacheDirectoryButton(),
+                    const SizedBox(height: 12),
+                    _clearTemporaryPlaintextButton(),
                   ],
                 ),
               ],
@@ -560,19 +559,39 @@ final class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
+  Widget _openCacheDirectoryButton() {
+    return OutlinedButton.icon(
+      onPressed: _openCacheDirectory,
+      icon: const Icon(Icons.folder_open_outlined),
+      label: const Text('打开缓存目录'),
+    );
+  }
+
+  Widget _clearTemporaryPlaintextButton() {
+    return OutlinedButton.icon(
+      onPressed: _clearTemporaryPlaintext,
+      icon: const Icon(Icons.delete_outline),
+      label: const Text('清理临时文件'),
+    );
+  }
+
   String get _identityLabel {
     final identity = widget.controller.identityRecord;
     if (identity == null) return '未设置';
     final id = hexLower(identity.recipientKeyId);
-    return 'SB••••${id.substring(id.length - 4).toUpperCase()}';
+    return '••••${id.substring(id.length - 4).toUpperCase()}';
   }
 
   Future<void> _load() async {
     try {
       final configuration = await _configurationStore.load();
       if (configuration != null) {
-        _githubAddressController.text = _webUrl(configuration.github);
-        _giteeAddressController.text = _webUrl(configuration.gitee);
+        _githubAddressController.text = configuration.github.webUrl(
+          host: 'github.com',
+        );
+        _giteeAddressController.text = configuration.gitee.webUrl(
+          host: 'gitee.com',
+        );
         _githubConnected = await _hasToken(configuration.github.credentialId);
         _giteeConnected = await _hasToken(configuration.gitee.credentialId);
       }
@@ -586,9 +605,9 @@ final class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _saveConfiguration() async {
     final existing = await _configurationStore.load();
-    final githubUrl = _githubAddressController.text.trim();
-    final giteeUrl = _giteeAddressController.text.trim();
-    if (githubUrl.isEmpty || giteeUrl.isEmpty) {
+    final githubUrl = _githubAddressController.text;
+    final giteeUrl = _giteeAddressController.text;
+    if (githubUrl.trim().isEmpty || giteeUrl.trim().isEmpty) {
       _showFeedback('请填写 GitHub 和 Gitee 的完整地址。');
       return;
     }
@@ -719,20 +738,41 @@ final class _SettingsPageState extends State<SettingsPage> {
     return true;
   }
 
-  Future<void> _showRecoveryPhraseNotice() async {
-    await showDialog<void>(
+  Future<void> _removeIdentity() async {
+    final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('备份恢复词'),
-        content: const Text('恢复词只在创建安全身份时显示一次。请使用离线保存的恢复词，并妥善保管，不要截图或发送给任何人。'),
+        title: const Text('移除身份？'),
+        content: const Text(
+          '这会删除本机保存的公钥、仓库地址、访问凭证、临时目录及其他相关设置，并返回首次设置界面。云端仓库中的文件不会被删除。此操作无法撤销。',
+        ),
         actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
           ElevatedButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('知道了'),
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('确认移除'),
           ),
         ],
       ),
     );
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _removingIdentity = true);
+    try {
+      await widget.controller.removeIdentity();
+      if (!mounted) return;
+      widget.onOpenOnboarding?.call();
+    } catch (error) {
+      if (mounted) {
+        widget.controller.setError(error, operation: '移除安全身份失败');
+        _showFeedback('身份相关数据没有完全清理，请稍后重试。');
+      }
+    } finally {
+      if (mounted) setState(() => _removingIdentity = false);
+    }
   }
 
   Future<void> _showThemeNotice() async {
@@ -782,14 +822,26 @@ final class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
+  Future<void> _openCacheDirectory() async {
+    try {
+      final directory = await _temporaryStore.ensureRoot();
+      await FileOpener.openDirectory(directory);
+      if (mounted) _showFeedback('缓存目录已打开。');
+    } catch (error) {
+      if (!mounted) return;
+      widget.controller.setError(error, operation: '打开缓存目录失败');
+      _showFeedback(
+        error is UnsupportedError ? '当前平台不支持打开缓存目录。' : '缓存目录暂时无法打开，请稍后重试。',
+      );
+    }
+  }
+
   void _showFeedback(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(message)));
   }
-
-  static String _webUrl(CloudRepositoryEndpoint endpoint) => endpoint.webUrl;
 }
 
 final class _CloudSummaryLine extends StatelessWidget {
@@ -912,30 +964,6 @@ final class _LockHint extends StatelessWidget {
           text,
           style: Theme.of(context).textTheme.bodyLarge
               ?.copyWith(color: SboxColors.textMuted),
-        ),
-      ],
-    );
-  }
-}
-
-final class _HealthyStatus extends StatelessWidget {
-  const _HealthyStatus();
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: <Widget>[
-        const Icon(
-          Icons.check_circle_outline,
-          color: SboxColors.accent,
-          size: 23,
-        ),
-        const SizedBox(width: 8),
-        Text(
-          '当前运行正常',
-          style: Theme.of(context).textTheme.bodyLarge
-              ?.copyWith(color: SboxColors.accent, fontWeight: FontWeight.w600),
         ),
       ],
     );

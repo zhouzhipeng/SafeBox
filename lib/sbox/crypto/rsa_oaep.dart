@@ -197,7 +197,7 @@ final class RsaOaepSha256 {
       throw ArgumentError('Invalid SBOX OAEP label component length');
     }
     return concatBytes(<List<int>>[
-      asciiBytes('SBOX-v2-bundle-DEK'),
+      asciiBytes('SBOX-v3-bundle-DEK'),
       const <int>[0],
       bundleId,
       recipientKeyId,

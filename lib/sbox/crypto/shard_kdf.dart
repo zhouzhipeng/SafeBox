@@ -5,7 +5,7 @@ import 'package:crypto/crypto.dart' as crypto;
 import '../bytes.dart';
 import '../constants.dart';
 
-/// SBOX v2 HKDF-SHA256 key derivation. This is deliberately independent of
+/// SBOX v3 HKDF-SHA256 key derivation. This is deliberately independent of
 /// identity and container classes so its fixed vectors can be tested alone.
 abstract final class ShardKdf {
   static Uint8List extract({required List<int> salt, required List<int> ikm}) {
@@ -32,7 +32,7 @@ abstract final class ShardKdf {
     }
     final prk = extract(salt: bundleId, ikm: bundleDek);
     final info = concatBytes(<List<int>>[
-      asciiBytes('SBOX-v2/shard-key'),
+      asciiBytes('SBOX-v3/shard-key'),
       const <int>[0],
       recipientKeyId,
       bigIntToFixedBytes(BigInt.from(shardIndex), 4),

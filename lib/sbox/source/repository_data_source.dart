@@ -113,12 +113,22 @@ abstract base class RepositoryDataSource
     SourcePath path, {
     required int start,
     required int endExclusive,
+    SourceObjectInfo? objectInfo,
   }) async {
     if (start < 0 || endExclusive < start) {
       throw const SboxException(SboxErrorCode.invalidHeader, '范围读取边界无效');
     }
     logger?.info('$sourceName：读取对象范围', detail: '读取公共头范围');
-    final metadata = await _readMetadata(path);
+    final metadata =
+        objectInfo == null ||
+            objectInfo.length == 0 ||
+            objectInfo.downloadUri == null
+        ? await _readMetadata(path)
+        : RepositoryObjectMetadata(
+            revision: _revisionString(objectInfo.revision),
+            size: objectInfo.length,
+            downloadUri: objectInfo.downloadUri,
+          );
     if (endExclusive > metadata.size) {
       throw const SboxException(SboxErrorCode.truncated, '范围读取超过对象长度');
     }
@@ -166,6 +176,7 @@ abstract base class RepositoryDataSource
       final name = value['name'];
       final revision = value['sha'];
       final size = value['size'];
+      final downloadUri = _parseDownloadUri(value['download_url']);
       if (name is! String ||
           revision is! String ||
           (size is! int && size != null) ||
@@ -183,6 +194,7 @@ abstract base class RepositoryDataSource
             // supplies and verifies the exact size.
             length: size is int ? size : 0,
             revision: RevisionToken(ascii.encode(revision)),
+            downloadUri: downloadUri,
           ),
         );
       } on Object {
@@ -235,43 +247,77 @@ abstract base class RepositoryDataSource
     } on SboxException catch (error) {
       if (error.code != SboxErrorCode.sourceNotFound) rethrow;
     }
-    final response = await _withCredential((token) async {
-      final request = http.Request(createMethod, writeUri(path))
-        ..headers.addAll(publicHeaders(raw: false));
-      final fields = <String, String>{
-        'message': 'sbox: add immutable object',
-        'content': base64Encode(bytes),
-        'branch': config.branch,
-        if (credentialPlacement == RepositoryCredentialPlacement.jsonBody ||
-            credentialPlacement == RepositoryCredentialPlacement.formBody)
-          'access_token': token,
-      };
-      if (credentialPlacement == RepositoryCredentialPlacement.formBody) {
-        request.bodyFields = fields;
-      } else {
-        request
-          ..headers['Content-Type'] = 'application/json; charset=utf-8'
-          ..bodyBytes = utf8.encode(jsonEncode(fields));
+    try {
+      final response = await _withCredential((token) async {
+        final request = http.Request(createMethod, writeUri(path))
+          ..headers.addAll(publicHeaders(raw: false));
+        final fields = <String, String>{
+          'message': 'sbox: add immutable object',
+          'content': base64Encode(bytes),
+          if (credentialPlacement == RepositoryCredentialPlacement.jsonBody ||
+              credentialPlacement == RepositoryCredentialPlacement.formBody)
+            'access_token': token,
+        };
+        if (credentialPlacement == RepositoryCredentialPlacement.formBody) {
+          request.bodyFields = fields;
+        } else {
+          request
+            ..headers['Content-Type'] = 'application/json; charset=utf-8'
+            ..bodyBytes = utf8.encode(jsonEncode(fields));
+        }
+        if (credentialPlacement ==
+            RepositoryCredentialPlacement.authorizationHeader) {
+          request.headers['Authorization'] = 'Bearer $token';
+        }
+        return httpTransport.send(request);
+      });
+      if (response.statusCode != 200 && response.statusCode != 201) {
+        await httpTransport.throwForStatus(
+          response,
+          RemoteFailureContext.immutableCreate,
+        );
       }
-      if (credentialPlacement ==
-          RepositoryCredentialPlacement.authorizationHeader) {
-        request.headers['Authorization'] = 'Bearer $token';
-      }
-      return httpTransport.send(request);
-    });
-    if (response.statusCode != 200 && response.statusCode != 201) {
-      await httpTransport.throwForStatus(
-        response,
-        RemoteFailureContext.immutableCreate,
+      final value = await httpTransport.readJsonObject(response);
+      final content = value['content'];
+      final providerRevision =
+          content is Map<String, Object?> && content['sha'] is String
+          ? content['sha']! as String
+          : hexLower(sha256);
+      return RevisionToken(ascii.encode(providerRevision));
+    } on SboxException catch (error) {
+      if (error.code != SboxErrorCode.immutableConflict) rethrow;
+      // Another upload may have created the immutable object between the
+      // preflight GET and the create request. Treat an exact-content object as
+      // success so a concurrent or resumed upload can continue.
+      final existingRevision = await _existingRevisionIfSame(
+        path,
+        length: length,
+        expectedHash: sha256,
       );
+      if (existingRevision != null) return existingRevision;
+      rethrow;
     }
-    final value = await httpTransport.readJsonObject(response);
-    final content = value['content'];
-    final providerRevision =
-        content is Map<String, Object?> && content['sha'] is String
-        ? content['sha']! as String
-        : hexLower(sha256);
-    return RevisionToken(ascii.encode(providerRevision));
+  }
+
+  Future<RevisionToken?> _existingRevisionIfSame(
+    SourcePath path, {
+    required int length,
+    required Uint8List expectedHash,
+  }) async {
+    try {
+      final remote = await get(path);
+      if (remote.length != length) return null;
+      final remoteBytes = await httpTransport.readBounded(
+        remote.body,
+        maximumBytes: length,
+      );
+      return constantTimeBytesEqual(sha256Bytes(remoteBytes), expectedHash)
+          ? remote.revision
+          : null;
+    } on SboxException catch (error) {
+      if (error.code == SboxErrorCode.sourceNotFound) return null;
+      rethrow;
+    }
   }
 
   @override
@@ -290,7 +336,6 @@ abstract base class RepositoryDataSource
         ..body = jsonEncode(<String, Object?>{
           'message': 'sbox: delete immutable object',
           'sha': revision,
-          'branch': config.branch,
         });
       request.headers['Authorization'] = 'Bearer $token';
       final response = await httpTransport.send(request);
@@ -325,6 +370,7 @@ abstract base class RepositoryDataSource
     final type = value['type'];
     final revision = value['sha'];
     final size = value['size'];
+    final downloadUri = _parseDownloadUri(value['download_url']);
     if (type != 'file' ||
         revision is! String ||
         revision.isEmpty ||
@@ -335,7 +381,26 @@ abstract base class RepositoryDataSource
       logger?.warning('$sourceName：对象元数据字段无效');
       throw const SboxException(SboxErrorCode.sourceNetwork, '数据源返回了无效对象元数据');
     }
-    return RepositoryObjectMetadata(revision: revision, size: size);
+    return RepositoryObjectMetadata(
+      revision: revision,
+      size: size,
+      downloadUri: downloadUri,
+    );
+  }
+
+  Uri? _parseDownloadUri(Object? value) {
+    if (value is! String || value.isEmpty) return null;
+    final uri = Uri.tryParse(value);
+    if (uri == null || uri.scheme != 'https' || uri.host.isEmpty) return null;
+    return uri;
+  }
+
+  Uri resolvedDownloadUri(RepositoryObjectMetadata metadata) {
+    final uri = metadata.downloadUri;
+    if (uri == null) {
+      throw const SboxException(SboxErrorCode.sourceNetwork, '远端文件响应缺少下载地址');
+    }
+    return uri;
   }
 
   Future<Map<String, String>> _requestHeaders({required bool raw}) async {
@@ -488,8 +553,13 @@ abstract base class RepositoryDataSource
 }
 
 final class RepositoryObjectMetadata {
-  const RepositoryObjectMetadata({required this.revision, required this.size});
+  const RepositoryObjectMetadata({
+    required this.revision,
+    required this.size,
+    this.downloadUri,
+  });
 
   final String revision;
   final int size;
+  final Uri? downloadUri;
 }

@@ -60,17 +60,7 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
               ),
               child: Column(
                 children: <Widget>[
-                  SboxTopBar(
-                    mobile: mobile,
-                    identityReady: false,
-                    cloudReady: false,
-                    firstUse: true,
-                  ),
-                  SboxTabBar(
-                    mobile: mobile,
-                    settingsSelected: true,
-                    cloudDisabled: true,
-                  ),
+                  SboxTopBar(mobile: mobile, firstUse: true),
                   Expanded(child: _buildContent(context, mobile)),
                 ],
               ),

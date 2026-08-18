@@ -65,7 +65,7 @@ final class AppLogger extends ChangeNotifier {
   AppLogger({SharedPreferences? preferences})
     : _providedPreferences = preferences;
 
-  static const String _storageKey = 'sbox.v2.application_logs';
+  static const String _storageKey = 'sbox.v3.application_logs';
   static const int maximumEntries = 200;
   static const int maximumFieldLength = 600;
 

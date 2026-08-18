@@ -37,7 +37,7 @@ final class GiteeDataSource extends RepositoryDataSource {
   bool get emptyMetadataListMeansNotFound => true;
 
   @override
-  Uri metadataUri(SourcePath path) => _contentsUri(path, includeRef: true);
+  Uri metadataUri(SourcePath path) => _contentsUri(path);
 
   @override
   Uri listUri({String? cursor, int pageSize = 1000}) => Uri(
@@ -53,7 +53,6 @@ final class GiteeDataSource extends RepositoryDataSource {
       if (config.pathPrefix.isNotEmpty) ...config.pathPrefix.split('/'),
     ],
     queryParameters: <String, String>{
-      'ref': config.branch,
       'page': cursor ?? '1',
       'per_page': (pageSize < providerPageSize ? pageSize : providerPageSize)
           .toString(),
@@ -61,20 +60,11 @@ final class GiteeDataSource extends RepositoryDataSource {
   );
 
   @override
-  Uri writeUri(SourcePath path) => _contentsUri(path, includeRef: false);
+  Uri writeUri(SourcePath path) => _contentsUri(path);
 
   @override
-  Uri rawUri(SourcePath path, RepositoryObjectMetadata metadata) => Uri(
-    scheme: 'https',
-    host: 'gitee.com',
-    pathSegments: <String>[
-      config.owner,
-      config.repository,
-      'raw',
-      config.branch,
-      ...config.resolveBasename(path).split('/'),
-    ],
-  );
+  Uri rawUri(SourcePath path, RepositoryObjectMetadata metadata) =>
+      resolvedDownloadUri(metadata);
 
   @override
   Uri repositoryProbeUri() => listUri();
@@ -85,7 +75,7 @@ final class GiteeDataSource extends RepositoryDataSource {
     'User-Agent': 'SafeBox',
   };
 
-  Uri _contentsUri(SourcePath path, {required bool includeRef}) => Uri(
+  Uri _contentsUri(SourcePath path) => Uri(
     scheme: 'https',
     host: 'gitee.com',
     pathSegments: <String>[
@@ -97,6 +87,5 @@ final class GiteeDataSource extends RepositoryDataSource {
       'contents',
       ...config.resolveBasename(path).split('/'),
     ],
-    queryParameters: includeRef ? <String, String>{'ref': config.branch} : null,
   );
 }

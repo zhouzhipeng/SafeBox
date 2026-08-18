@@ -3,8 +3,6 @@ import 'package:flutter/material.dart';
 import '../features/identity/mnemonic_onboarding.dart';
 import '../features/library/library_page.dart';
 import '../features/settings/settings_page.dart';
-import '../platform/cloud_backup_configuration_store.dart';
-import '../platform/secure_credential_store.dart';
 import 'app_controller.dart';
 import 'sbox_theme.dart';
 import 'sbox_widgets.dart';
@@ -100,37 +98,6 @@ final class _HomeShell extends StatefulWidget {
 }
 
 final class _HomeShellState extends State<_HomeShell> {
-  bool _cloudReady = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadCloudState();
-  }
-
-  Future<void> _loadCloudState() async {
-    try {
-      final configuration = await CloudBackupConfigurationStore().load();
-      if (configuration == null) {
-        if (mounted) setState(() => _cloudReady = false);
-        return;
-      }
-      final credentials = PlatformCredentialStore();
-      final github = await credentials.getAccessToken(
-        configuration.github.credentialId,
-      );
-      final gitee = await credentials.getAccessToken(
-        configuration.gitee.credentialId,
-      );
-      final ready = github != null && gitee != null;
-      github?.dispose();
-      gitee?.dispose();
-      if (mounted) setState(() => _cloudReady = ready);
-    } catch (_) {
-      if (mounted) setState(() => _cloudReady = false);
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -143,7 +110,6 @@ final class _HomeShellState extends State<_HomeShell> {
                 ? SettingsPage(
                     controller: widget.controller,
                     onOpenOnboarding: widget.onOpenOnboarding,
-                    onCloudStateChanged: _loadCloudState,
                   )
                 : LibraryPage(
                     controller: widget.controller,
@@ -165,13 +131,7 @@ final class _HomeShellState extends State<_HomeShell> {
                 children: <Widget>[
                   SboxTopBar(
                     mobile: mobile,
-                    identityReady: widget.controller.hasIdentity,
-                    cloudReady: _cloudReady,
-                  ),
-                  SboxTabBar(
-                    mobile: mobile,
-                    settingsSelected: settingsSelected,
-                    onCloudTap: () =>
+                    onFilesTap: () =>
                         widget.onSectionChanged(AppSection.library),
                     onSettingsTap: () =>
                         widget.onSectionChanged(AppSection.settings),
