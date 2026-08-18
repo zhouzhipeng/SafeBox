@@ -23,11 +23,35 @@ void main() {
     await source.listObjects();
 
     expect(client.readRequest?.headers['authorization'], 'token test-token');
-    expect(client.readRequest?.url.queryParameters, <String, String>{
-      'page': '1',
-      'per_page': '100',
-    });
+    expect(client.readRequest?.url.queryParameters, isEmpty);
   });
+
+  test(
+    'Gitee directory listings do not request a synthetic next page',
+    () async {
+      final client = _RecordingClient(
+        directoryEntries: List<Object?>.generate(
+          100,
+          (index) => <String, Object?>{
+            'type': 'file',
+            'name': '${index.toRadixString(16).padLeft(32, '0')}.sbox',
+            'sha': 'revision-$index',
+            'size': 16992,
+          },
+        ),
+      );
+      final source = GiteeDataSource(
+        config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
+        client: client,
+      );
+
+      final page = await source.listObjects();
+
+      expect(page.objects, hasLength(100));
+      expect(page.nextCursor, isNull);
+      expect(client.readRequest?.url.queryParameters, isEmpty);
+    },
+  );
 
   test('Gitee creates files with form-encoded API parameters', () async {
     final client = _RecordingClient();
@@ -162,6 +186,9 @@ final class _CredentialStore implements CredentialStore {
 }
 
 final class _RecordingClient extends http.BaseClient {
+  _RecordingClient({this.directoryEntries = const <Object?>[]});
+
+  final List<Object?> directoryEntries;
   http.Request? createRequest;
   http.BaseRequest? readRequest;
 
@@ -177,7 +204,7 @@ final class _RecordingClient extends http.BaseClient {
         );
       }
       return http.StreamedResponse(
-        Stream<List<int>>.value(utf8.encode('[]')),
+        Stream<List<int>>.value(utf8.encode(jsonEncode(directoryEntries))),
         200,
         request: request,
       );

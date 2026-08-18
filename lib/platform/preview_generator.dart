@@ -9,22 +9,25 @@ import '../sbox/errors.dart';
 import '../sbox/format/baseline_jpeg_inspector.dart';
 import '../sbox/format/bundle_preview.dart';
 import 'preview_generation_result.dart';
+import 'video_poster_decoder.dart';
 
 abstract interface class PreviewGenerator {
   Future<PreviewGenerationResult> generate(File source);
 }
 
-/// A bounded static-image generator used by the desktop and mobile product
-/// layers. Video is deliberately detected but reported as platform
-/// unsupported until a platform poster-frame implementation is installed.
+/// A bounded preview generator used by the desktop and mobile product layers.
+/// Video decoding is injected from the platform layer so the protocol and
+/// JPEG encoding remain independent from native media frameworks.
 final class PlatformPreviewGenerator implements PreviewGenerator {
   const PlatformPreviewGenerator({
     this.timeout = const Duration(seconds: 8),
     this.maxSourceBytes = 64 * 1024 * 1024,
+    this.videoPosterDecoder,
   });
 
   final Duration timeout;
   final int maxSourceBytes;
+  final VideoPosterDecoder? videoPosterDecoder;
 
   @override
   Future<PreviewGenerationResult> generate(File source) async {
@@ -57,10 +60,40 @@ final class PlatformPreviewGenerator implements PreviewGenerator {
     final prefix = await _readRange(source, prefixLength);
     final probe = _probeMedia(prefix);
     if (probe.kind == _MediaKind.video) {
-      return PreviewUnavailable(
-        reason: PreviewUnavailableReason.platformUnsupported,
-        detectedSourceMediaType: probe.mediaType,
-      );
+      final decoder = videoPosterDecoder;
+      if (decoder == null) {
+        return PreviewUnavailable(
+          reason: PreviewUnavailableReason.platformUnsupported,
+          detectedSourceMediaType: probe.mediaType,
+        );
+      }
+      final frame = await decoder.decode(source);
+      if (frame == null) {
+        return PreviewUnavailable(
+          reason: PreviewUnavailableReason.decodeFailed,
+          detectedSourceMediaType: probe.mediaType,
+        );
+      }
+      try {
+        if (_validateFrame(frame) == null) {
+          return PreviewUnavailable(
+            reason: PreviewUnavailableReason.resourceLimit,
+            detectedSourceMediaType: probe.mediaType,
+          );
+        }
+        final decoded = img.Image.fromBytes(
+          width: frame.width,
+          height: frame.height,
+          bytes: frame.pixels.buffer,
+          bytesOffset: frame.pixels.offsetInBytes,
+          rowStride: frame.rowStride,
+          numChannels: 4,
+          order: img.ChannelOrder.bgra,
+        );
+        return _encodePreview(decoded, probe.mediaType!);
+      } finally {
+        frame.dispose();
+      }
     }
     if (probe.kind != _MediaKind.staticImage) {
       return PreviewUnavailable(
@@ -102,97 +135,118 @@ final class PlatformPreviewGenerator implements PreviewGenerator {
           detectedSourceMediaType: probe.mediaType,
         );
       }
-      final oriented = img.bakeOrientation(decoded);
-      final target = _targetDimensions(oriented.width, oriented.height);
-      final resized = img.copyResize(
-        oriented,
-        width: target.width,
-        height: target.height,
-        interpolation: img.Interpolation.average,
-      );
-      final rgb = _flattenToRgb(resized);
-      try {
-        for (final quality in const <int>[72, 64, 56, 48, 40, 32]) {
-          final encoded = img.encodeJpg(
-            rgb,
-            quality: quality,
-            chroma: img.JpegChroma.yuv444,
-          );
-          if (encoded.length > SboxProtocol.maxPreviewBytes) continue;
-          try {
-            BaselineJpegInspector.validate(
-              encoded,
-              width: target.width,
-              height: target.height,
-            );
-            return PreviewGenerated(
-              preview: BundlePreview(
-                codec: BundlePreviewCodec.baselineJpeg,
-                width: target.width,
-                height: target.height,
-                encodedBytes: encoded,
-              ),
-              detectedSourceMediaType: probe.mediaType!,
-            );
-          } on SboxException {
-            // Try the next quality/size candidate below.
-          }
-        }
-        for (final dimension in const <int>[288, 256, 224, 192, 160, 128, 96]) {
-          if (dimension >= target.longestSide) continue;
-          final smaller = _targetDimensions(
-            oriented.width,
-            oriented.height,
-            maximum: dimension,
-          );
-          final candidate = img.copyResize(
-            oriented,
-            width: smaller.width,
-            height: smaller.height,
-            interpolation: img.Interpolation.average,
-          );
-          final candidateRgb = _flattenToRgb(candidate);
-          try {
-            for (final quality in const <int>[72, 64, 56, 48, 40, 32]) {
-              final encoded = img.encodeJpg(
-                candidateRgb,
-                quality: quality,
-                chroma: img.JpegChroma.yuv444,
-              );
-              if (encoded.length > SboxProtocol.maxPreviewBytes) continue;
-              try {
-                BaselineJpegInspector.validate(
-                  encoded,
-                  width: smaller.width,
-                  height: smaller.height,
-                );
-                return PreviewGenerated(
-                  preview: BundlePreview(
-                    codec: BundlePreviewCodec.baselineJpeg,
-                    width: smaller.width,
-                    height: smaller.height,
-                    encodedBytes: encoded,
-                  ),
-                  detectedSourceMediaType: probe.mediaType!,
-                );
-              } on SboxException {
-                // Continue through the bounded candidate set.
-              }
-            }
-          } finally {
-            candidateRgb.clear();
-          }
-        }
-      } finally {
-        rgb.clear();
-      }
-      return PreviewUnavailable(
-        reason: PreviewUnavailableReason.encodeFailed,
-        detectedSourceMediaType: probe.mediaType,
-      );
+      return _encodePreview(decoded, probe.mediaType!);
     } finally {
       bytes.fillRange(0, bytes.length, 0);
     }
+  }
+
+  static _Dimensions? _validateFrame(VideoPosterFrame frame) {
+    if (frame.width < 1 ||
+        frame.height < 1 ||
+        frame.width > 100000 ||
+        frame.height > 100000 ||
+        frame.width * frame.height > 32 * 1024 * 1024 ||
+        frame.rowStride < frame.width * 4 ||
+        frame.rowStride * frame.height > 32 * 1024 * 1024 ||
+        frame.pixels.length < frame.rowStride * frame.height) {
+      return null;
+    }
+    return _Dimensions(width: frame.width, height: frame.height);
+  }
+
+  static PreviewGenerationResult _encodePreview(
+    img.Image decoded,
+    String mediaType,
+  ) {
+    final oriented = img.bakeOrientation(decoded);
+    final target = _targetDimensions(oriented.width, oriented.height);
+    final resized = img.copyResize(
+      oriented,
+      width: target.width,
+      height: target.height,
+      interpolation: img.Interpolation.average,
+    );
+    final rgb = _flattenToRgb(resized);
+    try {
+      for (final quality in const <int>[72, 64, 56, 48, 40, 32]) {
+        final encoded = img.encodeJpg(
+          rgb,
+          quality: quality,
+          chroma: img.JpegChroma.yuv444,
+        );
+        if (encoded.length > SboxProtocol.maxPreviewBytes) continue;
+        try {
+          BaselineJpegInspector.validate(
+            encoded,
+            width: target.width,
+            height: target.height,
+          );
+          return PreviewGenerated(
+            preview: BundlePreview(
+              codec: BundlePreviewCodec.baselineJpeg,
+              width: target.width,
+              height: target.height,
+              encodedBytes: encoded,
+            ),
+            detectedSourceMediaType: mediaType,
+          );
+        } on SboxException {
+          // Try the next quality/size candidate below.
+        }
+      }
+      for (final dimension in const <int>[288, 256, 224, 192, 160, 128, 96]) {
+        if (dimension >= target.longestSide) continue;
+        final smaller = _targetDimensions(
+          oriented.width,
+          oriented.height,
+          maximum: dimension,
+        );
+        final candidate = img.copyResize(
+          oriented,
+          width: smaller.width,
+          height: smaller.height,
+          interpolation: img.Interpolation.average,
+        );
+        final candidateRgb = _flattenToRgb(candidate);
+        try {
+          for (final quality in const <int>[72, 64, 56, 48, 40, 32]) {
+            final encoded = img.encodeJpg(
+              candidateRgb,
+              quality: quality,
+              chroma: img.JpegChroma.yuv444,
+            );
+            if (encoded.length > SboxProtocol.maxPreviewBytes) continue;
+            try {
+              BaselineJpegInspector.validate(
+                encoded,
+                width: smaller.width,
+                height: smaller.height,
+              );
+              return PreviewGenerated(
+                preview: BundlePreview(
+                  codec: BundlePreviewCodec.baselineJpeg,
+                  width: smaller.width,
+                  height: smaller.height,
+                  encodedBytes: encoded,
+                ),
+                detectedSourceMediaType: mediaType,
+              );
+            } on SboxException {
+              // Continue through the bounded candidate set.
+            }
+          }
+        } finally {
+          candidateRgb.clear();
+        }
+      }
+    } finally {
+      rgb.clear();
+    }
+    return PreviewUnavailable(
+      reason: PreviewUnavailableReason.encodeFailed,
+      detectedSourceMediaType: mediaType,
+    );
   }
 
   Future<_FileSnapshot?> _snapshot(File source) async {

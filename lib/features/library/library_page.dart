@@ -14,6 +14,7 @@ import '../../app/sbox_theme.dart';
 import '../../app/sbox_widgets.dart';
 import '../../platform/cloud_backup_configuration_store.dart';
 import '../../platform/file_opener.dart';
+import '../../platform/flutter_video_poster_decoder.dart';
 import '../../platform/preview_generation_result.dart';
 import '../../platform/preview_generator.dart';
 import '../../platform/secure_credential_store.dart';
@@ -1045,9 +1046,9 @@ final class _LibraryPageState extends State<LibraryPage> {
     var mediaType = 'application/octet-stream';
     try {
       if (_generatePreview) {
-        final generated = await const PlatformPreviewGenerator().generate(
-          sourceFile,
-        );
+        final generated = await const PlatformPreviewGenerator(
+          videoPosterDecoder: FlutterVideoPosterDecoder(),
+        ).generate(sourceFile);
         switch (generated) {
           case PreviewGenerated(
             preview: final generatedPreview,

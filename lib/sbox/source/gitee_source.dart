@@ -36,6 +36,13 @@ final class GiteeDataSource extends RepositoryDataSource {
   @override
   bool get emptyMetadataListMeansNotFound => true;
 
+  /// The repository-contents endpoint returns the directory listing directly;
+  /// it does not provide the page/per_page cursor contract assumed by the
+  /// generic repository source. Advertising synthetic pages here can make a
+  /// completed upload loop over the same directory forever.
+  @override
+  bool get supportsListPagination => false;
+
   @override
   Uri metadataUri(SourcePath path) => _contentsUri(path);
 
@@ -52,11 +59,6 @@ final class GiteeDataSource extends RepositoryDataSource {
       'contents',
       if (config.pathPrefix.isNotEmpty) ...config.pathPrefix.split('/'),
     ],
-    queryParameters: <String, String>{
-      'page': cursor ?? '1',
-      'per_page': (pageSize < providerPageSize ? pageSize : providerPageSize)
-          .toString(),
-    },
   );
 
   @override

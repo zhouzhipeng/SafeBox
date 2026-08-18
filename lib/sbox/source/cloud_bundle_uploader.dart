@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -60,6 +61,8 @@ final class CloudBundleUploadProgress {
   final int? currentShardIndex;
   final int attempt;
 
+  bool get isComplete => stage == CloudBundleUploadStage.completed;
+
   int get completedShards => sources.values.fold(
     0,
     (total, source) => total + source.completedShards,
@@ -70,12 +73,22 @@ final class CloudBundleUploadProgress {
     (total, source) => total + source.totalShards,
   );
 
-  double get fraction => totalShards == 0
-      ? 0
-      : (completedShards / totalShards).clamp(0, 1).toDouble();
+  double get fraction {
+    if (totalShards == 0) return 0;
+    final value = (completedShards / totalShards).clamp(0, 1).toDouble();
+    // The last shard can be written before the verification pass and the
+    // final local inspection. Keep the visual progress just below complete
+    // until the explicit terminal event is emitted.
+    if (!isComplete && value >= 1) return 0.99;
+    return value;
+  }
 
-  String get overallLabel =>
-      '$completedShards/$totalShards (${(fraction * 100).toStringAsFixed(1)}%)';
+  String get overallLabel {
+    if (!isComplete && totalShards > 0 && completedShards >= totalShards) {
+      return '$completedShards/$totalShards（正在核对）';
+    }
+    return '$completedShards/$totalShards (${(fraction * 100).toStringAsFixed(1)}%)';
+  }
 
   String get sourceLabel => sources.values
       .map((source) => '${source.sourceName} ${source.ratioLabel}')
@@ -151,6 +164,7 @@ final class CloudBundleUploader {
   }
 
   static const int _giteeObjectLimit = 20 * 1024 * 1024;
+  static const Duration _remoteListingTimeout = Duration(seconds: 45);
 
   final CredentialStore _credentialStore;
   final http.Client _client;
@@ -359,7 +373,6 @@ final class CloudBundleUploader {
           progress: progress,
         ),
       ]);
-      progress.emit(stage: CloudBundleUploadStage.completed);
       final previewOutcome = await _readPreviewOutcome(
         root: root,
         rootObjectName: objectNames.firstWhere(
@@ -368,6 +381,10 @@ final class CloudBundleUploader {
         options: effectiveOptions,
         reused: !created,
       );
+      // This is the terminal event. It must be emitted only after remote
+      // verification and local metadata inspection have both completed;
+      // publishing the final shard is not the same as finishing the upload.
+      progress.emit(stage: CloudBundleUploadStage.completed);
       return CloudBundleUploadResult(
         bundleId: bundleId,
         objectNames: List.unmodifiable(objectNames),
@@ -527,20 +544,55 @@ final class CloudBundleUploader {
   }) async {
     final objects = <String>{};
     try {
+      if (expected.isEmpty) return objects;
       String? cursor;
+      final visitedCursors = <String>{};
+      final visitedPages = <String>{};
+      final listingClock = Stopwatch()..start();
       do {
+        if (cursor != null && !visitedCursors.add(cursor)) {
+          throw const SboxException(
+            SboxErrorCode.sourceNetwork,
+            '数据源分页游标重复，无法完成云端校验',
+          );
+        }
         SourceListPage page;
         try {
-          page = await source.listObjects(cursor: cursor);
+          final remaining = _remoteListingTimeout - listingClock.elapsed;
+          if (remaining <= Duration.zero) {
+            throw const SboxException(
+              SboxErrorCode.sourceNetwork,
+              '云端目录校验超时',
+            );
+          }
+          page = await source.listObjects(cursor: cursor).timeout(remaining);
         } on SboxException catch (error) {
           if (error.code == SboxErrorCode.sourceNotFound) return objects;
           rethrow;
+        } on TimeoutException {
+          throw const SboxException(
+            SboxErrorCode.sourceNetwork,
+            '云端目录校验超时',
+          );
+        }
+        final pageSignature = page.objects
+            .map((object) => object.path.value)
+            .join('\u0000');
+        if (!visitedPages.add(pageSignature)) {
+          throw const SboxException(
+            SboxErrorCode.sourceNetwork,
+            '数据源重复返回目录页，无法完成云端校验',
+          );
         }
         for (final object in page.objects) {
           if (expected.contains(object.path.value)) {
             objects.add(object.path.value);
           }
         }
+        // Only the current Bundle matters here. Once every expected object is
+        // visible, scanning unrelated historical objects in later pages only
+        // delays completion and can leave the UI at a misleading 100%.
+        if (objects.length == expected.length) return objects;
         cursor = page.nextCursor;
       } while (cursor != null);
       return objects;
@@ -693,6 +745,13 @@ final class CloudBundleUploader {
           );
         }
 
+        // The last put can finish before this source's post-publish listing.
+        // Switch stages before waiting for that listing so the UI never
+        // presents the final shard write as the terminal upload state.
+        progress.emit(
+          stage: CloudBundleUploadStage.verifying,
+          currentSource: sourceName,
+        );
         observed = await _remoteObjects(
           source,
           objectNames.toSet(),

@@ -12,6 +12,7 @@ import '../../app/sbox_feedback.dart';
 import '../../app/sbox_theme.dart';
 import '../../app/sbox_widgets.dart';
 import '../../platform/cloud_backup_configuration_store.dart';
+import '../../platform/flutter_video_poster_decoder.dart';
 import '../../platform/preview_generation_result.dart';
 import '../../platform/preview_generator.dart';
 import '../../platform/secure_credential_store.dart';
@@ -478,9 +479,9 @@ final class _EncryptPageState extends State<EncryptPage> {
     });
     try {
       if (_contentKind == SboxContentKind.file && _generatePreview) {
-        final generated = await const PlatformPreviewGenerator().generate(
-          File((_selectedFile!).path),
-        );
+        final generated = await const PlatformPreviewGenerator(
+          videoPosterDecoder: FlutterVideoPosterDecoder(),
+        ).generate(File((_selectedFile!).path));
         switch (generated) {
           case PreviewGenerated(
             preview: final generatedPreview,

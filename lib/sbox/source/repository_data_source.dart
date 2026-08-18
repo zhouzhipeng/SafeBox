@@ -64,6 +64,11 @@ abstract base class RepositoryDataSource
 
   int get providerPageSize => 100;
 
+  /// Whether [listUri] supports the page/per-page cursor contract used by
+  /// [listObjects]. Some provider directory endpoints return the complete
+  /// directory in one response and ignore those query parameters.
+  bool get supportsListPagination => true;
+
   Future<void> verifyRepository() async {
     logger?.info('$sourceName：开始测试 API 连接');
     final response = await httpTransport.get(
@@ -317,7 +322,8 @@ abstract base class RepositoryDataSource
     }
     objects.sort((left, right) => left.path.value.compareTo(right.path.value));
     final pageNumber = int.tryParse(cursor ?? '1') ?? 1;
-    final nextCursor = values.length >= providerPageSize
+    final nextCursor =
+        supportsListPagination && values.length >= providerPageSize
         ? (pageNumber + 1).toString()
         : null;
     logger?.info(

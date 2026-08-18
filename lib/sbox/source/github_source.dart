@@ -29,6 +29,14 @@ final class GitHubDataSource extends RepositoryDataSource {
   @override
   String get apiAcceptHeader => 'application/vnd.github+json';
 
+  /// GitHub's repository-contents directory endpoint returns the directory
+  /// listing directly and does not implement the page/per_page query contract
+  /// used by the other repository providers. Sending a synthetic next page
+  /// would return the same entries again and make BundleListing reject the
+  /// response as duplicate paths.
+  @override
+  bool get supportsListPagination => false;
+
   @override
   Uri metadataUri(SourcePath path) => _contentsUri(path);
 
@@ -43,11 +51,6 @@ final class GitHubDataSource extends RepositoryDataSource {
       'contents',
       if (config.pathPrefix.isNotEmpty) ...config.pathPrefix.split('/'),
     ],
-    queryParameters: <String, String>{
-      'page': cursor ?? '1',
-      'per_page': (pageSize < providerPageSize ? pageSize : providerPageSize)
-          .toString(),
-    },
   );
 
   @override
