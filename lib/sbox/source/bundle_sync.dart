@@ -11,14 +11,85 @@ import '../identity/rsa_models.dart';
 import 'data_source.dart';
 import 'source_path.dart';
 
+enum BundleDownloadStage { preparing, downloading, decrypting }
+
+final class BundleDownloadProgress {
+  const BundleDownloadProgress({
+    required this.stage,
+    required this.downloadedBytes,
+    required this.completedObjects,
+    required this.totalObjects,
+    required this.progressUnits,
+    this.currentShardIndex,
+    this.currentObjectBytes = 0,
+    this.currentObjectLength = 0,
+  });
+
+  final BundleDownloadStage stage;
+  final int downloadedBytes;
+  final int completedObjects;
+  final int totalObjects;
+
+  /// Completed objects plus the fractional progress of active objects. The
+  /// value is weighted by object count because continuation object lengths
+  /// are discovered while their responses are opened.
+  final double progressUnits;
+  final int? currentShardIndex;
+  final int currentObjectBytes;
+  final int currentObjectLength;
+
+  double? get fraction {
+    if (stage == BundleDownloadStage.decrypting || totalObjects <= 0) {
+      return null;
+    }
+    return (progressUnits / totalObjects).clamp(0, 1).toDouble();
+  }
+
+  String get overallLabel {
+    final value = fraction;
+    if (value == null) {
+      return stage == BundleDownloadStage.decrypting ? '下载完成' : '读取文件信息';
+    }
+    return '${(value * 100).toStringAsFixed(1)}% · '
+        '$completedObjects/$totalObjects 个分片';
+  }
+
+  String get detailLabel {
+    if (stage == BundleDownloadStage.decrypting) {
+      return '已下载 ${_formatBytes(downloadedBytes)}，正在校验并解密文件。';
+    }
+    final current = currentShardIndex;
+    final currentLabel = current == null || currentObjectLength <= 0
+        ? null
+        : totalObjects > 0
+        ? '当前分片 ${current + 1}/$totalObjects：'
+              '${_formatBytes(currentObjectBytes)} / '
+              '${_formatBytes(currentObjectLength)} '
+              '(${(currentObjectBytes / currentObjectLength * 100).clamp(0, 100).toStringAsFixed(1)}%)'
+        : '正在读取文件头：${_formatBytes(currentObjectBytes)} / '
+              '${_formatBytes(currentObjectLength)} '
+              '(${(currentObjectBytes / currentObjectLength * 100).clamp(0, 100).toStringAsFixed(1)}%)';
+    return <String>[
+      '已下载 ${_formatBytes(downloadedBytes)}',
+      ?currentLabel,
+      if (totalObjects > 0) '已完成 $completedObjects/$totalObjects 个分片',
+    ].join(' · ');
+  }
+}
+
 abstract final class BundleSync {
   static Future<DecryptedBundle> fetchAndDecrypt({
     required DataSource source,
     required SourcePath rootPath,
     required String mnemonic,
     PublicIdentity? expectedIdentity,
+    void Function(BundleDownloadProgress progress)? onProgress,
   }) async {
-    final objects = await _downloadObjects(source: source, rootPath: rootPath);
+    final objects = await _downloadObjects(
+      source: source,
+      rootPath: rootPath,
+      onProgress: onProgress,
+    );
     return BackgroundBundleCrypto.decrypt(
       objects: objects,
       mnemonic: mnemonic,
@@ -32,12 +103,14 @@ abstract final class BundleSync {
     required String mnemonic,
     required File destination,
     PublicIdentity? expectedIdentity,
+    void Function(BundleDownloadProgress progress)? onProgress,
   }) => fetchAndDecryptToFileStreaming(
     source: source,
     rootPath: rootPath,
     mnemonic: mnemonic,
     destination: destination,
     expectedIdentity: expectedIdentity,
+    onProgress: onProgress,
   );
 
   /// Downloads ciphertext shards concurrently and performs authentication,
@@ -49,8 +122,13 @@ abstract final class BundleSync {
     required String mnemonic,
     required File destination,
     PublicIdentity? expectedIdentity,
+    void Function(BundleDownloadProgress progress)? onProgress,
   }) async {
-    final objects = await _downloadObjects(source: source, rootPath: rootPath);
+    final objects = await _downloadObjects(
+      source: source,
+      rootPath: rootPath,
+      onProgress: onProgress,
+    );
     await BackgroundBundleCrypto.decryptToFile(
       objects: objects,
       mnemonic: mnemonic,
@@ -62,6 +140,7 @@ abstract final class BundleSync {
   static Future<Map<String, List<int>>> _downloadObjects({
     required DataSource source,
     required SourcePath rootPath,
+    void Function(BundleDownloadProgress progress)? onProgress,
   }) async {
     if (!source.capabilities.canRead) {
       throw const SboxException(
@@ -69,8 +148,15 @@ abstract final class BundleSync {
         'The current data source is not readable',
       );
     }
+    final reporter = _DownloadProgressReporter(onProgress);
     final rootRead = await source.get(rootPath);
-    final rootBytes = await _readObject(source, rootRead);
+    reporter.startObject(shardIndex: 0, length: rootRead.length);
+    final rootBytes = await _readObject(
+      source,
+      rootRead,
+      onBytesRead: (count) => reporter.updateObject(0, count),
+    );
+    reporter.completeObject(0);
     final rootHeader = BundleHeader.parse(rootBytes);
     validateBundlePathAgainstHeader(rootPath.value, rootHeader);
     if (!rootHeader.isRoot) {
@@ -79,25 +165,39 @@ abstract final class BundleSync {
         'A root shard is required',
       );
     }
+    reporter.setTotalObjects(rootHeader.shardCount);
 
     final objects = <String, List<int>>{rootPath.value: rootBytes};
-    final paths = <SourcePath>[
+    final paths = <({SourcePath path, int shardIndex})>[
       for (var index = 1; index < rootHeader.shardCount; index++)
-        SourcePath(
-          canonicalBundleBasename(
-            bundleId: rootHeader.bundleId,
-            shardIndex: index,
-            shardCount: rootHeader.shardCount,
+        (
+          path: SourcePath(
+            canonicalBundleBasename(
+              bundleId: rootHeader.bundleId,
+              shardIndex: index,
+              shardCount: rootHeader.shardCount,
+            ),
           ),
+          shardIndex: index,
         ),
     ];
     await _parallelForEach(
       paths,
       maxParallel: source.capabilities.maxParallelTransfers,
-      action: (path) async {
+      action: (item) async {
         try {
-          final read = await source.get(path);
-          objects[path.value] = await _readObject(source, read);
+          final read = await source.get(item.path);
+          reporter.startObject(
+            shardIndex: item.shardIndex,
+            length: read.length,
+          );
+          objects[item.path.value] = await _readObject(
+            source,
+            read,
+            onBytesRead: (count) =>
+                reporter.updateObject(item.shardIndex, count),
+          );
+          reporter.completeObject(item.shardIndex);
         } on SboxException catch (error) {
           if (error.code == SboxErrorCode.sourceNotFound) {
             throw const SboxException(
@@ -109,6 +209,7 @@ abstract final class BundleSync {
         }
       },
     );
+    reporter.emitDecrypting();
     return objects;
   }
 
@@ -178,8 +279,9 @@ abstract final class BundleSync {
 
   static Future<Uint8List> _readObject(
     DataSource source,
-    SourceRead read,
-  ) async {
+    SourceRead read, {
+    void Function(int bytesRead)? onBytesRead,
+  }) async {
     if (read.notModified ||
         read.length < 0 ||
         (source.capabilities.maxObjectBytes != null &&
@@ -200,6 +302,7 @@ abstract final class BundleSync {
         );
       }
       output.add(chunk);
+      onBytesRead?.call(count);
     }
     if (count != read.length) {
       throw const SboxException(
@@ -209,6 +312,102 @@ abstract final class BundleSync {
     }
     return output.takeBytes();
   }
+}
+
+final class _DownloadProgressReporter {
+  _DownloadProgressReporter(this.onProgress);
+
+  final void Function(BundleDownloadProgress progress)? onProgress;
+  final Map<int, ({int bytes, int length})> _active =
+      <int, ({int bytes, int length})>{};
+  int _downloadedBytes = 0;
+  int _completedObjects = 0;
+  int _totalObjects = 0;
+  int? _currentShardIndex;
+
+  void startObject({required int shardIndex, required int length}) {
+    _active[shardIndex] = (bytes: 0, length: length);
+    _currentShardIndex = shardIndex;
+    _emit();
+  }
+
+  void updateObject(int shardIndex, int bytesRead) {
+    final active = _active[shardIndex];
+    if (active == null) return;
+    final bytes = bytesRead.clamp(0, active.length).toInt();
+    _downloadedBytes += bytes - active.bytes;
+    _active[shardIndex] = (bytes: bytes, length: active.length);
+    _currentShardIndex = shardIndex;
+    _emit();
+  }
+
+  void completeObject(int shardIndex) {
+    final active = _active.remove(shardIndex);
+    if (active == null) return;
+    _downloadedBytes += active.length - active.bytes;
+    _completedObjects++;
+    _currentShardIndex = _active.isEmpty ? null : _active.keys.first;
+    _emit();
+  }
+
+  void setTotalObjects(int totalObjects) {
+    _totalObjects = totalObjects < 0 ? 0 : totalObjects;
+    _emit();
+  }
+
+  void emitDecrypting() {
+    _emit(stage: BundleDownloadStage.decrypting);
+  }
+
+  void _emit({BundleDownloadStage? stage}) {
+    final callback = onProgress;
+    if (callback == null) return;
+    final progress = _progressUnits;
+    final current = _currentShardIndex == null
+        ? null
+        : _active[_currentShardIndex!];
+    try {
+      callback(
+        BundleDownloadProgress(
+          stage:
+              stage ??
+              (_totalObjects == 0
+                  ? BundleDownloadStage.preparing
+                  : BundleDownloadStage.downloading),
+          downloadedBytes: _downloadedBytes,
+          completedObjects: _completedObjects,
+          totalObjects: _totalObjects,
+          progressUnits: progress,
+          currentShardIndex: _currentShardIndex,
+          currentObjectBytes: current?.bytes ?? 0,
+          currentObjectLength: current?.length ?? 0,
+        ),
+      );
+    } on Object {
+      // UI progress must never be able to interrupt a download.
+    }
+  }
+
+  double get _progressUnits {
+    var value = _completedObjects.toDouble();
+    for (final object in _active.values) {
+      if (object.length > 0) {
+        value += (object.bytes / object.length).clamp(0, 1);
+      }
+    }
+    return value;
+  }
+}
+
+String _formatBytes(int bytes) {
+  if (bytes >= 1024 * 1024 * 1024) {
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GiB';
+  }
+  if (bytes >= 1024 * 1024) {
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MiB';
+  }
+  if (bytes >= 1024) return '${(bytes / 1024).toStringAsFixed(1)} KiB';
+  return '$bytes B';
 }
 
 Future<void> _parallelForEach<T>(

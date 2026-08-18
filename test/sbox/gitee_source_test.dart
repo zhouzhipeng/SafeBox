@@ -120,6 +120,30 @@ void main() {
       );
     },
   );
+
+  test(
+    'Gitee full reads tolerate raw responses without size or ETag headers',
+    () async {
+      final client = _FullObjectRawClient(omitRawHeaders: true);
+      final source = GiteeDataSource(
+        config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
+        client: client,
+      );
+
+      final read = await source.get(
+        SourcePath('0123456789abcdef0123456789abcdef-0-of-1.sbox'),
+      );
+
+      expect(await read.body.expand((chunk) => chunk).toList(), <int>[
+        1,
+        2,
+        3,
+        4,
+      ]);
+      expect(read.length, 4);
+      expect(ascii.decode(read.revision.bytes), startsWith('raw-sha256:'));
+    },
+  );
 }
 
 final class _CredentialStore implements CredentialStore {
@@ -171,6 +195,9 @@ final class _RecordingClient extends http.BaseClient {
 }
 
 final class _FullObjectRawClient extends http.BaseClient {
+  _FullObjectRawClient({this.omitRawHeaders = false});
+
+  final bool omitRawHeaders;
   http.BaseRequest? rawRequest;
   var metadataRequests = 0;
 
@@ -195,6 +222,13 @@ final class _FullObjectRawClient extends http.BaseClient {
         request.url.path.contains('/api/v5/repos/') &&
         request.url.path.contains('/raw/')) {
       rawRequest = request;
+      if (omitRawHeaders) {
+        return http.StreamedResponse(
+          Stream<List<int>>.value(Uint8List.fromList(<int>[1, 2, 3, 4])),
+          200,
+          request: request,
+        );
+      }
       return http.StreamedResponse(
         Stream<List<int>>.value(Uint8List.fromList(<int>[1, 2, 3, 4])),
         200,

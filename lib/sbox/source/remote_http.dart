@@ -5,9 +5,9 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
-import '../../app/app_logger.dart';
 import '../errors.dart';
 import '../format/strict_json.dart';
+import '../logging.dart';
 
 enum RemoteFailureContext { read, immutableCreate, delete }
 
@@ -28,7 +28,7 @@ final class RemoteHttp {
   final http.Client client;
   final Duration requestTimeout;
   final Duration streamIdleTimeout;
-  final AppLogger? logger;
+  final SboxLogger? logger;
   final String sourceName;
 
   Future<http.StreamedResponse> get(

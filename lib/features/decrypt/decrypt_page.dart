@@ -37,6 +37,7 @@ final class _DecryptPageState extends State<DecryptPage> {
   CloudRepositoryPair? _pair;
   bool _loading = true;
   bool _busy = false;
+  BundleDownloadProgress? _downloadProgress;
 
   @override
   void initState() {
@@ -116,7 +117,7 @@ final class _DecryptPageState extends State<DecryptPage> {
               TextField(
                 controller: _mnemonicController,
                 obscureText: true,
-                maxLines: 2,
+                maxLines: 1,
                 decoration: const InputDecoration(
                   labelText: '12 词 BIP39 助记词',
                   prefixIcon: Icon(Icons.key_outlined),
@@ -137,9 +138,15 @@ final class _DecryptPageState extends State<DecryptPage> {
         ),
         const SizedBox(height: 18),
         if (_busy)
-          const SboxProgressCard(
-            title: '正在读取、校验并解密',
-            detail: '只有所有分片、Final 值、长度、SHA-256 和 UTF-8 校验通过后，才发布明文文件。',
+          SboxProgressCard(
+            title: _downloadProgress == null
+                ? '正在读取、校验并解密'
+                : _downloadStageTitle(_downloadProgress!.stage),
+            detail:
+                _downloadProgress?.detailLabel ??
+                '只有所有分片、Final 值、长度、SHA-256 和 UTF-8 校验通过后，才发布明文文件。',
+            value: _downloadProgress?.fraction,
+            progressLabel: _downloadProgress?.overallLabel,
           )
         else
           const SecurityNotice(
@@ -203,7 +210,10 @@ final class _DecryptPageState extends State<DecryptPage> {
       return;
     }
 
-    setState(() => _busy = true);
+    setState(() {
+      _busy = true;
+      _downloadProgress = null;
+    });
     Object? lastError;
     final sources = <({String name, DataSource source})>[
       (name: 'GitHub', source: pair.github),
@@ -222,6 +232,7 @@ final class _DecryptPageState extends State<DecryptPage> {
             rootPath: rootPath,
             mnemonic: mnemonic,
             destination: File(destinationPath),
+            onProgress: _handleDownloadProgress,
           );
           if (mounted) {
             widget.controller.setStatus(
@@ -241,8 +252,26 @@ final class _DecryptPageState extends State<DecryptPage> {
       }
     } finally {
       _mnemonicController.clear();
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _downloadProgress = null;
+        });
+      }
     }
+  }
+
+  void _handleDownloadProgress(BundleDownloadProgress progress) {
+    if (!mounted) return;
+    setState(() => _downloadProgress = progress);
+  }
+
+  static String _downloadStageTitle(BundleDownloadStage stage) {
+    return switch (stage) {
+      BundleDownloadStage.preparing => '正在读取文件信息',
+      BundleDownloadStage.downloading => '正在下载加密文件',
+      BundleDownloadStage.decrypting => '正在校验并解密',
+    };
   }
 
   static Future<SourcePath> _resolveRootPath({

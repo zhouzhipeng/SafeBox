@@ -11,11 +11,14 @@ import '../../app/app_controller.dart';
 import '../../app/sbox_theme.dart';
 import '../../app/sbox_widgets.dart';
 import '../../platform/cloud_backup_configuration_store.dart';
+import '../../platform/preview_generation_result.dart';
+import '../../platform/preview_generator.dart';
 import '../../platform/secure_credential_store.dart';
 import '../../sbox/bytes.dart';
 import '../../sbox/constants.dart';
 import '../../sbox/engine/bundle_encryptor.dart';
 import '../../sbox/errors.dart';
+import '../../sbox/format/bundle_preview.dart';
 import '../../sbox/identity/public_identity_record.dart';
 import '../../sbox/source/cloud_backup_config.dart';
 import '../../sbox/source/cloud_bundle_uploader.dart';
@@ -45,6 +48,7 @@ final class _EncryptPageState extends State<EncryptPage> {
   bool _credentialsReady = false;
   bool _busy = false;
   bool _dragging = false;
+  bool _generatePreview = true;
   XFile? _selectedFile;
   int? _selectedFileLength;
   CloudBundleUploadProgress? _uploadProgress;
@@ -124,7 +128,21 @@ final class _EncryptPageState extends State<EncryptPage> {
               ),
               const SizedBox(height: 14),
               if (_contentKind == SboxContentKind.file)
-                _buildFilePicker(context)
+                ...<Widget>[
+                  _buildFilePicker(context),
+                  const SizedBox(height: 8),
+                  SwitchListTile(
+                    value: _generatePreview,
+                    onChanged: _busy
+                        ? null
+                        : (value) => setState(() => _generatePreview = value),
+                    contentPadding: EdgeInsets.zero,
+                    secondary: const Icon(Icons.image_outlined),
+                    subtitle: const Text(
+                      '仅上传图片或视频时生效；持有完整公钥的人可以读取缩略图，完整文件仍需验证。',
+                    ),
+                  ),
+                ]
               else ...<Widget>[
                 TextField(
                   controller: _nameController,
@@ -228,12 +246,7 @@ final class _EncryptPageState extends State<EncryptPage> {
                         style: Theme.of(context).textTheme.titleMedium,
                       ),
                       const SizedBox(height: 5),
-                      Text(
-                        file == null
-                            ? '或点击打开文件选择器'
-                            : '${_formatBytes(_selectedFileLength ?? 0)} · 点击可更换文件',
-                        style: Theme.of(context).textTheme.bodyMedium,
-                      ),
+                      _buildFileSelectionHint(context, file),
                     ],
                   ),
                 ),
@@ -246,6 +259,29 @@ final class _EncryptPageState extends State<EncryptPage> {
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildFileSelectionHint(BuildContext context, XFile? file) {
+    if (file == null) {
+      return Text(
+        '或点击打开文件选择器',
+        style: Theme.of(context).textTheme.bodyMedium,
+      );
+    }
+
+    return TextButton(
+      onPressed: _busy ? null : _pickFile,
+      style: TextButton.styleFrom(
+        alignment: Alignment.centerLeft,
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+        minimumSize: Size.zero,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
+      child: Text(
+        '${_formatBytes(_selectedFileLength ?? 0)} · 点击可更换文件',
+        style: Theme.of(context).textTheme.bodyMedium,
       ),
     );
   }
@@ -397,7 +433,9 @@ final class _EncryptPageState extends State<EncryptPage> {
     late final BundleInput input;
     late final int declaredLength;
     late final String originalName;
-    late final String mediaType;
+    var mediaType = 'application/octet-stream';
+    BundlePreview? preview;
+    PreviewUnavailableReason? previewUnavailableReason;
     if (_contentKind == SboxContentKind.file) {
       final selectedFile = _selectedFile;
       if (selectedFile == null) {
@@ -416,7 +454,6 @@ final class _EncryptPageState extends State<EncryptPage> {
       originalName = selectedFile.name.trim().isEmpty
           ? p.basename(file.path)
           : selectedFile.name;
-      mediaType = 'application/octet-stream';
     } else {
       if (!_isWellFormedUtf16(_textController.text)) {
         widget.controller.setError('文本包含不完整的 Unicode 字符。');
@@ -439,6 +476,27 @@ final class _EncryptPageState extends State<EncryptPage> {
       _uploadProgress = null;
     });
     try {
+      if (_contentKind == SboxContentKind.file && _generatePreview) {
+        final generated = await const PlatformPreviewGenerator().generate(
+          File((_selectedFile!).path),
+        );
+        switch (generated) {
+          case PreviewGenerated(
+            preview: final generatedPreview,
+            detectedSourceMediaType: final detected,
+          ):
+            preview = generatedPreview;
+            mediaType = detected;
+          case PreviewUnavailable(
+            reason: final reason,
+            detectedSourceMediaType: final detected,
+          ):
+            previewUnavailableReason = reason;
+            if (detected != null) mediaType = detected;
+        }
+      } else {
+        previewUnavailableReason = PreviewUnavailableReason.userDisabled;
+      }
       final identity = PublicIdentityRecord(
         spkiDer: record.spkiDer,
         recipientKeyId: record.recipientKeyId,
@@ -460,6 +518,10 @@ final class _EncryptPageState extends State<EncryptPage> {
                 originalName: originalName,
                 mediaType: mediaType,
                 title: originalName,
+                preview: preview,
+                previewRequested: _contentKind == SboxContentKind.file &&
+                    _generatePreview,
+                previewUnavailableReason: previewUnavailableReason,
               ),
               configuration: configuration,
               onProgress: _handleUploadProgress,
@@ -482,6 +544,11 @@ final class _EncryptPageState extends State<EncryptPage> {
           '上传成功：已同步到 GitHub 和 Gitee。根对象：${result.rootObjectName}（MD5：${result.bundleId}）',
         );
       }
+      if (!result.previewEmbedded) {
+        widget.controller.setStatus(
+          '${widget.controller.statusMessage ?? '上传成功'}；未嵌入缩略图（${_previewReasonLabel(result.previewUnavailableReason!)}）。',
+        );
+      }
     } catch (error) {
       if (mounted) {
         widget.controller.setError(error, operation: '加密并上传文件失败');
@@ -493,6 +560,7 @@ final class _EncryptPageState extends State<EncryptPage> {
     } finally {
       final bytes = textBytes;
       if (bytes != null) bytes.fillRange(0, bytes.length, 0);
+      preview?.dispose();
       if (mounted) {
         setState(() {
           _busy = false;
@@ -500,6 +568,22 @@ final class _EncryptPageState extends State<EncryptPage> {
         });
       }
     }
+  }
+
+  static String _previewReasonLabel(PreviewUnavailableReason reason) {
+    return switch (reason) {
+      PreviewUnavailableReason.userDisabled => '用户已关闭预览',
+      PreviewUnavailableReason.unsupportedMediaType => '格式不支持',
+      PreviewUnavailableReason.platformUnsupported => '当前平台不支持此媒体',
+      PreviewUnavailableReason.decodeFailed => '媒体解码失败',
+      PreviewUnavailableReason.encodeFailed => '缩略图编码失败',
+      PreviewUnavailableReason.timeout => '生成超时',
+      PreviewUnavailableReason.resourceLimit => '资源限制',
+      PreviewUnavailableReason.metadataCapacity => '元数据空间不足',
+      PreviewUnavailableReason.existingV30 => '复用旧版安全文件',
+      PreviewUnavailableReason.existingV31WithoutPreview => '复用的文件没有缩略图',
+      PreviewUnavailableReason.inputChanged => '输入文件发生变化',
+    };
   }
 
   void _handleUploadProgress(CloudBundleUploadProgress progress) {

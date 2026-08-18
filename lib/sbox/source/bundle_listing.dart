@@ -7,6 +7,7 @@ import '../errors.dart';
 import '../format/bundle_header.dart';
 import '../format/bundle_manifest.dart';
 import '../format/bundle_path.dart';
+import '../format/bundle_preview.dart';
 import '../identity/rsa_models.dart';
 import 'data_source.dart';
 import 'source_path.dart';
@@ -17,13 +18,17 @@ final class ListedBundleRoot {
     required this.info,
     required this.header,
     this.manifest,
+    this.preview,
+    bool? hasPreview,
     this.status = BundleTrustStatus.headerOnly,
-  });
+  }) : hasPreview = hasPreview ?? preview != null;
 
   final SourcePath path;
   final SourceObjectInfo info;
   final BundleHeader header;
   final BundleManifest? manifest;
+  final BundlePreview? preview;
+  final bool hasPreview;
   final BundleTrustStatus status;
 }
 
@@ -33,6 +38,7 @@ abstract final class BundleListing {
     int pageSize = 1000,
     PublicIdentity? identity,
     int? maxParallelTransfers,
+    int maxRetainedPreviewBytes = SboxProtocol.maxRetainedPreviewBytes,
   }) async {
     if (!source.capabilities.canListObjects ||
         !source.capabilities.supportsRangeRead) {
@@ -47,8 +53,12 @@ abstract final class BundleListing {
         '当前数据源不支持范围读取',
       );
     }
+    if (maxRetainedPreviewBytes < 0) {
+      throw ArgumentError.value(maxRetainedPreviewBytes, 'maxRetainedPreviewBytes');
+    }
     final rangeSource = source as RangeReadableDataSource;
-    final roots = <ListedBundleRoot>[];
+    var roots = <ListedBundleRoot>[];
+    var retainedPreviewBytes = 0;
     final seenPaths = <String>{};
     final parallelism =
         (maxParallelTransfers ?? source.capabilities.maxParallelTransfers)
@@ -103,7 +113,27 @@ abstract final class BundleListing {
             }
           }),
         );
-        roots.addAll(results.whereType<ListedBundleRoot>());
+        for (final root in results.whereType<ListedBundleRoot>()) {
+          final preview = root.preview;
+          if (preview == null ||
+              preview.encodedLength <=
+                  maxRetainedPreviewBytes - retainedPreviewBytes) {
+            if (preview != null) retainedPreviewBytes += preview.encodedLength;
+            roots.add(root);
+            continue;
+          }
+          preview.dispose();
+          roots.add(
+            ListedBundleRoot(
+              path: root.path,
+              info: root.info,
+              header: root.header,
+              manifest: root.manifest,
+              hasPreview: true,
+              status: root.status,
+            ),
+          );
+        }
       }
       cursor = page.nextCursor;
     } while (cursor != null);
@@ -150,6 +180,7 @@ abstract final class BundleListing {
         info: info,
         header: header,
         manifest: result.manifest,
+        preview: result.preview,
         status: result.status,
       );
     } on SboxException {

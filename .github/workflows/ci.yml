@@ -53,11 +53,7 @@ jobs:
         run: |
           flutter analyze --no-pub
           dart test test/sbox
-          flutter test test/persistence_security_test.dart test/widget_test.dart test/golden_test.dart --no-pub
-      - name: Verify anonymous GitHub and Gitee reads
-        env:
-          SBOX_LIVE_REMOTE_TESTS: '1'
-        run: dart test test/live_remote_source_test.dart
+          flutter test test/app --no-pub
       - name: Build Windows release
         run: flutter build windows --release --no-pub
       - name: Package Windows release

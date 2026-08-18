@@ -14,8 +14,11 @@ import '../crypto/shard_kdf.dart';
 import '../errors.dart';
 import '../format/bundle_header.dart';
 import '../format/bundle_manifest.dart';
+import '../format/bundle_preview.dart';
 import '../format/bundle_record.dart';
-import '../format/manifest_block.dart';
+import '../format/metadata_block.dart';
+import '../format/sbox_version.dart';
+import '../../platform/preview_generation_result.dart';
 import '../identity/der.dart';
 import '../identity/rsa_models.dart';
 import '../storage/io_hash.dart';
@@ -158,6 +161,9 @@ final class BundleEncryptionOptions {
     this.targetNominalShardPlaintextSize =
         SboxProtocol.defaultNominalShardPlaintextSize,
     this.maxObjectBytes,
+    this.preview,
+    this.previewRequested = false,
+    this.previewUnavailableReason,
     this.randomness,
   });
 
@@ -171,7 +177,12 @@ final class BundleEncryptionOptions {
   final String? createdAt;
   final int targetNominalShardPlaintextSize;
   final int? maxObjectBytes;
+  final BundlePreview? preview;
+  final bool previewRequested;
+  final PreviewUnavailableReason? previewUnavailableReason;
   final BundleEncryptionRandomness? randomness;
+
+  bool get wantsPreview => previewRequested || preview != null;
 }
 
 final class EncryptedBundleObject {
@@ -194,11 +205,17 @@ final class EncryptedBundle {
     required this.manifest,
     required this.objects,
     required List<int> plaintextSha256,
+    this.preview,
+    this.previewRequested = false,
+    this.previewEmbedded = false,
   }) : plaintextSha256 = Uint8List.fromList(plaintextSha256);
 
   final BundleManifest manifest;
   final List<EncryptedBundleObject> objects;
   final Uint8List plaintextSha256;
+  final BundlePreview? preview;
+  final bool previewRequested;
+  final bool previewEmbedded;
 
   EncryptedBundleObject get root =>
       objects.firstWhere((object) => object.header.isRoot);
@@ -313,6 +330,9 @@ final class BundleEncryptor {
         manifest: prepared.manifest,
         objects: List<EncryptedBundleObject>.unmodifiable(objects),
         plaintextSha256: firstPass.sha256,
+        preview: prepared.preview?.copy(),
+        previewRequested: prepared.previewRequested,
+        previewEmbedded: prepared.previewEmbedded,
       );
     } finally {
       prepared.dispose();
@@ -516,6 +536,7 @@ final class BundleEncryptor {
     Uint8List? wrapped;
     Uint8List? metadataKey;
     MetadataCiphertext? encryptedMetadata;
+    BundlePreview? embeddedPreview;
     try {
       if (!constantTimeBytesEqual(randomness.bundleId, firstPass.md5) ||
           randomness.noncePrefixes.length != plan.shardCount) {
@@ -542,7 +563,20 @@ final class BundleEncryptor {
       // This is the only protocol Manifest serialization performed by the
       // generator. The block is also constructed exactly once.
       manifestBytes = manifest.encode();
-      manifestBlock = ManifestBlock.pack(manifestBytes);
+      final requestedPreview = options.preview;
+      if (requestedPreview != null) {
+        MetadataBlockCodec.validatePreview(requestedPreview);
+        final previewCapacity = MetadataBlockCodec.previewCapacity(
+          manifestBytes.length,
+        );
+        if (requestedPreview.encodedLength <= previewCapacity) {
+          embeddedPreview = requestedPreview.copy();
+        }
+      }
+      manifestBlock = MetadataBlockCodec.packV2(
+        manifestBytes,
+        preview: embeddedPreview,
+      );
       wrapped = RsaOaepSha256().encrypt(
         message: randomness.bundleDek,
         publicKey: options.recipient.rsaPublicKey,
@@ -553,6 +587,7 @@ final class BundleEncryptor {
         seed: randomness.oaepSeed,
       );
       final placeholderRoot = BundleHeader.root(
+        version: SboxVersion.v31,
         bundleId: firstPass.md5,
         shardCount: plan.shardCount,
         shardPlaintextSize: BigInt.from(plan.shards.first.length),
@@ -570,7 +605,7 @@ final class BundleEncryptor {
         metadataSalt: randomness.metadataSalt,
         bundleId: firstPass.md5,
         recipientKeyId: options.recipient.recipientKeyId,
-        formatId: SboxProtocol.metadataFormatId,
+        formatId: SboxProtocol.metadataFormatIdV31,
       );
       encryptedMetadata = await MetadataCipher().encrypt(
         key: metadataKey,
@@ -581,6 +616,7 @@ final class BundleEncryptor {
         ),
       );
       final rootHeader = BundleHeader.root(
+        version: SboxVersion.v31,
         bundleId: firstPass.md5,
         shardCount: plan.shardCount,
         shardPlaintextSize: BigInt.from(plan.shards.first.length),
@@ -599,6 +635,9 @@ final class BundleEncryptor {
         rootHeader: rootHeader,
         manifestBytes: manifestBytes,
         wrapped: wrapped,
+        preview: embeddedPreview,
+        previewRequested: options.wantsPreview,
+        previewEmbedded: embeddedPreview != null,
       );
     } catch (_) {
       manifestBytes?.fillRange(0, manifestBytes.length, 0);
@@ -606,6 +645,7 @@ final class BundleEncryptor {
       wrapped?.fillRange(0, wrapped.length, 0);
       metadataKey?.fillRange(0, metadataKey.length, 0);
       encryptedMetadata?.dispose();
+      embeddedPreview?.dispose();
       if (ownsRandomness) randomness.dispose();
       rethrow;
     } finally {
@@ -927,6 +967,9 @@ final class _PreparedBundle {
     required this.rootHeader,
     required List<int> manifestBytes,
     required List<int> wrapped,
+    required this.preview,
+    required this.previewRequested,
+    required this.previewEmbedded,
   }) : manifestBytes = Uint8List.fromList(manifestBytes),
        wrapped = Uint8List.fromList(wrapped);
 
@@ -936,6 +979,9 @@ final class _PreparedBundle {
   final BundleHeader rootHeader;
   final Uint8List manifestBytes;
   final Uint8List wrapped;
+  final BundlePreview? preview;
+  final bool previewRequested;
+  final bool previewEmbedded;
 
   BundleHeader headerFor(int shardIndex, int shardLength) {
     if (shardIndex == 0) return rootHeader;
@@ -946,12 +992,14 @@ final class _PreparedBundle {
       shardPlaintextSize: BigInt.from(shardLength),
       recipientKeyId: rootHeader.recipientKeyId,
       noncePrefix: randomness.noncePrefixes[shardIndex],
+      version: rootHeader.version,
     );
   }
 
   void dispose() {
     manifestBytes.fillRange(0, manifestBytes.length, 0);
     wrapped.fillRange(0, wrapped.length, 0);
+    preview?.dispose();
     if (ownsRandomness) randomness.dispose();
   }
 }

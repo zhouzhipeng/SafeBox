@@ -13,6 +13,7 @@ import '../format/bundle_header.dart';
 import '../format/bundle_manifest.dart';
 import '../format/bundle_path.dart';
 import '../format/bundle_record.dart';
+import '../format/bundle_preview.dart';
 import '../identity/bip39_identity.dart';
 import '../identity/rsa_models.dart';
 import 'bundle_probe.dart';
@@ -22,12 +23,14 @@ final class DecryptedBundle {
     required this.manifest,
     required this.rootHeader,
     required List<int> plaintext,
+    this.preview,
     this.status = BundleTrustStatus.complete,
   }) : plaintext = Uint8List.fromList(plaintext);
 
   final BundleManifest manifest;
   final BundleHeader rootHeader;
   final Uint8List plaintext;
+  final BundlePreview? preview;
   final BundleTrustStatus status;
 
   bool get rootAuthenticated =>
@@ -118,7 +121,7 @@ final class BundleDecryptor {
       }
 
       final identityForMetadata = expectedIdentity ?? identity.publicIdentity;
-      final fast = await BundleProbe.readManifest(
+       final fast = await BundleProbe.readMetadata(
         basename: root.basename,
         objectPrefix: root.bytes.sublist(0, root.header.headerLength),
         identity: identityForMetadata,
@@ -207,6 +210,7 @@ final class BundleDecryptor {
         manifest: manifest,
         rootHeader: root.header,
         plaintext: plaintext,
+        preview: fast.preview,
         status: BundleTrustStatus.complete,
       );
     } on SboxException {
@@ -304,6 +308,12 @@ final class BundleDecryptor {
     final byIndex = <int, _ParsedObject>{};
     for (final object in parsed) {
       final header = object.header;
+      if (header.version != root.header.version) {
+        throw const SboxException(
+          SboxErrorCode.shardMismatch,
+          'Bundle 分片版本不一致',
+        );
+      }
       if (!constantTimeBytesEqual(header.bundleId, root.header.bundleId) ||
           !constantTimeBytesEqual(
             header.recipientKeyId,
@@ -351,7 +361,7 @@ final class BundleDecryptor {
       )) {
         throw const SboxException(SboxErrorCode.keyMismatch, '助记词与 Bundle 身份不匹配');
       }
-      final fast = await BundleProbe.readManifest(
+      final fast = await BundleProbe.readMetadata(
         basename: root.basename,
         objectPrefix: root.bytes.sublist(0, root.header.headerLength),
         identity: expectedIdentity ?? identity.publicIdentity,
@@ -380,6 +390,7 @@ final class BundleDecryptor {
         basename: fast.basename,
         header: fast.header,
         manifest: fast.manifest,
+        metadata: fast.metadata,
         status: BundleTrustStatus.rootAuthenticated,
       );
     } on SboxException {

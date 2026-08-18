@@ -4,7 +4,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../sbox/errors.dart';
+import '../sbox/logging.dart';
 
 enum AppLogLevel { info, warning, error }
 
@@ -61,7 +61,7 @@ final class AppLogEntry {
 ///
 /// Logs are intentionally short and sanitized. They are for diagnosing
 /// control-flow and connectivity failures, not for exporting SBOX data.
-final class AppLogger extends ChangeNotifier {
+final class AppLogger extends ChangeNotifier implements SboxLogger {
   AppLogger({SharedPreferences? preferences})
     : _providedPreferences = preferences;
 
@@ -99,12 +99,15 @@ final class AppLogger extends ChangeNotifier {
     notifyListeners();
   }
 
+  @override
   void info(String title, {String? detail}) =>
       _append(AppLogLevel.info, title, detail);
 
+  @override
   void warning(String title, {String? detail}) =>
       _append(AppLogLevel.warning, title, detail);
 
+  @override
   void error(Object error, {String operation = '应用操作失败', String? context}) {
     final parts = <String>[describeError(error)];
     if (context != null && context.trim().isNotEmpty) {
@@ -138,59 +141,13 @@ final class AppLogger extends ChangeNotifier {
         .join('\n');
   }
 
-  static String describeError(Object error) {
-    if (error is SboxException) {
-      return '${error.code.value}: ${sanitize(error.message)}';
-    }
-    final detail = sanitize(error.toString());
-    final type = error.runtimeType.toString();
-    return detail == type ? type : '$type: $detail';
-  }
+  static String describeError(Object error) => describeSboxError(error);
 
   /// Removes credentials and strips URLs down to their host before a message
   /// is stored. This also protects logs when a third-party exception includes
   /// a request URL or a query string.
-  static String sanitize(String value) {
-    var result = value.replaceAll('\r', ' ').replaceAll('\n', ' ').trim();
-    result = result.replaceAllMapped(
-      RegExp(
-        r'authorization\s*[:=]\s*(?:bearer|token)\s+[^\s,;]+',
-        caseSensitive: false,
-      ),
-      (_) => 'Authorization=<已隐藏>',
-    );
-    result = result.replaceAllMapped(
-      RegExp(
-        r'(mnemonic|seed|bundle[_-]?dek)\s*[:=]\s*[^,;]+',
-        caseSensitive: false,
-      ),
-      (match) => '${match.group(1)}=<已隐藏>',
-    );
-    result = result.replaceAllMapped(
-      RegExp(
-        r'(authorization|token|access[_-]?token|password|secret)\s*[:=]\s*[^\s,;]+',
-        caseSensitive: false,
-      ),
-      (match) => '${match.group(1)}=<已隐藏>',
-    );
-    result = result.replaceAllMapped(
-      RegExp(r'\bbearer\s+[^\s,;]+', caseSensitive: false),
-      (_) => 'Bearer <已隐藏>',
-    );
-    result = result.replaceAllMapped(
-      RegExp(r'https?://[^\s,;]+', caseSensitive: false),
-      (match) {
-        final uri = Uri.tryParse(match.group(0)!);
-        if (uri == null || uri.host.isEmpty) return '<URL 已隐藏>';
-        final port = uri.hasPort ? ':${uri.port}' : '';
-        return '${uri.scheme}://${uri.host}$port';
-      },
-    );
-    if (result.length > maximumFieldLength) {
-      result = '${result.substring(0, maximumFieldLength - 1)}…';
-    }
-    return result.isEmpty ? '（无附加信息）' : result;
-  }
+  static String sanitize(String value) =>
+      sanitizeSboxLog(value, maximumLength: maximumFieldLength);
 
   void _append(AppLogLevel level, String title, String? detail) {
     _entries.insert(

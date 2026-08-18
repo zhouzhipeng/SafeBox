@@ -24,6 +24,12 @@ final class KeysSummaryPage extends StatelessWidget {
           subtitle: 'RSA-3072 公钥和 Key ID 可以持久化；私钥材料只在需要时从助记词临时派生。',
         ),
         const SizedBox(height: 24),
+        const SecurityNotice(
+          title: '公钥与缩略图隐私提示',
+          message: '获得此公钥的人可以读取文件名、说明、时间和缩略图预览，但不能仅凭公钥解密文件正文。',
+          warning: true,
+        ),
+        const SizedBox(height: 16),
         SboxCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,

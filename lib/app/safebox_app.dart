@@ -131,6 +131,8 @@ final class _HomeShellState extends State<_HomeShell> {
                 children: <Widget>[
                   SboxTopBar(
                     mobile: mobile,
+                    filesSelected: !settingsSelected,
+                    settingsSelected: settingsSelected,
                     onFilesTap: () =>
                         widget.onSectionChanged(AppSection.library),
                     onSettingsTap: () =>

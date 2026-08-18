@@ -24,8 +24,8 @@ abstract final class MetadataKdf {
     if (metadataSalt.length != SboxProtocol.metadataSaltLength ||
         bundleId.length != SboxProtocol.bundleIdLength ||
         recipientKeyId.length != SboxProtocol.recipientKeyIdLength ||
-        formatId < 0 ||
-        formatId > 0xffff) {
+        (formatId != SboxProtocol.metadataFormatIdV30 &&
+            formatId != SboxProtocol.metadataFormatIdV31)) {
       throw const SboxException(
         SboxErrorCode.invalidHeader,
         'Metadata 密钥参数无效',
@@ -66,8 +66,8 @@ abstract final class MetadataKdf {
   }) {
     if (bundleId.length != SboxProtocol.bundleIdLength ||
         recipientKeyId.length != SboxProtocol.recipientKeyIdLength ||
-        formatId < 0 ||
-        formatId > 0xffff) {
+        (formatId != SboxProtocol.metadataFormatIdV30 &&
+            formatId != SboxProtocol.metadataFormatIdV31)) {
       throw ArgumentError('Invalid Metadata KDF info inputs');
     }
     final format = Uint8List(2);

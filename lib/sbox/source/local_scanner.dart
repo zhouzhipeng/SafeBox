@@ -9,6 +9,7 @@ import '../errors.dart';
 import '../format/bundle_header.dart';
 import '../format/bundle_path.dart';
 import '../format/bundle_manifest.dart';
+import '../format/bundle_preview.dart';
 import '../identity/rsa_models.dart';
 import '../storage/io_hash.dart';
 
@@ -20,8 +21,11 @@ final class BundleCandidate {
     required this.ciphertextSize,
     required List<int> sha256,
     this.manifest,
+    this.preview,
+    bool? hasPreview,
     this.status = BundleTrustStatus.headerOnly,
-  }) : sha256 = Uint8List.fromList(sha256);
+  }) : sha256 = Uint8List.fromList(sha256),
+       hasPreview = hasPreview ?? preview != null;
 
   final String basename;
   final File file;
@@ -29,6 +33,8 @@ final class BundleCandidate {
   final int ciphertextSize;
   final Uint8List sha256;
   final BundleManifest? manifest;
+  final BundlePreview? preview;
+  final bool hasPreview;
   final BundleTrustStatus status;
 }
 
@@ -44,13 +50,21 @@ abstract final class LocalBundleScanner {
     Directory selectedRoot, {
     int maximumCandidates = 100000,
     PublicIdentity? identity,
+    int maxRetainedPreviewBytes = SboxProtocol.maxRetainedPreviewBytes,
   }) async {
     if (!await selectedRoot.exists()) {
       throw const SboxException(SboxErrorCode.sourceNotFound, '数据源目录不存在');
     }
+    if (maxRetainedPreviewBytes < 0) {
+      throw ArgumentError.value(
+        maxRetainedPreviewBytes,
+        'maxRetainedPreviewBytes',
+      );
+    }
     final canonical = await selectedRoot.resolveSymbolicLinks();
     final root = Directory(canonical);
     final candidates = <BundleCandidate>[];
+    var retainedPreviewBytes = 0;
     var count = 0;
     await for (final entity in root.list(followLinks: false)) {
       final type = await FileSystemEntity.type(entity.path, followLinks: false);
@@ -95,6 +109,7 @@ abstract final class LocalBundleScanner {
         validateBundlePathAgainstHeader(basename, header);
         if (!header.isRoot || path.shardIndex != 0) continue;
         BundleManifest? manifest;
+        BundlePreview? preview;
         var status = BundleTrustStatus.headerOnly;
         if (identity != null) {
           try {
@@ -104,30 +119,54 @@ abstract final class LocalBundleScanner {
               identity: identity,
             );
             manifest = result.manifest;
+            preview = result.preview;
             status = result.status;
           } on SboxException {
             // Keep the candidate as headerOnly when this identity cannot read
             // its public Metadata.
           }
         }
-        candidates.add(
-          BundleCandidate(
-            basename: basename,
-            file: file,
-            header: header,
-            ciphertextSize: length,
-            sha256: await sha256File(file),
-            manifest: manifest,
-            status: status,
-          ),
+        final candidate = BundleCandidate(
+          basename: basename,
+          file: file,
+          header: header,
+          ciphertextSize: length,
+          sha256: await sha256File(file),
+          manifest: manifest,
+          preview: preview,
+          status: status,
         );
+        if (candidate.preview == null ||
+            candidate.preview!.encodedLength <=
+                maxRetainedPreviewBytes - retainedPreviewBytes) {
+          if (candidate.preview != null) {
+            retainedPreviewBytes += candidate.preview!.encodedLength;
+          }
+          candidates.add(candidate);
+        } else {
+          candidate.preview!.dispose();
+          candidates.add(
+            BundleCandidate(
+              basename: candidate.basename,
+              file: candidate.file,
+              header: candidate.header,
+              ciphertextSize: candidate.ciphertextSize,
+              sha256: candidate.sha256,
+              manifest: candidate.manifest,
+              hasPreview: true,
+              status: candidate.status,
+            ),
+          );
+        }
       } on SboxException {
         // Non-v3 and malformed objects are not promoted to Bundle candidates.
       } on FileSystemException {
         // A disappearing file is ignored; a later listing can observe it.
       }
     }
-    candidates.sort((left, right) => left.basename.compareTo(right.basename));
+    candidates.sort(
+      (left, right) => left.basename.compareTo(right.basename),
+    );
     return BundleScanResult(
       roots: List<BundleCandidate>.unmodifiable(candidates),
       scannedFileCount: count,

@@ -4,9 +4,9 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:http/http.dart' as http;
 
-import '../../app/app_logger.dart';
 import '../bytes.dart';
 import '../errors.dart';
+import '../logging.dart';
 import 'credential.dart';
 import 'data_source.dart';
 import 'remote_config.dart';
@@ -33,7 +33,7 @@ abstract base class RepositoryDataSource
   final RepositorySourceConfig config;
   final CredentialStore? credentialStore;
   final SourceCredentialId? credentialId;
-  final AppLogger? logger;
+  final SboxLogger? logger;
   final RemoteHttp httpTransport;
 
   final String sourceName;
@@ -111,15 +111,23 @@ abstract base class RepositoryDataSource
       }
       final size = _responseSize(response);
       final revision = _responseRevision(response);
-      if (size == null ||
-          size < 0 ||
-          revision == null ||
-          capabilities.maxObjectBytes != null &&
-              size > capabilities.maxObjectBytes!) {
+      if (size != null &&
+          (size < 0 ||
+              capabilities.maxObjectBytes != null &&
+                  size > capabilities.maxObjectBytes!)) {
         await httpTransport.discard(response.stream);
-        throw const SboxException(
-          SboxErrorCode.sourceNetwork,
-          '鏁版嵁婧愯繑鍥炰簡鏃犳晥瀵硅薄鍝嶅簲',
+        throw const SboxException(SboxErrorCode.sourceLimit, '对象超过数据源上限');
+      }
+      if (size == null || revision == null) {
+        // Raw repository endpoints are not required to return both
+        // Content-Length and ETag. This is common for large Gitee objects.
+        // Buffer only this bounded fallback response so callers still get a
+        // verified length and a stable revision token without accepting an
+        // unbounded stream.
+        return _bufferRawResponse(
+          response,
+          expectedLength: size,
+          revision: revision,
         );
       }
       return SourceRead(
@@ -204,16 +212,56 @@ abstract base class RepositoryDataSource
     final requestedLength = endExclusive - start;
     final revision = knownRevision ?? _responseRevision(response);
     if (revision == null) {
-      await httpTransport.discard(response.stream);
-      throw const SboxException(
-        SboxErrorCode.sourceNetwork,
-        '鏁版嵁婧愯繑鍥炰簡鏃犳晥瀵硅薄鍝嶅簲',
+      final body = response.statusCode == 200
+          ? _sliceStream(response.stream, start: start, length: requestedLength)
+          : _verifiedStream(response.stream, requestedLength);
+      final bytes = await httpTransport.readBounded(
+        body,
+        maximumBytes: requestedLength,
+      );
+      if (bytes.length != requestedLength) {
+        throw const SboxException(SboxErrorCode.remoteChanged, '范围读取响应长度不一致');
+      }
+      return SourceRead(
+        body: Stream<List<int>>.value(bytes),
+        length: requestedLength,
+        revision: _fallbackRevision(bytes),
       );
     }
     final body = response.statusCode == 200
         ? _sliceStream(response.stream, start: start, length: requestedLength)
         : _verifiedStream(response.stream, requestedLength);
     return SourceRead(body: body, length: requestedLength, revision: revision);
+  }
+
+  Future<SourceRead> _bufferRawResponse(
+    http.StreamedResponse response, {
+    required int? expectedLength,
+    required RevisionToken? revision,
+  }) async {
+    final maximumBytes =
+        expectedLength ?? capabilities.maxObjectBytes ?? 100 * 1024 * 1024;
+    final bytes = await httpTransport.readBounded(
+      response.stream,
+      maximumBytes: maximumBytes,
+    );
+    if (expectedLength != null && bytes.length != expectedLength) {
+      throw const SboxException(SboxErrorCode.remoteChanged, '远端对象长度不一致');
+    }
+    return SourceRead(
+      body: Stream<List<int>>.value(bytes),
+      length: bytes.length,
+      revision: revision ?? _fallbackRevision(bytes),
+    );
+  }
+
+  static RevisionToken _fallbackRevision(List<int> bytes) {
+    final digest = sha256Bytes(bytes);
+    try {
+      return RevisionToken(ascii.encode('raw-sha256:${hexLower(digest)}'));
+    } finally {
+      digest.fillRange(0, digest.length, 0);
+    }
   }
 
   @override

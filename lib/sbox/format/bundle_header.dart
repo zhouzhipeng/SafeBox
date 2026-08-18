@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import '../bytes.dart';
 import '../constants.dart';
 import '../errors.dart';
+import 'sbox_version.dart';
 
 /// The v3 public header. A parsed header retains the exact bytes received on
 /// the wire so Metadata AAD and the root record binding never depend on a
@@ -10,6 +11,7 @@ import '../errors.dart';
 final class BundleHeader {
   BundleHeader._({
     required this.isRoot,
+    required this.version,
     required List<int> bundleId,
     required this.shardIndex,
     required this.shardCount,
@@ -51,7 +53,8 @@ final class BundleHeader {
     required List<int> metadataNonce,
     required List<int> metadataCiphertext,
     required List<int> metadataTag,
-    int metadataFormatId = SboxProtocol.metadataFormatId,
+    SboxVersion version = SboxVersion.v30,
+    int? metadataFormatId,
     int metadataKdfAlg = SboxProtocol.metadataKdfAlgorithm,
     int metadataAeadAlg = SboxProtocol.metadataAeadAlgorithm,
     int metadataFlags = SboxProtocol.metadataFlags,
@@ -59,6 +62,7 @@ final class BundleHeader {
     int metadataCiphertextLength = SboxProtocol.metadataCiphertextLength,
   }) => BundleHeader._(
     isRoot: true,
+    version: version,
     bundleId: bundleId,
     shardIndex: 0,
     shardCount: shardCount,
@@ -66,7 +70,7 @@ final class BundleHeader {
     recipientKeyId: recipientKeyId,
     noncePrefix: noncePrefix,
     wrappedBundleDek: wrappedBundleDek,
-    metadataFormatId: metadataFormatId,
+    metadataFormatId: metadataFormatId ?? version.metadataFormatId,
     metadataKdfAlg: metadataKdfAlg,
     metadataAeadAlg: metadataAeadAlg,
     metadataFlags: metadataFlags,
@@ -85,8 +89,10 @@ final class BundleHeader {
     required BigInt shardPlaintextSize,
     required List<int> recipientKeyId,
     required List<int> noncePrefix,
+    SboxVersion version = SboxVersion.v30,
   }) => BundleHeader._(
     isRoot: false,
+    version: version,
     bundleId: bundleId,
     shardIndex: shardIndex,
     shardCount: shardCount,
@@ -107,6 +113,7 @@ final class BundleHeader {
   );
 
   final bool isRoot;
+  final SboxVersion version;
   final Uint8List bundleId;
   final int shardIndex;
   final int shardCount;
@@ -151,8 +158,8 @@ final class BundleHeader {
     _validateFields();
     final bytes = Uint8List(headerLength);
     bytes.setRange(0, 8, SboxProtocol.magic);
-    bytes[8] = SboxProtocol.versionMajor;
-    bytes[9] = SboxProtocol.versionMinor;
+    bytes[8] = version.major;
+    bytes[9] = version.minor;
     writeUint16BigEndian(bytes, 10, headerLength);
     writeUint32BigEndian(bytes, 12, isRoot ? 1 : 0);
     writeUint16BigEndian(bytes, 16, SboxProtocol.keyProfileId);
@@ -198,13 +205,7 @@ final class BundleHeader {
     if (!constantTimeBytesEqual(input.sublist(0, 8), SboxProtocol.magic)) {
       throw _invalidHeader();
     }
-    if (input[8] != SboxProtocol.versionMajor ||
-        input[9] != SboxProtocol.versionMinor) {
-      throw const SboxException(
-        SboxErrorCode.unsupportedVersion,
-        '不支持此 SBOX 协议版本',
-      );
-    }
+    final version = SboxVersion.parse(input[8], input[9]);
     final headerLength = readUint16BigEndian(input, 10);
     if (headerLength != SboxProtocol.commonHeaderLength &&
         headerLength != SboxProtocol.rootHeaderLength) {
@@ -246,7 +247,7 @@ final class BundleHeader {
           (shardCount >= 2 && shardPlaintextSize == BigInt.zero)) {
         throw _invalidHeader();
       }
-      _validateRootMetadata(bytes);
+      _validateRootMetadata(bytes, version);
     } else if (headerLength != SboxProtocol.commonHeaderLength ||
         keyWrapAlgorithm != SboxProtocol.continuationKeyWrapAlgorithm ||
         wrappedKeyLength != 0 ||
@@ -256,6 +257,7 @@ final class BundleHeader {
     }
     return BundleHeader._(
       isRoot: isRoot,
+      version: version,
       bundleId: bytes.sublist(28, 44),
       shardIndex: shardIndex,
       shardCount: shardCount,
@@ -293,7 +295,7 @@ final class BundleHeader {
       if (shardIndex != 0 ||
           (shardCount >= 2 && shardPlaintextSize == BigInt.zero) ||
           wrappedBundleDek.length != SboxProtocol.wrappedBundleDekLength ||
-          metadataFormatId != SboxProtocol.metadataFormatId ||
+          metadataFormatId != version.metadataFormatId ||
           metadataKdfAlg != SboxProtocol.metadataKdfAlgorithm ||
           metadataAeadAlg != SboxProtocol.metadataAeadAlgorithm ||
           metadataFlags != SboxProtocol.metadataFlags ||
@@ -323,9 +325,9 @@ final class BundleHeader {
     }
   }
 
-  static void _validateRootMetadata(List<int> bytes) {
+  static void _validateRootMetadata(List<int> bytes, SboxVersion version) {
     if (!constantTimeBytesEqual(bytes.sublist(512, 516), _metadataMagic) ||
-        readUint16BigEndian(bytes, 516) != SboxProtocol.metadataFormatId ||
+        readUint16BigEndian(bytes, 516) != version.metadataFormatId ||
         readUint16BigEndian(bytes, 518) != SboxProtocol.metadataKdfAlgorithm ||
         readUint16BigEndian(bytes, 520) != SboxProtocol.metadataAeadAlgorithm ||
         readUint16BigEndian(bytes, 522) != SboxProtocol.metadataFlags ||

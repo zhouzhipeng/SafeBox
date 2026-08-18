@@ -13,6 +13,8 @@ import '../../app/sbox_theme.dart';
 import '../../app/sbox_widgets.dart';
 import '../../platform/cloud_backup_configuration_store.dart';
 import '../../platform/file_opener.dart';
+import '../../platform/preview_generation_result.dart';
+import '../../platform/preview_generator.dart';
 import '../../platform/secure_credential_store.dart';
 import '../../platform/temporary_plaintext_platform.dart';
 import '../../sbox/bytes.dart';
@@ -23,6 +25,7 @@ import '../../sbox/errors.dart';
 import '../../sbox/format/bundle_header.dart';
 import '../../sbox/format/bundle_manifest.dart';
 import '../../sbox/format/bundle_path.dart';
+import '../../sbox/format/bundle_preview.dart';
 import '../../sbox/identity/public_identity_record.dart';
 import '../../sbox/source/bundle_listing.dart';
 import '../../sbox/source/bundle_sync.dart';
@@ -48,27 +51,6 @@ final class LibraryPage extends StatefulWidget {
 }
 
 final class _LibraryPageState extends State<LibraryPage> {
-  static const List<_PreviewFile> _previewFiles = <_PreviewFile>[
-    _PreviewFile(
-      name: '项目资料.pdf',
-      time: '今天 14:30',
-      type: 'PDF',
-      color: Color(0xFFFF4E42),
-    ),
-    _PreviewFile(
-      name: '照片.zip',
-      time: '今天 10:18',
-      type: 'ZIP',
-      color: Color(0xFFFFB52E),
-    ),
-    _PreviewFile(
-      name: '合同.docx',
-      time: '昨天 16:45',
-      type: 'W\nDOCX',
-      color: Color(0xFF2E86F3),
-    ),
-  ];
-
   final _configurationStore = CloudBackupConfigurationStore();
   final _credentialStore = PlatformCredentialStore();
   final _temporaryStore = TemporaryPlaintextStore();
@@ -83,15 +65,18 @@ final class _LibraryPageState extends State<LibraryPage> {
   bool _busy = true;
   bool _loading = true;
   bool _dragging = false;
-  bool _showPreview = true;
+  bool _generatePreview = true;
   _LibrarySource _selectedSource = _LibrarySource.github;
   String _busyTitle = '正在读取文件';
   String _busyDetail = '正在同步你的安全文件。';
   CloudBundleUploadProgress? _uploadProgress;
+  BundleDownloadProgress? _downloadProgress;
 
   @override
   void initState() {
     super.initState();
+    PaintingBinding.instance.imageCache.maximumSizeBytes =
+        SboxProtocol.maxRetainedPreviewBytes;
     _load();
   }
 
@@ -100,6 +85,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     _searchController.dispose();
     _descriptionController.clear();
     _descriptionController.dispose();
+    _disposeBundlePreviews(_bundles);
     _client?.close();
     super.dispose();
   }
@@ -214,14 +200,7 @@ final class _LibraryPageState extends State<LibraryPage> {
               ),
             ),
             const SizedBox(height: 18),
-            Text(
-              _selectedFile == null
-                  ? '文件会自动安全保存'
-                  : '${_formatBytes(_selectedFileLength ?? 0)} · 点击可更换文件',
-              style: Theme.of(context).textTheme.bodyLarge
-                  ?.copyWith(color: SboxColors.textMuted),
-              textAlign: TextAlign.center,
-            ),
+            _buildFileSelectionHint(context),
             const SizedBox(height: 22),
             TextField(
               controller: _descriptionController,
@@ -235,6 +214,16 @@ final class _LibraryPageState extends State<LibraryPage> {
                 alignLabelWithHint: true,
               ),
             ),
+            const SizedBox(height: 8),
+            SwitchListTile(
+              value: _generatePreview,
+              onChanged: _busy
+                  ? null
+                  : (value) => setState(() => _generatePreview = value),
+              contentPadding: EdgeInsets.zero,
+              secondary: const Icon(Icons.image_outlined),
+              subtitle: const Text('仅上传图片或视频时生效；持有完整公钥的人可以读取缩略图，完整文件仍需验证。'),
+            ),
             if (_busy) ...<Widget>[
               const SizedBox(height: 18),
               Text(
@@ -244,6 +233,34 @@ final class _LibraryPageState extends State<LibraryPage> {
             ],
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildFileSelectionHint(BuildContext context) {
+    final file = _selectedFile;
+    final textStyle = Theme.of(context).textTheme.bodyLarge?.copyWith(
+      color: _busy ? SboxColors.textDim : SboxColors.textMuted,
+    );
+    if (file == null) {
+      return Text(
+        '文件会自动安全保存',
+        style: textStyle,
+        textAlign: TextAlign.center,
+      );
+    }
+
+    return TextButton(
+      onPressed: _busy ? null : _pickFile,
+      style: TextButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        minimumSize: Size.zero,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
+      child: Text(
+        '${_formatBytes(BigInt.from(_selectedFileLength ?? 0))} · 点击可更换文件',
+        style: textStyle,
+        textAlign: TextAlign.center,
       ),
     );
   }
@@ -332,8 +349,10 @@ final class _LibraryPageState extends State<LibraryPage> {
             SboxProgressCard(
               title: _busyTitle,
               detail: _busyDetail,
-              value: _uploadProgress?.fraction,
-              progressLabel: _uploadProgress?.overallLabel,
+              value: _downloadProgress?.fraction ?? _uploadProgress?.fraction,
+              progressLabel:
+                  _downloadProgress?.overallLabel ??
+                  _uploadProgress?.overallLabel,
             )
           else if (rows.isEmpty)
             Padding(
@@ -532,6 +551,16 @@ final class _LibraryPageState extends State<LibraryPage> {
                       fontSize: mobile ? 14 : 15,
                     ),
                   ),
+                  if (row.bundle?.manifest != null) ...<Widget>[
+                    const SizedBox(height: 5),
+                    Text(
+                      '原始大小：${_formatBytes(row.bundle!.manifest!.logicalPlaintextSize)}',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: SboxColors.textMuted,
+                        fontSize: mobile ? 13 : 14,
+                      ),
+                    ),
+                  ],
                   if (row.bundle?.manifest?.description.isNotEmpty ??
                       false) ...<Widget>[
                     const SizedBox(height: 5),
@@ -552,27 +581,73 @@ final class _LibraryPageState extends State<LibraryPage> {
             return Row(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: <Widget>[
-                FileTypeBadge(type: row.type, color: row.color),
+                _buildRowLeading(context, row, mobile),
                 details,
                 const SizedBox(width: 8),
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.end,
-                  children: <Widget>[
-                    actions,
-                  ],
+                  children: <Widget>[actions],
                 ),
               ],
             );
           }
           return Row(
             children: <Widget>[
-              FileTypeBadge(type: row.type, color: row.color),
+              _buildRowLeading(context, row, mobile),
               details,
               const SizedBox(width: 18),
               actions,
             ],
           );
         },
+      ),
+    );
+  }
+
+  Widget _buildRowLeading(BuildContext context, _FileRow row, bool mobile) {
+    final preview = row.thumbnail;
+    if (preview == null) {
+      return FileTypeBadge(type: row.type, color: row.color);
+    }
+    final size = mobile ? 56.0 : 72.0;
+    final fallback = FileTypeBadge(type: row.type, color: row.color);
+    final isVideo =
+        row.bundle?.manifest?.mediaType.toLowerCase().startsWith('video/') ??
+        false;
+    return Semantics(
+      image: true,
+      label: '快速缩略图预览；完整文件尚未验证',
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: SizedBox(
+          width: size,
+          height: size,
+          child: Stack(
+            fit: StackFit.expand,
+            children: <Widget>[
+              Image.memory(
+                preview.encodedBytesView,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+                cacheWidth: (size * MediaQuery.devicePixelRatioOf(context))
+                    .round(),
+                cacheHeight: (size * MediaQuery.devicePixelRatioOf(context))
+                    .round(),
+                errorBuilder: (context, error, stackTrace) => fallback,
+              ),
+              if (isVideo)
+                const Center(
+                  child: IgnorePointer(
+                    child: Icon(
+                      Icons.play_circle_fill_rounded,
+                      color: Colors.white,
+                      size: 30,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -612,9 +687,9 @@ final class _LibraryPageState extends State<LibraryPage> {
         SizedBox(
           width: buttonWidth,
           child: OutlinedButton.icon(
-            onPressed: _busy ? null : () => _openRow(row),
+            onPressed: _busy ? null : () => _downloadAndDecrypt(row),
             icon: Icon(Icons.download_outlined, size: mobile ? 20 : 22),
-            label: const Text('下载并打开'),
+            label: const Text('下载并解密'),
           ),
         ),
       ],
@@ -644,23 +719,12 @@ final class _LibraryPageState extends State<LibraryPage> {
 
   List<_FileRow> get _visibleRows {
     final query = _searchController.text.trim().toLowerCase();
-    final source = _showPreview
-        ? _previewFiles
-              .map(
-                (file) => _FileRow(
-                  name: file.name,
-                  time: file.time,
-                  type: file.type,
-                  color: file.color,
-                  actionState: _FileActionState.remoteOnly,
-                  preview: true,
-                ),
-              )
-              .toList(growable: false)
-        : _bundles
-              .where((bundle) => bundle.sourceName == _selectedSource.label)
-              .map(_rowForBundle)
-              .toList(growable: false);
+    final source =
+        _bundles
+            .where((bundle) => bundle.sourceName == _selectedSource.label)
+            .map(_rowForBundle)
+            .toList()
+          ..sort(_compareFileRowsByCreatedAt);
     if (query.isEmpty) return source;
     return source
         .where((file) {
@@ -670,6 +734,32 @@ final class _LibraryPageState extends State<LibraryPage> {
                   description.toLowerCase().contains(query));
         })
         .toList(growable: false);
+  }
+
+  static int _compareFileRowsByCreatedAt(_FileRow left, _FileRow right) {
+    final leftCreatedAt = left.bundle?.manifest?.createdAt;
+    final rightCreatedAt = right.bundle?.manifest?.createdAt;
+    final leftDate = leftCreatedAt == null
+        ? null
+        : DateTime.tryParse(leftCreatedAt);
+    final rightDate = rightCreatedAt == null
+        ? null
+        : DateTime.tryParse(rightCreatedAt);
+
+    if (leftDate == null && rightDate == null) {
+      return _compareFileRowsByPath(left, right);
+    }
+    if (leftDate == null) return 1;
+    if (rightDate == null) return -1;
+
+    final byCreatedAt = rightDate.compareTo(leftDate);
+    return byCreatedAt != 0 ? byCreatedAt : _compareFileRowsByPath(left, right);
+  }
+
+  static int _compareFileRowsByPath(_FileRow left, _FileRow right) {
+    final leftPath = left.bundle?.root.path.value ?? '';
+    final rightPath = right.bundle?.root.path.value ?? '';
+    return leftPath.compareTo(rightPath);
   }
 
   _FileRow _rowForBundle(_LibraryBundle bundle) {
@@ -691,6 +781,7 @@ final class _LibraryPageState extends State<LibraryPage> {
       color: color,
       actionState: bundle.actionState,
       bundle: bundle,
+      thumbnail: bundle.preview,
     );
   }
 
@@ -718,14 +809,12 @@ final class _LibraryPageState extends State<LibraryPage> {
       setState(() {
         _configuration = configuration;
         _credentialsReady = credentialsReady;
-        _showPreview = configuration == null;
         _loading = false;
       });
     } catch (error) {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _showPreview = true;
       });
       widget.controller.logger.warning(
         '读取云端配置失败',
@@ -745,7 +834,6 @@ final class _LibraryPageState extends State<LibraryPage> {
     if (configuration == null) {
       if (mounted) {
         setState(() {
-          _showPreview = true;
           _busy = false;
         });
       }
@@ -774,6 +862,8 @@ final class _LibraryPageState extends State<LibraryPage> {
             source: pair.github,
             sourceName: 'GitHub',
             manifest: root.manifest,
+            preview: root.preview,
+            hasPreview: root.hasPreview,
             status: root.status,
           ),
         );
@@ -785,25 +875,30 @@ final class _LibraryPageState extends State<LibraryPage> {
             source: pair.gitee,
             sourceName: 'Gitee',
             manifest: root.manifest,
+            preview: root.preview,
+            hasPreview: root.hasPreview,
             status: root.status,
           ),
         );
       }
       await _hydrateLocalState(bundles, configuration.backupDirectory);
-      if (!mounted) return;
+      if (!mounted) {
+        _disposeBundlePreviews(bundles);
+        return;
+      }
+      final previousBundles = _bundles;
       _client?.close();
       _client = client;
       nextClient = null;
       setState(() {
         _bundles = List<_LibraryBundle>.unmodifiable(bundles);
-        _showPreview = false;
         _busy = false;
       });
+      _disposeBundlePreviews(previousBundles);
     } catch (error) {
       if (mounted) {
         setState(() {
           _busy = false;
-          _showPreview = false;
         });
         widget.controller.logger.warning(
           '读取云端文件失败',
@@ -813,6 +908,14 @@ final class _LibraryPageState extends State<LibraryPage> {
       }
     } finally {
       nextClient?.close();
+    }
+  }
+
+  static void _disposeBundlePreviews(Iterable<_LibraryBundle> bundles) {
+    final disposed = <BundlePreview>{};
+    for (final bundle in bundles) {
+      final preview = bundle.preview;
+      if (preview != null && disposed.add(preview)) preview.dispose();
     }
   }
 
@@ -934,34 +1037,66 @@ final class _LibraryPageState extends State<LibraryPage> {
       _busyTitle = '正在安全保存';
       _busyDetail = '文件正在加密并同步到云端，请稍候。';
       _uploadProgress = null;
+      _downloadProgress = null;
     });
+    BundlePreview? preview;
+    PreviewUnavailableReason? previewUnavailableReason;
+    var mediaType = 'application/octet-stream';
     try {
+      if (_generatePreview) {
+        final generated = await const PlatformPreviewGenerator().generate(
+          sourceFile,
+        );
+        switch (generated) {
+          case PreviewGenerated(
+            preview: final generatedPreview,
+            detectedSourceMediaType: final detected,
+          ):
+            preview = generatedPreview;
+            mediaType = detected;
+          case PreviewUnavailable(
+            reason: final reason,
+            detectedSourceMediaType: final detected,
+          ):
+            previewUnavailableReason = reason;
+            if (detected != null) mediaType = detected;
+        }
+      } else {
+        previewUnavailableReason = PreviewUnavailableReason.userDisabled;
+      }
       final identity = PublicIdentityRecord(
         spkiDer: record.spkiDer,
         recipientKeyId: record.recipientKeyId,
       ).toPublicIdentity();
       final client = http.Client();
+      late final CloudBundleUploadResult uploadResult;
       try {
-        await CloudBundleUploader(
-          credentialStore: _credentialStore,
-          client: client,
-          logger: widget.controller.logger,
-        ).upload(
-          input: FileBundleInput(sourceFile),
-          declaredLength: await sourceFile.length(),
-          options: BundleEncryptionOptions(
-            recipient: identity,
-            contentKind: SboxContentKind.file,
-            originalName: file.name.trim().isEmpty
-                ? p.basename(file.path)
-                : file.name,
-            mediaType: 'application/octet-stream',
-            title: file.name.trim().isEmpty ? p.basename(file.path) : file.name,
-            description: _descriptionController.text,
-          ),
-          configuration: configuration,
-          onProgress: _handleUploadProgress,
-        );
+        uploadResult =
+            await CloudBundleUploader(
+              credentialStore: _credentialStore,
+              client: client,
+              logger: widget.controller.logger,
+            ).upload(
+              input: FileBundleInput(sourceFile),
+              declaredLength: await sourceFile.length(),
+              options: BundleEncryptionOptions(
+                recipient: identity,
+                contentKind: SboxContentKind.file,
+                originalName: file.name.trim().isEmpty
+                    ? p.basename(file.path)
+                    : file.name,
+                mediaType: mediaType,
+                title: file.name.trim().isEmpty
+                    ? p.basename(file.path)
+                    : file.name,
+                description: _descriptionController.text,
+                preview: preview,
+                previewRequested: _generatePreview,
+                previewUnavailableReason: previewUnavailableReason,
+              ),
+              configuration: configuration,
+              onProgress: _handleUploadProgress,
+            );
       } finally {
         client.close();
       }
@@ -972,14 +1107,20 @@ final class _LibraryPageState extends State<LibraryPage> {
         _descriptionController.clear();
         _busy = false;
         _uploadProgress = null;
+        _downloadProgress = null;
       });
-      _showFeedback('文件已安全保存。');
+      _showFeedback(
+        uploadResult.previewEmbedded
+            ? '文件已安全保存，并已生成加密缩略图。'
+            : '文件已安全保存，但未生成缩略图（${_previewReasonLabel(uploadResult.previewUnavailableReason!)}）。',
+      );
       await _scan();
     } catch (error) {
       if (mounted) {
         setState(() {
           _busy = false;
           _uploadProgress = null;
+          _downloadProgress = null;
         });
         widget.controller.setError(error, operation: '安全保存文件失败');
         final message = error is SboxException
@@ -987,7 +1128,25 @@ final class _LibraryPageState extends State<LibraryPage> {
             : '发生未知错误，请稍后重试。';
         _showFeedback('上传失败：$message', error: true);
       }
+    } finally {
+      preview?.dispose();
     }
+  }
+
+  static String _previewReasonLabel(PreviewUnavailableReason reason) {
+    return switch (reason) {
+      PreviewUnavailableReason.userDisabled => '用户已关闭预览',
+      PreviewUnavailableReason.unsupportedMediaType => '格式不支持',
+      PreviewUnavailableReason.platformUnsupported => '当前平台不支持此媒体',
+      PreviewUnavailableReason.decodeFailed => '媒体解码失败',
+      PreviewUnavailableReason.encodeFailed => '缩略图编码失败',
+      PreviewUnavailableReason.timeout => '生成超时',
+      PreviewUnavailableReason.resourceLimit => '资源限制',
+      PreviewUnavailableReason.metadataCapacity => '元数据空间不足',
+      PreviewUnavailableReason.existingV30 => '复用旧版安全文件',
+      PreviewUnavailableReason.existingV31WithoutPreview => '复用的文件没有缩略图',
+      PreviewUnavailableReason.inputChanged => '输入文件发生变化',
+    };
   }
 
   void _handleUploadProgress(CloudBundleUploadProgress progress) {
@@ -1004,20 +1163,17 @@ final class _LibraryPageState extends State<LibraryPage> {
     });
   }
 
-  Future<void> _openRow(_FileRow row) async {
-    if (row.preview) {
-      _showFeedback('这是预览文件；完成云端备份后即可打开你的文件。');
-      return;
-    }
-    final bundle = row.bundle;
-    if (bundle == null) return;
-    if (bundle.manifest == null) {
-      final mnemonic = await _askMnemonic();
-      if (mnemonic == null || mnemonic.trim().isEmpty) return;
-      await _authenticate(bundle, mnemonic);
-      return;
-    }
-    await _open(bundle);
+  void _handleDownloadProgress(BundleDownloadProgress progress) {
+    if (!mounted) return;
+    setState(() {
+      _downloadProgress = progress;
+      _busyTitle = switch (progress.stage) {
+        BundleDownloadStage.preparing => '正在读取文件信息',
+        BundleDownloadStage.downloading => '正在下载加密文件',
+        BundleDownloadStage.decrypting => '正在校验并解密',
+      };
+      _busyDetail = progress.detailLabel;
+    });
   }
 
   Future<void> _decryptLocal(_FileRow row) async {
@@ -1025,7 +1181,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     if (bundle == null) return;
     final configuration = _configuration ?? await _configurationStore.load();
     if (configuration == null) {
-      _showFeedback('未找到本地加密备份，请使用下载并打开。');
+      _showFeedback('未找到本地加密备份，请使用下载并解密。');
       return;
     }
     final mnemonic = await _askMnemonic(title: '解密文件', actionLabel: '解密文件');
@@ -1035,6 +1191,7 @@ final class _LibraryPageState extends State<LibraryPage> {
       _busy = true;
       _busyTitle = '正在解密文件';
       _busyDetail = '正在从本地加密备份恢复文件，请稍候。';
+      _downloadProgress = null;
     });
     try {
       final source = await LocalDirectoryDataSource.attach(
@@ -1047,6 +1204,7 @@ final class _LibraryPageState extends State<LibraryPage> {
         rootPath: bundle.root.path,
         mnemonic: mnemonic,
         expectedIdentity: widget.controller.identityRecord?.toPublicIdentity(),
+        onProgress: _handleDownloadProgress,
       );
       final destination = await _cacheDecrypted(
         manifest: decrypted.manifest,
@@ -1055,6 +1213,7 @@ final class _LibraryPageState extends State<LibraryPage> {
       if (!mounted) return;
       setState(() {
         bundle.manifest = decrypted.manifest;
+        _adoptPreview(bundle, decrypted.preview);
         bundle.status = decrypted.status;
         bundle.plaintextFile = destination;
         bundle.encryptedBackupAvailable = true;
@@ -1066,7 +1225,12 @@ final class _LibraryPageState extends State<LibraryPage> {
         _showFeedback('文件暂时无法解密，请检查本地备份和恢复词。');
       }
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _downloadProgress = null;
+        });
+      }
     }
   }
 
@@ -1074,7 +1238,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     final bundle = row.bundle;
     final plaintext = bundle?.plaintextFile;
     if (bundle == null || plaintext == null) {
-      _showFeedback('本地明文不存在，请先解密文件或下载并打开。');
+      _showFeedback('本地明文不存在，请先解密文件或下载并解密。');
       return;
     }
     try {
@@ -1092,7 +1256,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     final bundle = row.bundle;
     final plaintext = bundle?.plaintextFile;
     if (bundle == null || plaintext == null) {
-      _showFeedback('本地明文不存在，请先解密文件或下载并打开。');
+      _showFeedback('本地明文不存在，请先解密文件或下载并解密。');
       return;
     }
     try {
@@ -1106,20 +1270,28 @@ final class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
-  Future<void> _authenticate(_LibraryBundle bundle, String mnemonic) async {
+  Future<void> _downloadAndDecrypt(_FileRow row) async {
+    final bundle = row.bundle;
+    if (bundle == null) return;
+    final mnemonic = await _askMnemonic(
+      title: '下载并解密文件',
+      actionLabel: '下载并解密',
+    );
+    if (mnemonic == null || mnemonic.trim().isEmpty) return;
+    if (!mounted) return;
     setState(() {
       _busy = true;
-      _busyTitle = '正在准备文件';
-      _busyDetail = '正在验证文件并准备打开。';
+      _busyTitle = '正在下载并解密';
+      _busyDetail = '正在下载、校验并保存解密后的文件，请稍候。';
+      _downloadProgress = null;
     });
     try {
-      // A headerOnly bundle is opened only after explicit user action. Full
-      // decryption authenticates the unique Header Manifest and every record
-      // before this UI receives or publishes plaintext.
       final decrypted = await BundleSync.fetchAndDecrypt(
         source: bundle.source,
         rootPath: bundle.root.path,
         mnemonic: mnemonic,
+        expectedIdentity: widget.controller.identityRecord?.toPublicIdentity(),
+        onProgress: _handleDownloadProgress,
       );
       final destination = await _cacheDecrypted(
         manifest: decrypted.manifest,
@@ -1128,74 +1300,24 @@ final class _LibraryPageState extends State<LibraryPage> {
       if (!mounted) return;
       setState(() {
         bundle.manifest = decrypted.manifest;
+        _adoptPreview(bundle, decrypted.preview);
         bundle.status = decrypted.status;
         bundle.plaintextFile = destination;
-        _busy = false;
       });
-      await FileOpener.open(destination);
-      _showFeedback('文件已准备好。');
+      _showFeedback('文件已下载并解密，可以打开文件或文件夹。');
     } catch (error) {
       if (mounted) {
-        setState(() => _busy = false);
-        widget.controller.setError(error, operation: '准备文件失败');
-        _showFeedback('文件暂时无法打开，请检查恢复词后重试。');
-      }
-    }
-  }
-
-  Future<void> _open(_LibraryBundle bundle) async {
-    final manifest = bundle.manifest;
-    if (manifest == null) return;
-    setState(() {
-      _busy = true;
-      _busyTitle = '正在准备文件';
-      _busyDetail = '正在确认文件完整性。';
-    });
-    try {
-      // Cached plaintext is only a performance hint. Re-read the current
-      // root and perform RSA/root-record authentication for every open.
-      final mnemonic = await _askMnemonic(
-        title: '重新验证文件',
-        actionLabel: '下载并打开',
-      );
-      if (mnemonic == null || mnemonic.trim().isEmpty) return;
-      final destination = await _ensurePlaintext(
-        bundle: bundle,
-        mnemonic: mnemonic,
-      );
-      if (mounted) {
-        bundle.plaintextFile = destination;
-        bundle.status = BundleTrustStatus.complete;
-      }
-      await FileOpener.open(destination);
-      if (mounted) _showFeedback('文件已打开。');
-    } catch (error) {
-      if (mounted) {
-        widget.controller.setError(error, operation: '打开文件失败');
-        _showFeedback('文件暂时无法打开，请稍后重试。');
+        widget.controller.setError(error, operation: '下载并解密文件失败');
+        _showFeedback('文件暂时无法下载并解密，请检查恢复词后重试。', error: true);
       }
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _downloadProgress = null;
+        });
+      }
     }
-  }
-
-  Future<File> _ensurePlaintext({
-    required _LibraryBundle bundle,
-    required String mnemonic,
-  }) async {
-    // Do not construct a path from the fast, SPKI-readable Manifest. The
-    // authenticated Manifest returned by full decryption is the first value
-    // allowed to determine the managed plaintext path.
-    final decrypted = await BundleSync.fetchAndDecrypt(
-      source: bundle.source,
-      rootPath: bundle.root.path,
-      mnemonic: mnemonic,
-      expectedIdentity: widget.controller.identityRecord?.toPublicIdentity(),
-    );
-    return _cacheDecrypted(
-      manifest: decrypted.manifest,
-      plaintext: decrypted.plaintext,
-    );
   }
 
   Future<File> _cacheDecrypted({
@@ -1224,6 +1346,14 @@ final class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
+  static void _adoptPreview(_LibraryBundle bundle, BundlePreview? preview) {
+    if (preview == null) return;
+    final previous = bundle.preview;
+    if (previous != null && !identical(previous, preview)) previous.dispose();
+    bundle.preview = preview;
+    bundle.hasPreview = true;
+  }
+
   Future<String?> _askMnemonic({
     String title = '验证文件',
     String actionLabel = '打开',
@@ -1238,7 +1368,7 @@ final class _LibraryPageState extends State<LibraryPage> {
             controller: input,
             autofocus: true,
             obscureText: true,
-            maxLines: 2,
+            maxLines: 1,
             decoration: const InputDecoration(labelText: '输入 12 个恢复词'),
           ),
           actions: <Widget>[
@@ -1271,14 +1401,19 @@ final class _LibraryPageState extends State<LibraryPage> {
       );
   }
 
-  static String _formatBytes(int bytes) {
-    if (bytes >= 1024 * 1024 * 1024) {
-      return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GiB';
+  static String _formatBytes(BigInt bytes) {
+    final kib = BigInt.from(1024);
+    final mib = kib * kib;
+    final gib = mib * kib;
+    if (bytes >= gib) {
+      return '${(bytes.toDouble() / gib.toDouble()).toStringAsFixed(2)} GiB';
     }
-    if (bytes >= 1024 * 1024) {
-      return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MiB';
+    if (bytes >= mib) {
+      return '${(bytes.toDouble() / mib.toDouble()).toStringAsFixed(2)} MiB';
     }
-    if (bytes >= 1024) return '${(bytes / 1024).toStringAsFixed(1)} KiB';
+    if (bytes >= kib) {
+      return '${(bytes.toDouble() / kib.toDouble()).toStringAsFixed(1)} KiB';
+    }
     return '$bytes B';
   }
 
@@ -1409,20 +1544,6 @@ final class _UploadFolderIcon extends StatelessWidget {
   }
 }
 
-final class _PreviewFile {
-  const _PreviewFile({
-    required this.name,
-    required this.time,
-    required this.type,
-    required this.color,
-  });
-
-  final String name;
-  final String time;
-  final String type;
-  final Color color;
-}
-
 final class _FileRow {
   const _FileRow({
     required this.name,
@@ -1431,7 +1552,7 @@ final class _FileRow {
     required this.color,
     required this.actionState,
     this.bundle,
-    this.preview = false,
+    this.thumbnail,
   });
 
   final String name;
@@ -1440,7 +1561,7 @@ final class _FileRow {
   final Color color;
   final _FileActionState actionState;
   final _LibraryBundle? bundle;
-  final bool preview;
+  final BundlePreview? thumbnail;
 }
 
 final class _LibraryBundle {
@@ -1449,13 +1570,17 @@ final class _LibraryBundle {
     required this.source,
     required this.sourceName,
     this.manifest,
+    this.preview,
+    bool? hasPreview,
     this.status = BundleTrustStatus.headerOnly,
-  });
+  }) : hasPreview = hasPreview ?? preview != null;
 
   final ListedBundleRoot root;
   final DataSource source;
   final String sourceName;
   BundleManifest? manifest;
+  BundlePreview? preview;
+  bool hasPreview;
   BundleTrustStatus status;
   File? plaintextFile;
   bool encryptedBackupAvailable = false;

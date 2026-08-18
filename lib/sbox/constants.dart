@@ -14,7 +14,12 @@ abstract final class SboxProtocol {
   ]);
 
   static const int versionMajor = 3;
+  /// Kept as the legacy v3.0 alias for source compatibility. New writers
+  /// select [SboxVersion.v31] explicitly.
   static const int versionMinor = 0;
+  static const int versionMinorV30 = 0;
+  static const int versionMinorV31 = 1;
+  static const int currentVersionMinor = versionMinorV31;
   static const int commonHeaderLength = 128;
   static const int rootHeaderLength = 16992;
   static const int wrappedBundleDekOffset = commonHeaderLength;
@@ -28,7 +33,12 @@ abstract final class SboxProtocol {
   static const int metadataSaltLength = 32;
   static const int metadataNonceLength = 12;
   static const int metadataAadPrefixLength = 16;
+  /// Legacy v3.0 Metadata Block format. New writers use
+  /// [metadataFormatIdV31].
   static const int metadataFormatId = 1;
+  static const int metadataFormatIdV30 = 1;
+  static const int metadataFormatIdV31 = 2;
+  static const int currentMetadataFormatId = metadataFormatIdV31;
   static const int metadataKdfAlgorithm = 1;
   static const int metadataAeadAlgorithm = 1;
   static const int metadataFlags = 0;
@@ -63,6 +73,13 @@ abstract final class SboxProtocol {
   static const int maxTagBytes = 64;
   static const int maxCandidateObjects = 100000;
   static const int defaultMaxParallelTransfers = 4;
+  static const int previewRecordVersion = 1;
+  static const int previewCodecBaselineJpeg = 1;
+  static const int previewDescriptorLength = 24;
+  static const int maxPreviewBytes = 10 * 1024;
+  static const int maxPreviewDimension = 320;
+  static const int maxPreviewPixels = 320 * 320;
+  static const int maxRetainedPreviewBytes = 32 * 1024 * 1024;
 }
 
 enum SboxContentKind {

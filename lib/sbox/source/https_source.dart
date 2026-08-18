@@ -3,8 +3,8 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
-import '../../app/app_logger.dart';
 import '../errors.dart';
+import '../logging.dart';
 import 'data_source.dart';
 import 'remote_config.dart';
 import 'remote_http.dart';
@@ -16,7 +16,7 @@ final class HttpsReadOnlyDataSource implements RangeReadableDataSource {
   HttpsReadOnlyDataSource({
     required this.config,
     required http.Client client,
-    AppLogger? logger,
+    SboxLogger? logger,
   }) : _http = RemoteHttp(client, logger: logger, sourceName: 'HTTPS 数据源');
 
   final HttpsSourceConfig config;

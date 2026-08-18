@@ -1,17 +1,23 @@
 import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
-import '../../app/app_logger.dart';
 import '../bytes.dart';
 import '../constants.dart';
 import '../engine/background_bundle_crypto.dart';
 import '../engine/bundle_encryptor.dart';
 import '../engine/bundle_planner.dart';
+import '../engine/bundle_probe.dart';
 import '../errors.dart';
 import '../format/bundle_header.dart';
 import '../format/bundle_path.dart';
+import '../format/metadata_block.dart';
+import '../format/sbox_version.dart';
+import '../../platform/preview_generation_result.dart';
+import '../logging.dart';
 import 'cloud_backup_config.dart';
 import 'credential.dart';
 import 'data_source.dart';
@@ -94,12 +100,22 @@ final class CloudBundleUploadResult {
     required this.objectNames,
     required this.duplicate,
     required this.uploadedSources,
-  });
+    required this.previewRequested,
+    required this.previewEmbedded,
+    required this.previewUnavailableReason,
+  }) : assert(
+         previewEmbedded
+             ? previewUnavailableReason == null
+             : previewUnavailableReason != null,
+       );
 
   final String bundleId;
   final List<String> objectNames;
   final bool duplicate;
   final List<String> uploadedSources;
+  final bool previewRequested;
+  final bool previewEmbedded;
+  final PreviewUnavailableReason? previewUnavailableReason;
 
   String get rootObjectName => objectNames.firstWhere(
     (name) => parseCanonicalBundleBasename(name).shardIndex == 0,
@@ -107,8 +123,12 @@ final class CloudBundleUploadResult {
 }
 
 /// Hashes, de-duplicates, encrypts and publishes one file through both
-/// repository APIs. CPU-heavy work is delegated to background isolates and
-/// continuation shards are transferred with bounded parallelism.
+/// repository APIs. CPU-heavy work is delegated to background isolates.
+///
+/// Each repository's Contents API advances one Git branch head per write, so
+/// shard publication must be serial within a source. GitHub explicitly
+/// rejects concurrent contents writes with a branch-level conflict even when
+/// the shard paths are different.
 final class CloudBundleUploader {
   CloudBundleUploader({
     required this._credentialStore,
@@ -135,7 +155,7 @@ final class CloudBundleUploader {
   final CredentialStore _credentialStore;
   final http.Client _client;
   final BundleEncryptor? _encryptor;
-  final AppLogger? _logger;
+  final SboxLogger? _logger;
   final int maxShardUploadRetries;
   final Duration retryBaseDelay;
 
@@ -201,6 +221,11 @@ final class CloudBundleUploader {
       ]);
       final githubObjects = remoteObjects[0];
       final giteeObjects = remoteObjects[1];
+      await _assertRemoteSourcesAgree(
+        github,
+        gitee,
+        githubObjects.intersection(giteeObjects),
+      );
       final githubComplete = githubObjects.length == expected.length;
       final giteeComplete = giteeObjects.length == expected.length;
       progress
@@ -211,6 +236,16 @@ final class CloudBundleUploader {
       final root = Directory(configuration.backupDirectory);
       var localObjects = await _localObjects(root, expected);
       var localComplete = localObjects.length == expected.length;
+      await _assertRemoteMatchesLocal(
+        source: github,
+        root: root,
+        names: githubObjects.intersection(localObjects),
+      );
+      await _assertRemoteMatchesLocal(
+        source: gitee,
+        root: root,
+        names: giteeObjects.intersection(localObjects),
+      );
 
       if (!localComplete && (githubComplete || giteeComplete)) {
         final mirror = githubComplete ? github : gitee;
@@ -226,14 +261,10 @@ final class CloudBundleUploader {
 
       var created = false;
       if (!localComplete) {
-        final remotePartial =
-            githubObjects.isNotEmpty || giteeObjects.isNotEmpty;
-        if (remotePartial) {
-          throw const SboxException(
-            SboxErrorCode.immutableConflict,
-            'A partial Bundle with the same MD5 already exists remotely',
-          );
-        }
+        // A remote partial Bundle is resumable when the local encryption can
+        // reproduce its existing objects.  Do not reject it before preparing
+        // the local objects: _publishDirectory already excludes objects that
+        // are present remotely and can continue with the missing shards.
         if (_encryptor == null && BackgroundBundleCrypto.supportsInput(input)) {
           await BackgroundBundleCrypto.encryptToDirectory(
             input: input,
@@ -257,6 +288,24 @@ final class CloudBundleUploader {
         throw const SboxException(
           SboxErrorCode.storageOverlap,
           'The local encrypted Bundle is incomplete',
+        );
+      }
+
+      // If encryption had to be recreated, validate the remote partial
+      // objects before treating their names as completed.  The Bundle ID is
+      // the plaintext MD5, while encrypted bytes also contain fresh random
+      // material; same-name objects with different bytes must never be mixed
+      // into one Bundle.
+      if (created) {
+        await _assertRemoteMatchesLocal(
+          source: github,
+          root: root,
+          names: githubObjects.intersection(localObjects),
+        );
+        await _assertRemoteMatchesLocal(
+          source: gitee,
+          root: root,
+          names: giteeObjects.intersection(localObjects),
         );
       }
 
@@ -311,14 +360,163 @@ final class CloudBundleUploader {
         ),
       ]);
       progress.emit(stage: CloudBundleUploadStage.completed);
+      final previewOutcome = await _readPreviewOutcome(
+        root: root,
+        rootObjectName: objectNames.firstWhere(
+          (name) => parseCanonicalBundleBasename(name).shardIndex == 0,
+        ),
+        options: effectiveOptions,
+        reused: !created,
+      );
       return CloudBundleUploadResult(
         bundleId: bundleId,
         objectNames: List.unmodifiable(objectNames),
         duplicate: !created,
         uploadedSources: List.unmodifiable(uploadedSources),
+        previewRequested: effectiveOptions.wantsPreview,
+        previewEmbedded: previewOutcome.embedded,
+        previewUnavailableReason: previewOutcome.reason,
       );
     } finally {
       md5.fillRange(0, md5.length, 0);
+    }
+  }
+
+  Future<void> _assertRemoteSourcesAgree(
+    EnumerableDataSource left,
+    EnumerableDataSource right,
+    Iterable<String> names,
+  ) async {
+    for (final name in names) {
+      final leftRead = await left.get(SourcePath(name));
+      final rightRead = await right.get(SourcePath(name));
+      final leftHash = await _hashSourceRead(leftRead);
+      final rightHash = await _hashSourceRead(rightRead);
+      try {
+        if (leftRead.length != rightRead.length ||
+            !constantTimeBytesEqual(leftHash, rightHash)) {
+          throw const SboxException(
+            SboxErrorCode.immutableConflict,
+            '双云存在相同路径但字节不同的不可变对象',
+          );
+        }
+      } finally {
+        leftHash.fillRange(0, leftHash.length, 0);
+        rightHash.fillRange(0, rightHash.length, 0);
+      }
+    }
+  }
+
+  Future<void> _assertRemoteMatchesLocal({
+    required EnumerableDataSource source,
+    required Directory root,
+    required Iterable<String> names,
+  }) async {
+    for (final name in names) {
+      final local = File(p.join(root.path, name));
+      if (await FileSystemEntity.type(local.path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        continue;
+      }
+      final remote = await source.get(SourcePath(name));
+      final localLength = await local.length();
+      final localHash = await BackgroundBundleCrypto.sha256File(local);
+      final remoteHash = await _hashSourceRead(remote);
+      try {
+        if (localLength != remote.length ||
+            !constantTimeBytesEqual(localHash, remoteHash)) {
+          throw const SboxException(
+            SboxErrorCode.immutableConflict,
+            '本地与远端存在相同路径但字节不同的不可变对象',
+          );
+        }
+      } finally {
+        localHash.fillRange(0, localHash.length, 0);
+        remoteHash.fillRange(0, remoteHash.length, 0);
+      }
+    }
+  }
+
+  Future<Uint8List> _hashSourceRead(SourceRead read) async {
+    final accumulator = HashDigestSink();
+    final sink = crypto.sha256.startChunkedConversion(accumulator);
+    var count = 0;
+    await for (final chunk in read.body) {
+      count += chunk.length;
+      if (count > read.length) {
+        throw const SboxException(
+          SboxErrorCode.remoteChanged,
+          '远端对象超过声明长度',
+        );
+      }
+      sink.add(chunk);
+    }
+    if (count != read.length) {
+      throw const SboxException(
+        SboxErrorCode.remoteChanged,
+        '远端对象长度不一致',
+      );
+    }
+    sink.close();
+    return Uint8List.fromList(accumulator.value.bytes);
+  }
+
+  Future<_PreviewOutcome> _readPreviewOutcome({
+    required Directory root,
+    required String rootObjectName,
+    required BundleEncryptionOptions options,
+    required bool reused,
+  }) async {
+    final rootFile = File(p.join(root.path, rootObjectName));
+    final headerBytes = await _readHeader(rootFile);
+    final header = BundleHeader.parse(headerBytes);
+    validateBundlePathAgainstHeader(rootObjectName, header);
+    if (header.version == SboxVersion.v30) {
+      return const _PreviewOutcome(
+        embedded: false,
+        reason: PreviewUnavailableReason.existingV30,
+      );
+    }
+
+    final result = await BundleProbe.readMetadata(
+      basename: rootObjectName,
+      objectPrefix: headerBytes,
+      identity: options.recipient,
+    );
+    try {
+      if (result.preview != null) {
+        return const _PreviewOutcome(embedded: true);
+      }
+      if (reused) {
+        return const _PreviewOutcome(
+          embedded: false,
+          reason: PreviewUnavailableReason.existingV31WithoutPreview,
+        );
+      }
+      if (options.preview != null) {
+        final manifestBytes = result.manifest!.encode();
+        try {
+          if (options.preview!.encodedLength >
+              MetadataBlockCodec.previewCapacity(manifestBytes.length)) {
+            return const _PreviewOutcome(
+              embedded: false,
+              reason: PreviewUnavailableReason.metadataCapacity,
+            );
+          }
+        } finally {
+          manifestBytes.fillRange(0, manifestBytes.length, 0);
+        }
+      }
+      return _PreviewOutcome(
+        embedded: false,
+        reason:
+            options.previewUnavailableReason ??
+            (options.wantsPreview
+                ? PreviewUnavailableReason.encodeFailed
+                : PreviewUnavailableReason.userDisabled),
+      );
+    } finally {
+      result.preview?.dispose();
     }
   }
 
@@ -349,7 +547,7 @@ final class CloudBundleUploader {
     } on SboxException catch (error) {
       _logger?.warning(
         '$sourceName: listing failed',
-        detail: AppLogger.describeError(error),
+        detail: describeSboxError(error),
       );
       throw SboxException(error.code, '$sourceName: ${error.message}');
     } on Object catch (error) {
@@ -472,19 +670,19 @@ final class CloudBundleUploader {
             .where((name) => name != rootName)
             .toList(growable: false);
 
-        // Continuations are independent immutable objects. Publish them in
-        // parallel, then publish the root as the final Bundle commit marker.
-        await _parallelForEach(
-          continuations,
-          maxParallel: source.capabilities.maxParallelTransfers,
-          action: (name) => _publishObject(
+        // Continuations are independent immutable objects at the path level,
+        // but each Contents API write also advances the same repository
+        // branch. Publish them serially, then publish the root as the final
+        // Bundle commit marker.
+        for (final name in continuations) {
+          await _publishObject(
             source: source,
             root: root,
             name: name,
             sourceName: sourceName,
             progress: progress,
-          ),
-        );
+          );
+        }
         if (rootName != null) {
           await _publishObject(
             source: source,
@@ -518,7 +716,7 @@ final class CloudBundleUploader {
     } on SboxException catch (error) {
       _logger?.warning(
         '$sourceName: publish failed',
-        detail: AppLogger.describeError(error),
+        detail: describeSboxError(error),
       );
       throw SboxException(error.code, '$sourceName: ${error.message}');
     } on Object catch (error) {
@@ -578,6 +776,24 @@ final class CloudBundleUploader {
           return;
         } on Object catch (error) {
           lastError = error;
+          if (error is SboxException &&
+              error.code == SboxErrorCode.immutableConflict &&
+              await _remoteObjectMatchesFile(
+                source: source,
+                name: name,
+                length: length,
+                expectedHash: digest,
+              )) {
+            // A concurrent or resumed upload may have published this exact
+            // shard after the listing. It is already complete, so advance
+            // progress and continue with the next pending shard.
+            progress.completed(
+              sourceName,
+              shardIndex: shard.shardIndex,
+              attempt: attempt,
+            );
+            return;
+          }
           if (retry >= maxShardUploadRetries || !_shouldRetry(error)) {
             throw _shardUploadError(
               shard,
@@ -587,7 +803,7 @@ final class CloudBundleUploader {
           }
           _logger?.warning(
             '$sourceName: shard upload failed; retrying',
-            detail: AppLogger.describeError(error),
+            detail: describeSboxError(error),
           );
           await _waitBeforeRetry(retry);
         }
@@ -599,6 +815,32 @@ final class CloudBundleUploader {
       );
     } finally {
       digest.fillRange(0, digest.length, 0);
+    }
+  }
+
+  Future<bool> _remoteObjectMatchesFile({
+    required DataSource source,
+    required String name,
+    required int length,
+    required Uint8List expectedHash,
+  }) async {
+    try {
+      final remote = await source.get(SourcePath(name));
+      final remoteHash = await _hashSourceRead(remote);
+      try {
+        return remote.length == length &&
+            constantTimeBytesEqual(remoteHash, expectedHash);
+      } finally {
+        remoteHash.fillRange(0, remoteHash.length, 0);
+      }
+    } on SboxException catch (error) {
+      // The object may not have been committed yet. Any other read failure
+      // is treated as "not confirmed" and the original upload error remains
+      // authoritative.
+      if (error.code == SboxErrorCode.sourceNotFound) return false;
+      return false;
+    } on Object {
+      return false;
     }
   }
 
@@ -620,6 +862,9 @@ final class CloudBundleUploader {
       createdAt: options.createdAt,
       targetNominalShardPlaintextSize: options.targetNominalShardPlaintextSize,
       maxObjectBytes: maxObjectBytes,
+      preview: options.preview,
+      previewRequested: options.previewRequested,
+      previewUnavailableReason: options.previewUnavailableReason,
       randomness: options.randomness,
     );
   }
@@ -713,6 +958,13 @@ final class CloudBundleUploader {
       );
     }
   }
+}
+
+final class _PreviewOutcome {
+  const _PreviewOutcome({required this.embedded, this.reason});
+
+  final bool embedded;
+  final PreviewUnavailableReason? reason;
 }
 
 final class _UploadProgressReporter {

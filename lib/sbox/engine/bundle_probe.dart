@@ -8,7 +8,8 @@ import '../errors.dart';
 import '../format/bundle_header.dart';
 import '../format/bundle_manifest.dart';
 import '../format/bundle_path.dart';
-import '../format/manifest_block.dart';
+import '../format/bundle_preview.dart';
+import '../format/metadata_block.dart';
 import '../identity/rsa_models.dart';
 
 enum BundleTrustStatus { headerOnly, metadataReadable, rootAuthenticated, complete }
@@ -18,13 +19,17 @@ final class BundleProbeResult {
     required this.basename,
     required this.header,
     this.manifest,
+    this.metadata,
     this.status = BundleTrustStatus.headerOnly,
   });
 
   final String basename;
   final BundleHeader header;
   final BundleManifest? manifest;
+  final BundleMetadata? metadata;
   final BundleTrustStatus status;
+
+  BundlePreview? get preview => metadata?.preview;
 
   bool get manifestAuthenticated =>
       status.index >= BundleTrustStatus.metadataReadable.index;
@@ -54,7 +59,7 @@ abstract final class BundleProbe {
   /// Reads the only persistent Manifest from a complete root header using a
   /// persisted public identity. No file records, RSA private operation or
   /// mnemonic are required.
-  static Future<BundleProbeResult> readManifest({
+  static Future<BundleProbeResult> readMetadata({
     required String basename,
     required List<int> objectPrefix,
     required PublicIdentity identity,
@@ -76,7 +81,6 @@ abstract final class BundleProbe {
 
     Uint8List? metadataKey;
     Uint8List? block;
-    Uint8List? manifestBytes;
     try {
       metadataKey = MetadataKdf.derive(
         spkiDer: identity.spkiDer,
@@ -94,27 +98,40 @@ abstract final class BundleProbe {
           result.header.rawBytes.sublist(0, SboxProtocol.metadataAadHeaderLength),
         ),
       );
-      manifestBytes = ManifestBlock.unpack(block);
-      final manifest = BundleManifest.parse(manifestBytes);
+      final metadata = MetadataBlockCodec.unpack(
+        block,
+        formatId: result.header.metadataFormatId,
+      );
+      final manifest = metadata.manifest;
       manifest.validateAgainstHeader(result.header);
       return BundleProbeResult(
         basename: basename,
         header: result.header,
         manifest: manifest,
+        metadata: metadata,
         status: BundleTrustStatus.metadataReadable,
       );
     } finally {
       metadataKey?.fillRange(0, metadataKey.length, 0);
       block?.fillRange(0, block.length, 0);
-      manifestBytes?.fillRange(0, manifestBytes.length, 0);
     }
   }
+
+  static Future<BundleProbeResult> readManifest({
+    required String basename,
+    required List<int> objectPrefix,
+    required PublicIdentity identity,
+  }) => readMetadata(
+    basename: basename,
+    objectPrefix: objectPrefix,
+    identity: identity,
+  );
 
   static Future<BundleProbeResult> readFastManifest({
     required String basename,
     required List<int> objectPrefix,
     required PublicIdentity identity,
-  }) => readManifest(
+  }) => readMetadata(
     basename: basename,
     objectPrefix: objectPrefix,
     identity: identity,
@@ -124,7 +141,7 @@ abstract final class BundleProbe {
     required String basename,
     required List<int> objectPrefix,
     required PublicIdentity identity,
-  }) => readManifest(
+  }) => readMetadata(
     basename: basename,
     objectPrefix: objectPrefix,
     identity: identity,

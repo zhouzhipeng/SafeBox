@@ -56,12 +56,16 @@ class SboxTopBar extends StatelessWidget {
     required this.mobile,
     this.onFilesTap,
     this.onSettingsTap,
+    this.filesSelected = false,
+    this.settingsSelected = false,
     this.firstUse = false,
   });
 
   final bool mobile;
   final VoidCallback? onFilesTap;
   final VoidCallback? onSettingsTap;
+  final bool filesSelected;
+  final bool settingsSelected;
   final bool firstUse;
 
   @override
@@ -92,10 +96,23 @@ class SboxTopBar extends StatelessWidget {
                 onPressed: onFilesTap,
                 tooltip: '文件',
                 icon: const Icon(Icons.folder_outlined),
-                color: SboxColors.textMuted,
+                color: filesSelected ? SboxColors.accent : SboxColors.textMuted,
                 iconSize: 28,
                 padding: const EdgeInsets.all(10),
                 constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+                style: IconButton.styleFrom(
+                  backgroundColor: filesSelected
+                      ? SboxColors.accent.withValues(alpha: 0.14)
+                      : Colors.transparent,
+                  side: filesSelected
+                      ? BorderSide(
+                          color: SboxColors.accent.withValues(alpha: 0.42),
+                        )
+                      : BorderSide.none,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
               ),
               const SizedBox(width: 12),
             ],
@@ -104,10 +121,25 @@ class SboxTopBar extends StatelessWidget {
                 onPressed: onSettingsTap,
                 tooltip: '设置',
                 icon: const Icon(Icons.settings_outlined),
-                color: SboxColors.textMuted,
+                color: settingsSelected
+                    ? SboxColors.accent
+                    : SboxColors.textMuted,
                 iconSize: 28,
                 padding: const EdgeInsets.all(10),
                 constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+                style: IconButton.styleFrom(
+                  backgroundColor: settingsSelected
+                      ? SboxColors.accent.withValues(alpha: 0.14)
+                      : Colors.transparent,
+                  side: settingsSelected
+                      ? BorderSide(
+                          color: SboxColors.accent.withValues(alpha: 0.42),
+                        )
+                      : BorderSide.none,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
               ),
             ],
           ],
