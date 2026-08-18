@@ -1,6 +1,6 @@
 import '../bytes.dart';
-import '../constants.dart';
 import 'hmac_drbg.dart';
+import 'rsa_identity_profile1.dart';
 import 'rsa_models.dart';
 
 final class DeterministicRsa3072Generator {
@@ -8,17 +8,21 @@ final class DeterministicRsa3072Generator {
 
   final HmacDrbgSha256 _drbg;
 
-  static final BigInt _publicExponent = BigInt.from(SboxV1.rsaPublicExponent);
-  static final BigInt _upperBound = BigInt.one << SboxV1.rsaPrimeBits;
+  static final BigInt _publicExponent = BigInt.from(
+    RsaIdentityProfile1.publicExponent,
+  );
+  static final BigInt _upperBound = BigInt.one << RsaIdentityProfile1.primeBits;
   static final BigInt _lowerBound = _calculateLowerBound();
   static final BigInt _minimumPrimeDifference = BigInt.one << 1436;
   static final List<int> _trialPrimes = _sieveOddPrimes(65521);
 
   RsaGenerationResult generate() {
     for (var outerAttempt = 1; outerAttempt <= 16; outerAttempt++) {
-      final pResult = _generatePrime(maxCandidates: 5 * SboxV1.rsaBits);
+      final pResult = _generatePrime(
+        maxCandidates: 5 * RsaIdentityProfile1.rsaBits,
+      );
       final qResult = _generatePrime(
-        maxCandidates: 10 * SboxV1.rsaBits,
+        maxCandidates: 10 * RsaIdentityProfile1.rsaBits,
         otherPrime: pResult.prime,
       );
 
@@ -26,7 +30,7 @@ final class DeterministicRsa3072Generator {
       var q = qResult.prime;
       final lambda = _lcm(p - BigInt.one, q - BigInt.one);
       final d = _publicExponent.modInverse(lambda);
-      if (d <= (BigInt.one << SboxV1.rsaPrimeBits)) {
+      if (d <= (BigInt.one << RsaIdentityProfile1.primeBits)) {
         continue;
       }
 
@@ -37,7 +41,7 @@ final class DeterministicRsa3072Generator {
       }
 
       final modulus = p * q;
-      if (modulus.bitLength != SboxV1.rsaBits) {
+      if (modulus.bitLength != RsaIdentityProfile1.rsaBits) {
         throw StateError('Deterministic RSA modulus has an invalid bit length');
       }
       if ((_publicExponent * d) % lambda != BigInt.one) {
@@ -226,7 +230,7 @@ final class DeterministicRsa3072Generator {
   }
 
   static BigInt _calculateLowerBound() {
-    final radicand = BigInt.one << 3071;
+    final radicand = BigInt.one << (RsaIdentityProfile1.rsaBits - 1);
     final floor = integerSquareRoot(radicand);
     return floor * floor == radicand ? floor : floor + BigInt.one;
   }

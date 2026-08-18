@@ -188,18 +188,18 @@ final class RsaOaepSha256 {
     return (blindedMessage * blindingFactor.modInverse(modulus)) % modulus;
   }
 
-  static Uint8List buildDekLabel({
-    required List<int> fileId,
+  static Uint8List buildBundleDekLabel({
+    required List<int> bundleId,
     required List<int> recipientKeyId,
   }) {
-    if (fileId.length != SboxV1.fileIdLength ||
-        recipientKeyId.length != SboxV1.recipientKeyIdLength) {
+    if (bundleId.length != SboxProtocol.bundleIdLength ||
+        recipientKeyId.length != SboxProtocol.recipientKeyIdLength) {
       throw ArgumentError('Invalid SBOX OAEP label component length');
     }
     return concatBytes(<List<int>>[
-      asciiBytes(SboxV1.oaepLabelPrefix),
+      asciiBytes('SBOX-v2-bundle-DEK'),
       const <int>[0],
-      fileId,
+      bundleId,
       recipientKeyId,
     ]);
   }

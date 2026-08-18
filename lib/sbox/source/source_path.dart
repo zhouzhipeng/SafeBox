@@ -1,15 +1,12 @@
-import 'package:path/path.dart' as p;
-
 import '../errors.dart';
 
-/// A validated, NFC-independent ASCII protocol path relative to a data-source
-/// root. It can never represent an absolute path or traversal.
+/// An untrusted data-source path reduced to one canonical ASCII basename.
 final class SourcePath {
   SourcePath(String value) : value = _validate(value);
 
   final String value;
 
-  List<String> get segments => value.split('/');
+  List<String> get segments => <String>[value];
 
   @override
   bool operator ==(Object other) => other is SourcePath && other.value == value;
@@ -21,33 +18,20 @@ final class SourcePath {
   String toString() => value;
 
   static String _validate(String input) {
-    var containsEncodedBypass = true;
-    try {
-      containsEncodedBypass = Uri.decodeComponent(input) != input;
-    } on FormatException {
-      containsEncodedBypass = true;
-    }
     if (input.isEmpty ||
-        input.startsWith('/') ||
-        input.endsWith('/') ||
+        input.length > 255 ||
+        input.codeUnits.any((unit) => unit < 0x20 || unit > 0x7e) ||
+        RegExp(r'[<>:"|?*]').hasMatch(input) ||
+        input.contains('/') ||
         input.contains('\\') ||
         input.contains('\u0000') ||
-        containsEncodedBypass) {
-      throw _pathError();
-    }
-    final segments = input.split('/');
-    if (segments.any(
-      (segment) => segment.isEmpty || segment == '.' || segment == '..',
-    )) {
-      throw _pathError();
-    }
-    final platformNormalized = p.posix.normalize(input);
-    if (platformNormalized != input || p.posix.isAbsolute(input)) {
-      throw _pathError();
+        input.contains('%') ||
+        input.endsWith('.') ||
+        input.endsWith(' ') ||
+        input == '.' ||
+        input == '..') {
+      throw const SboxException(SboxErrorCode.invalidHeader, '数据源对象路径无效');
     }
     return input;
   }
-
-  static SboxException _pathError() =>
-      const SboxException(SboxErrorCode.catalog, '数据源相对路径无效');
 }

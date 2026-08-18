@@ -8,7 +8,7 @@ final class SourceConfigurationStore {
   SourceConfigurationStore({SharedPreferences? preferences})
     : _providedPreferences = preferences;
 
-  static const String _storageKey = 'sbox.v1.source_configurations';
+  static const String _storageKey = 'sbox.v2.source_configurations';
   final SharedPreferences? _providedPreferences;
 
   Future<List<SourceConfiguration>> loadAll() async {

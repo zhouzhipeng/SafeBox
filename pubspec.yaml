@@ -1,5 +1,5 @@
 name: safebox
-description: Cross-platform SBOX v1 encrypted file vault.
+description: Cross-platform SBOX 2.0 encrypted Bundle client.
 publish_to: none
 version: 1.0.0+1
 
@@ -12,20 +12,15 @@ dependencies:
   asn1lib: 1.6.5
   bip39: 1.0.6
   convert: 3.1.2
-  connectivity_plus: 7.3.1
   crypto: 3.0.7
   cryptography: 2.9.0
   desktop_drop: 0.7.1
   file_selector: 1.1.0
   flutter_secure_storage: 11.0.0
   http: 1.6.0
-  intl: 0.20.3
-  mime: 2.0.0
   path: 1.9.1
-  path_provider: 2.1.6
   shared_preferences: 2.5.5
   unorm_dart: 0.3.2
-  url_launcher: 6.3.2
 
 dev_dependencies:
   flutter_test:

@@ -1,7 +1,6 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:convert/convert.dart';
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:path/path.dart' as p;
 
@@ -11,46 +10,45 @@ import '../storage/io_hash.dart';
 import 'data_source.dart';
 import 'source_path.dart';
 
-enum LocalDirectoryMode { canonicalCatalog, looseReadOnly }
+enum LocalDirectoryMode { readOnly, readWrite }
 
-final class LocalDirectoryDataSource implements DataSource {
+final class LocalDirectoryDataSource
+    implements EnumerableDataSource, RangeReadableDataSource {
   LocalDirectoryDataSource._({
     required this.root,
     required this.mode,
-    required this.readOnly,
-    required this._canonicalRoot,
+    required this.canonicalRoot,
   });
 
   final Directory root;
   final LocalDirectoryMode mode;
-  final bool readOnly;
-  final String _canonicalRoot;
+  final String canonicalRoot;
+
+  bool get readOnly => mode == LocalDirectoryMode.readOnly;
 
   static Future<LocalDirectoryDataSource> attach({
     required Directory root,
-    required LocalDirectoryMode mode,
-    required bool requestWrite,
+    LocalDirectoryMode mode = LocalDirectoryMode.readWrite,
+    bool requestWrite = true,
   }) async {
     if (!await root.exists()) {
-      if (!requestWrite || mode == LocalDirectoryMode.looseReadOnly) {
-        throw const SboxException(SboxErrorCode.sourceNetwork, '所选本地目录不存在');
+      if (!requestWrite || mode == LocalDirectoryMode.readOnly) {
+        throw const SboxException(SboxErrorCode.sourceNotFound, '所选数据源目录不存在');
       }
       await root.create(recursive: true);
     }
-    final canonicalRoot = await root.resolveSymbolicLinks();
-    if (await FileSystemEntity.type(canonicalRoot, followLinks: false) !=
+    final canonical = await root.resolveSymbolicLinks();
+    if (await FileSystemEntity.type(canonical, followLinks: false) !=
         FileSystemEntityType.directory) {
-      throw _pathError();
+      throw const SboxException(SboxErrorCode.remoteChanged, '数据源根目录无效');
     }
-    final canWrite =
-        requestWrite &&
-        mode == LocalDirectoryMode.canonicalCatalog &&
-        await _probeWrite(Directory(canonicalRoot));
+    final effectiveMode = requestWrite && mode == LocalDirectoryMode.readWrite
+        ? mode
+        : LocalDirectoryMode.readOnly;
     return LocalDirectoryDataSource._(
-      root: Directory(canonicalRoot),
-      mode: mode,
-      readOnly: !canWrite,
-      canonicalRoot: canonicalRoot,
+      root: Directory(canonical),
+      mode: effectiveMode,
+      canonicalRoot: canonical,
     );
   }
 
@@ -59,21 +57,16 @@ final class LocalDirectoryDataSource implements DataSource {
     canRead: true,
     canWrite: !readOnly,
     canDelete: !readOnly,
-    conditionalWrite: !readOnly,
-    history: false,
+    canListObjects: true,
+    supportsRangeRead: true,
     maxObjectBytes: null,
-    maxRequestBodyBytes: null,
-    uploadEncoding: UploadEncoding.binary,
-    maxParallelObjectTransfers: 4,
-    supportsStreamingDownload: true,
-    supportsResumableObjectDownload: true,
+    maxParallelTransfers: SboxProtocolDefaults.maxParallelTransfers,
   );
 
   @override
   Future<SourceRead> get(SourcePath path, {RevisionToken? ifNoneMatch}) async {
-    final file = await _resolveFile(path, mustExist: true);
-    final hash = await sha256File(file);
-    final revision = RevisionToken(hash);
+    final file = await _resolve(path, mustExist: true);
+    final revision = RevisionToken(await sha256File(file));
     if (ifNoneMatch != null && revision.matches(ifNoneMatch)) {
       return SourceRead(
         body: const Stream<List<int>>.empty(),
@@ -90,6 +83,77 @@ final class LocalDirectoryDataSource implements DataSource {
   }
 
   @override
+  Future<SourceRead> getRange(
+    SourcePath path, {
+    required int start,
+    required int endExclusive,
+  }) async {
+    if (start < 0 || endExclusive < start) {
+      throw const SboxException(SboxErrorCode.invalidHeader, '范围读取边界无效');
+    }
+    final file = await _resolve(path, mustExist: true);
+    final length = await file.length();
+    if (endExclusive > length) {
+      throw const SboxException(SboxErrorCode.truncated, '范围读取超过对象长度');
+    }
+    return SourceRead(
+      body: file.openRead(start, endExclusive),
+      length: endExclusive - start,
+      revision: RevisionToken(await sha256File(file)),
+    );
+  }
+
+  @override
+  Future<SourceListPage> listObjects({
+    String? cursor,
+    int pageSize = 1000,
+  }) async {
+    if (pageSize < 1 || pageSize > 1000) {
+      throw const SboxException(SboxErrorCode.sourceLimit, '列举分页大小无效');
+    }
+    var entries = <File>[];
+    await for (final entity in root.list(followLinks: false)) {
+      if (await FileSystemEntity.type(entity.path, followLinks: false) !=
+              FileSystemEntityType.file ||
+          p.dirname(entity.path) != canonicalRoot) {
+        continue;
+      }
+      final basename = p.basename(entity.path);
+      if (!basename.endsWith('.sbox')) continue;
+      entries.add(File(entity.path));
+      if (entries.length > 100000) {
+        throw const SboxException(SboxErrorCode.sourceLimit, '数据源对象数量超过上限');
+      }
+    }
+    entries.sort(
+      (left, right) => p.basename(left.path).compareTo(p.basename(right.path)),
+    );
+    final start = int.tryParse(cursor ?? '0') ?? 0;
+    if (start < 0 || start > entries.length) {
+      throw const SboxException(SboxErrorCode.invalidHeader, '列举游标无效');
+    }
+    final page = entries.skip(start).take(pageSize).toList(growable: false);
+    final objects = <SourceObjectInfo>[];
+    for (final file in page) {
+      final path = SourcePath(p.basename(file.path));
+      objects.add(
+        SourceObjectInfo(
+          path: path,
+          length: await file.length(),
+          revision: RevisionToken(await sha256File(file)),
+        ),
+      );
+    }
+    final next = start + page.length < entries.length
+        ? (start + page.length).toString()
+        : null;
+    return SourceListPage(
+      objects: List.unmodifiable(objects),
+      nextCursor: next,
+    );
+  }
+
+  @override
   Future<RevisionToken> putNew(
     SourcePath path,
     Stream<List<int>> body, {
@@ -97,213 +161,90 @@ final class LocalDirectoryDataSource implements DataSource {
     required Uint8List sha256,
   }) async {
     _requireWrite();
-    final target = await _resolveFile(path, mustExist: false);
-    if (await target.exists()) {
-      if (path.value == 'catalog.sbox') {
-        throw _changed();
-      }
-      if (await FileSystemEntity.type(target.path, followLinks: false) !=
-          FileSystemEntityType.file) {
-        throw _changed();
-      }
-      final existingHash = await sha256File(target);
-      if (!constantTimeBytesEqual(existingHash, sha256)) {
-        throw _changed();
-      }
-      return RevisionToken(existingHash);
+    if (length < 0 || sha256.length != 32) {
+      throw ArgumentError('Invalid object dimensions');
     }
-    final staged = await _writeStaged(
-      target: target,
-      body: body,
-      expectedLength: length,
-      expectedHash: sha256,
-    );
-    try {
-      if (await target.exists()) {
-        throw _changed();
+    final target = await _resolve(path, mustExist: false);
+    if (await target.exists()) {
+      final existingHash = await sha256File(target);
+      if (constantTimeBytesEqual(existingHash, sha256)) {
+        return RevisionToken(existingHash);
       }
-      await staged.rename(target.path);
+      throw const SboxException(
+        SboxErrorCode.immutableConflict,
+        '规范对象已存在且内容不同',
+      );
+    }
+    final stage = File(
+      p.join(
+        canonicalRoot,
+        '.${path.value}.${hexLower(secureRandomBytes(8))}.part',
+      ),
+    );
+    final output = stage.openWrite();
+    var count = 0;
+    final accumulator = HashDigestSink();
+    final hashSink = crypto.sha256.startChunkedConversion(accumulator);
+    try {
+      await for (final chunk in body) {
+        count += chunk.length;
+        if (count > length) {
+          throw const SboxException(SboxErrorCode.integrity, '对象超过声明长度');
+        }
+        output.add(chunk);
+        hashSink.add(chunk);
+      }
+      hashSink.close();
+      if (count != length ||
+          !constantTimeBytesEqual(accumulator.value.bytes, sha256)) {
+        throw const SboxException(SboxErrorCode.integrity, '对象摘要或长度不匹配');
+      }
+      await output.flush();
+      await output.close();
+      if (await target.exists()) {
+        throw const SboxException(SboxErrorCode.immutableConflict, '规范对象已存在');
+      }
+      await stage.rename(target.path);
       return RevisionToken(sha256);
     } finally {
-      if (await staged.exists()) {
-        await staged.delete();
-      }
-    }
-  }
-
-  @override
-  Future<RevisionToken> compareAndSwap(
-    SourcePath path,
-    RevisionToken expected,
-    Stream<List<int>> body, {
-    required int length,
-  }) async {
-    _requireWrite();
-    if (path.value != 'catalog.sbox') {
-      throw ArgumentError('compareAndSwap is reserved for catalog.sbox');
-    }
-    final lockDirectory = Directory(p.join(_canonicalRoot, '.sbox-staging'));
-    await lockDirectory.create(recursive: true);
-    final lockFile = File(p.join(lockDirectory.path, 'catalog.lock'));
-    final lock = await lockFile.open(mode: FileMode.append);
-    try {
-      await lock.lock(FileLock.exclusive);
-      final target = await _resolveFile(path, mustExist: true);
-      final currentHash = await sha256File(target);
-      if (!constantTimeBytesEqual(currentHash, expected.bytes)) {
-        throw _syncConflict();
-      }
-      final staged = await _writeStaged(
-        target: target,
-        body: body,
-        expectedLength: length,
-      );
-      try {
-        final newHash = await sha256File(staged);
-        // Recheck while the cross-process lock is still held. Cloud-sync tools
-        // may not honor the lock, so the hash remains authoritative.
-        if (!constantTimeBytesEqual(await sha256File(target), expected.bytes)) {
-          throw _syncConflict();
-        }
-        await staged.rename(target.path);
-        return RevisionToken(newHash);
-      } finally {
-        if (await staged.exists()) {
-          await staged.delete();
-        }
-      }
-    } finally {
-      try {
-        await lock.unlock();
-      } on FileSystemException {
-        // The primary operation result is preserved; close releases the lock.
-      }
-      await lock.close();
+      await output.close();
+      if (await stage.exists()) await stage.delete();
     }
   }
 
   @override
   Future<void> deleteIfMatch(SourcePath path, RevisionToken expected) async {
     _requireWrite();
-    final file = await _resolveFile(path, mustExist: true);
-    if (!constantTimeBytesEqual(await sha256File(file), expected.bytes)) {
-      throw _syncConflict();
+    final target = await _resolve(path, mustExist: true);
+    if (!constantTimeBytesEqual(await sha256File(target), expected.bytes)) {
+      throw const SboxException(SboxErrorCode.shardConflict, '对象在删除前发生变化');
     }
-    await file.delete();
+    await target.delete();
   }
 
-  Future<File> _writeStaged({
-    required File target,
-    required Stream<List<int>> body,
-    required int expectedLength,
-    Uint8List? expectedHash,
-  }) async {
-    if (expectedLength < 0) {
-      throw ArgumentError.value(expectedLength, 'expectedLength');
+  Future<File> _resolve(SourcePath path, {required bool mustExist}) async {
+    final candidate = p.join(canonicalRoot, path.value);
+    if (p.dirname(candidate) != canonicalRoot ||
+        !p.isWithin(canonicalRoot, candidate)) {
+      throw const SboxException(SboxErrorCode.invalidHeader, '数据源路径越界');
     }
-    await target.parent.create(recursive: true);
-    final randomName =
-        '.${p.basename(target.path)}.'
-        '${hexLower(secureRandomBytes(16))}.part';
-    final staged = File(p.join(target.parent.path, randomName));
-    final output = staged.openWrite(mode: FileMode.writeOnly);
-    final accumulator = AccumulatorSink<crypto.Digest>();
-    final hashSink = crypto.sha256.startChunkedConversion(accumulator);
-    var written = 0;
-    try {
-      await for (final chunk in body) {
-        written += chunk.length;
-        if (written > expectedLength) {
-          throw const SboxException(SboxErrorCode.integrity, '数据源写入流超过声明长度');
-        }
-        output.add(chunk);
-        hashSink.add(chunk);
-      }
-      if (written != expectedLength) {
-        throw const SboxException(SboxErrorCode.truncated, '数据源写入流提前结束');
-      }
-      hashSink.close();
-      final actualHash = accumulator.events.single.bytes;
-      if (expectedHash != null &&
-          !constantTimeBytesEqual(actualHash, expectedHash)) {
-        throw const SboxException(SboxErrorCode.integrity, '数据源写入摘要不匹配');
-      }
-      await output.flush();
-      await output.close();
-      return staged;
-    } catch (_) {
-      await output.close();
-      if (await staged.exists()) {
-        await staged.delete();
-      }
-      rethrow;
+    final type = await FileSystemEntity.type(candidate, followLinks: false);
+    if (mustExist && type != FileSystemEntityType.file) {
+      throw const SboxException(SboxErrorCode.sourceNotFound, '数据源对象不存在');
     }
-  }
-
-  Future<File> _resolveFile(SourcePath path, {required bool mustExist}) async {
-    final candidate = p.normalize(
-      p.joinAll(<String>[_canonicalRoot, ...path.segments]),
-    );
-    if (!p.isWithin(_canonicalRoot, candidate)) {
-      throw _pathError();
+    if (type == FileSystemEntityType.link) {
+      throw const SboxException(SboxErrorCode.invalidHeader, '数据源对象不能是符号链接');
     }
-    var ancestor = Directory(p.dirname(candidate));
-    while (!await ancestor.exists()) {
-      if (ancestor.parent.path == ancestor.path) {
-        throw _pathError();
-      }
-      ancestor = ancestor.parent;
-    }
-    final resolvedAncestor = await ancestor.resolveSymbolicLinks();
-    if (resolvedAncestor != _canonicalRoot &&
-        !p.isWithin(_canonicalRoot, resolvedAncestor)) {
-      throw _pathError();
-    }
-    final file = File(candidate);
-    if (mustExist) {
-      if (await FileSystemEntity.type(candidate, followLinks: false) !=
-          FileSystemEntityType.file) {
-        throw _pathError();
-      }
-    }
-    return file;
+    return File(candidate);
   }
 
   void _requireWrite() {
-    if (readOnly || mode != LocalDirectoryMode.canonicalCatalog) {
-      throw const SboxException(
-        SboxErrorCode.sourceAuthentication,
-        '此本地数据源仅可读取',
-      );
+    if (readOnly) {
+      throw const SboxException(SboxErrorCode.sourceAuthentication, '当前数据源为只读');
     }
   }
+}
 
-  static Future<bool> _probeWrite(Directory root) async {
-    final probe = File(
-      p.join(root.path, '.sbox-write-probe-${hexLower(secureRandomBytes(8))}'),
-    );
-    try {
-      await probe.writeAsBytes(const <int>[0], flush: true);
-      await probe.delete();
-      return true;
-    } on FileSystemException {
-      if (await probe.exists()) {
-        try {
-          await probe.delete();
-        } on FileSystemException {
-          // Read-only downgrade still wins over probe cleanup failure.
-        }
-      }
-      return false;
-    }
-  }
-
-  static SboxException _pathError() =>
-      const SboxException(SboxErrorCode.remoteChanged, '本地数据源路径边界无效');
-
-  static SboxException _changed() =>
-      const SboxException(SboxErrorCode.remoteChanged, '目标对象已存在且不能覆盖');
-
-  static SboxException _syncConflict() =>
-      const SboxException(SboxErrorCode.syncConflict, '本地 Catalog 已变化，请处理同步冲突');
+abstract final class SboxProtocolDefaults {
+  static const int maxParallelTransfers = 4;
 }

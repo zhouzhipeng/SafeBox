@@ -4,7 +4,7 @@ import 'package:crypto/crypto.dart' as crypto;
 
 import '../bytes.dart';
 
-/// The exact HMAC_DRBG-SHA256 profile required by SBOX v1.
+/// The exact HMAC_DRBG-SHA256 profile required by RSA Identity Profile 1.
 final class HmacDrbgSha256 {
   HmacDrbgSha256({
     required List<int> entropyInput,

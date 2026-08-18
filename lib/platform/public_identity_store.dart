@@ -15,17 +15,15 @@ final class PublicIdentityStore {
   PublicIdentityStore({SharedPreferences? preferences})
     : _providedPreferences = preferences;
 
-  static const String _storageKey = 'sbox.v1.public_identity';
-  static const String _historyKey = 'sbox.v1.public_identity_history';
+  static const String _storageKey = 'sbox.v2.public_identity';
+  static const String _historyKey = 'sbox.v2.public_identity_history';
   final SharedPreferences? _providedPreferences;
 
   Future<PublicIdentityRecord?> load() async {
     final preferences =
         _providedPreferences ?? await SharedPreferences.getInstance();
     final value = preferences.getString(_storageKey);
-    if (value == null) {
-      return null;
-    }
+    if (value == null) return null;
     final decoded = jsonDecode(value);
     if (decoded is! Map<String, Object?>) {
       throw const FormatException('Invalid public identity');
@@ -36,11 +34,10 @@ final class PublicIdentityStore {
   Future<void> save(PublicIdentityRecord record) async {
     final preferences =
         _providedPreferences ?? await SharedPreferences.getInstance();
-    final saved = await preferences.setString(
+    if (!await preferences.setString(
       _storageKey,
       jsonEncode(record.toJson()),
-    );
-    if (!saved) {
+    )) {
       throw StateError('Public identity was not persisted');
     }
     final history = await loadAll();
@@ -51,7 +48,7 @@ final class PublicIdentityStore {
         (item) => item.record.toJson()['recipient_key_id'] != keyId,
       ),
     ].take(20).toList(growable: false);
-    final historySaved = await preferences.setString(
+    if (!await preferences.setString(
       _historyKey,
       jsonEncode(
         updated
@@ -63,8 +60,7 @@ final class PublicIdentityStore {
             )
             .toList(growable: false),
       ),
-    );
-    if (!historySaved) {
+    )) {
       throw StateError('Public identity history was not persisted');
     }
   }
@@ -89,10 +85,10 @@ final class PublicIdentityStore {
       throw const FormatException('Invalid public identity history');
     }
     final result = <StoredPublicIdentity>[];
-    final ids = <Object?>{};
+    final ids = <String>{};
     for (final value in decoded) {
       if (value is! Map<String, Object?> ||
-          value.keys.length != 2 ||
+          value.length != 2 ||
           value['created_at'] is! String ||
           value['public_identity'] is! Map<String, Object?>) {
         throw const FormatException('Invalid public identity history');
@@ -100,7 +96,8 @@ final class PublicIdentityStore {
       final record = PublicIdentityRecord.fromJson(
         value['public_identity']! as Map<String, Object?>,
       );
-      if (!ids.add(record.toJson()['recipient_key_id'])) {
+      final id = record.toJson()['recipient_key_id']! as String;
+      if (!ids.add(id)) {
         throw const FormatException('Duplicate public identity history');
       }
       result.add(

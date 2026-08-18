@@ -3,98 +3,85 @@ import 'dart:typed_data';
 
 import '../bytes.dart';
 import 'der.dart';
+import 'rsa_identity_profile1.dart';
 import 'rsa_models.dart';
 
+/// The exact persisted RSA-only public identity schema.
 final class PublicIdentityRecord {
-  PublicIdentityRecord({required this.identity}) {
-    _validate(identity);
+  const PublicIdentityRecord({
+    required this.spkiDer,
+    required this.recipientKeyId,
+  });
+
+  final Uint8List spkiDer;
+  final Uint8List recipientKeyId;
+
+  factory PublicIdentityRecord.fromIdentity(PublicIdentity identity) {
+    return PublicIdentityRecord(
+      spkiDer: identity.spkiDer,
+      recipientKeyId: identity.recipientKeyId,
+    );
   }
 
-  final PublicIdentity identity;
-
   Map<String, Object?> toJson() => <String, Object?>{
-    'profile': 'SBOX-v1-RSA3072-Ed25519',
-    'rsa_modulus_hex': identity.rsaPublicKey.modulus.toRadixString(16),
-    'rsa_exponent': identity.rsaPublicKey.exponent.toInt(),
-    'spki_der': base64Url.encode(identity.spkiDer).replaceAll('=', ''),
-    'recipient_key_id': hexLower(identity.recipientKeyId),
-    'catalog_signing_public_key': hexLower(identity.catalogSigningPublicKey),
-    'catalog_signer_key_id': hexLower(identity.catalogSignerKeyId),
+    'schema': 'SBOX-PUBLIC-IDENTITY-1',
+    'key_profile_id': RsaIdentityProfile1.keyProfileId,
+    'spki_der': base64Url.encode(spkiDer).replaceAll('=', ''),
+    'recipient_key_id': hexLower(recipientKeyId),
   };
+
+  PublicIdentity toPublicIdentity() {
+    final publicKey = parseRsaSubjectPublicKeyInfo(spkiDer);
+    final derived = sha256Bytes(spkiDer);
+    if (!constantTimeBytesEqual(derived, recipientKeyId)) {
+      throw const FormatException('Public identity key ID mismatch');
+    }
+    return PublicIdentity(
+      rsaPublicKey: publicKey,
+      spkiDer: spkiDer,
+      spkiPem: encodePublicKeyPem(spkiDer),
+      recipientKeyId: recipientKeyId,
+    );
+  }
 
   factory PublicIdentityRecord.fromJson(Map<String, Object?> json) {
     const keys = <String>{
-      'profile',
-      'rsa_modulus_hex',
-      'rsa_exponent',
+      'schema',
+      'key_profile_id',
       'spki_der',
       'recipient_key_id',
-      'catalog_signing_public_key',
-      'catalog_signer_key_id',
     };
-    if (json.length != keys.length ||
-        json.keys.any((key) => !keys.contains(key)) ||
-        json['profile'] != 'SBOX-v1-RSA3072-Ed25519' ||
-        json['rsa_modulus_hex'] is! String ||
-        json['rsa_exponent'] is! int ||
+    if (json.length != keys.length || !json.keys.toSet().containsAll(keys)) {
+      throw const FormatException('Invalid public identity schema');
+    }
+    if (json['schema'] != 'SBOX-PUBLIC-IDENTITY-1' ||
+        json['key_profile_id'] != RsaIdentityProfile1.keyProfileId ||
         json['spki_der'] is! String ||
-        json['recipient_key_id'] is! String ||
-        json['catalog_signing_public_key'] is! String ||
-        json['catalog_signer_key_id'] is! String) {
-      throw const FormatException('Invalid public identity record');
+        json['recipient_key_id'] is! String) {
+      throw const FormatException('Invalid public identity schema');
     }
-    final modulusText = json['rsa_modulus_hex']! as String;
-    if (!RegExp(r'^[0-9a-f]{768}$').hasMatch(modulusText)) {
-      throw const FormatException('Invalid RSA public modulus');
+    final encodedDer = json['spki_der']! as String;
+    final keyId = json['recipient_key_id']! as String;
+    if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(keyId) ||
+        !RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(encodedDer) ||
+        encodedDer.contains('=')) {
+      throw const FormatException('Invalid public identity encoding');
     }
-    final key = SboxRsaPublicKey(
-      modulus: BigInt.parse(modulusText, radix: 16),
-      exponent: BigInt.from(json['rsa_exponent']! as int),
-    );
-    final spki = _decodeBase64Url(json['spki_der']! as String);
-    final identity = PublicIdentity(
-      rsaPublicKey: key,
-      spkiDer: spki,
-      spkiPem: encodePublicKeyPem(spki),
-      recipientKeyId: decodeHex(json['recipient_key_id']! as String),
-      catalogSigningPublicKey: decodeHex(
-        json['catalog_signing_public_key']! as String,
-      ),
-      catalogSignerKeyId: decodeHex(json['catalog_signer_key_id']! as String),
-    );
-    _validate(identity);
-    return PublicIdentityRecord(identity: identity);
-  }
-
-  static void _validate(PublicIdentity identity) {
-    final expectedDer = encodeRsaSubjectPublicKeyInfo(identity.rsaPublicKey);
-    if (identity.rsaPublicKey.modulus.bitLength != 3072 ||
-        identity.rsaPublicKey.exponent != BigInt.from(65537) ||
-        !constantTimeBytesEqual(expectedDer, identity.spkiDer) ||
-        identity.recipientKeyId.length != 32 ||
-        !constantTimeBytesEqual(
-          sha256Bytes(identity.spkiDer),
-          identity.recipientKeyId,
-        ) ||
-        identity.catalogSigningPublicKey.length != 32 ||
-        identity.catalogSignerKeyId.length != 32 ||
-        !constantTimeBytesEqual(
-          sha256Bytes(identity.catalogSigningPublicKey),
-          identity.catalogSignerKeyId,
-        )) {
-      throw const FormatException('Public identity record failed validation');
+    late final Uint8List der;
+    try {
+      final padding = '=' * ((4 - encodedDer.length % 4) % 4);
+      der = Uint8List.fromList(base64Url.decode('$encodedDer$padding'));
+      if (base64Url.encode(der).replaceAll('=', '') != encodedDer) {
+        throw const FormatException('Non-canonical public identity encoding');
+      }
+      parseRsaSubjectPublicKeyInfo(der);
+    } on FormatException {
+      throw const FormatException('Invalid public identity DER');
     }
+    final decodedKeyId = decodeHex(keyId);
+    if (!constantTimeBytesEqual(sha256Bytes(der), decodedKeyId)) {
+      throw const FormatException('Public identity key ID mismatch');
+    }
+    return PublicIdentityRecord(spkiDer: der, recipientKeyId: decodedKeyId);
   }
-}
-
-Uint8List _decodeBase64Url(String value) {
-  if (!RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(value)) {
-    throw const FormatException('Invalid public identity encoding');
-  }
-  final padding = '=' * ((4 - value.length % 4) % 4);
-  final result = Uint8List.fromList(base64Url.decode('$value$padding'));
-  if (base64Url.encode(result).replaceAll('=', '') != value) {
-    throw const FormatException('Invalid public identity encoding');
-  }
-  return result;
 }

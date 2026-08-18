@@ -5,6 +5,24 @@ import 'dart:typed_data';
 import 'package:convert/convert.dart';
 import 'package:crypto/crypto.dart' as crypto;
 
+/// Captures the single digest emitted by a chunked crypto hash.
+final class HashDigestSink implements Sink<crypto.Digest> {
+  crypto.Digest? _digest;
+
+  crypto.Digest get value => _digest!;
+
+  @override
+  void add(crypto.Digest value) {
+    if (_digest != null) throw StateError('Digest already captured');
+    _digest = value;
+  }
+
+  @override
+  void close() {
+    if (_digest == null) throw StateError('Digest was not emitted');
+  }
+}
+
 Uint8List asciiBytes(String value) => Uint8List.fromList(ascii.encode(value));
 
 Uint8List utf8Bytes(String value) => Uint8List.fromList(utf8.encode(value));

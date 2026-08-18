@@ -60,13 +60,13 @@ ThemeData buildSboxTheme() {
           color: SboxColors.text,
           fontSize: 24,
           height: 1.22,
-          fontWeight: FontWeight.w600,
+          fontWeight: FontWeight.w700,
         ),
         titleLarge: const TextStyle(
           color: SboxColors.text,
           fontSize: 18,
           height: 1.35,
-          fontWeight: FontWeight.w600,
+          fontWeight: FontWeight.w700,
         ),
         titleMedium: const TextStyle(
           color: SboxColors.text,
@@ -87,7 +87,7 @@ ThemeData buildSboxTheme() {
         labelLarge: const TextStyle(
           color: SboxColors.text,
           fontSize: 14,
-          fontWeight: FontWeight.w600,
+          fontWeight: FontWeight.w700,
         ),
       )
       .apply(fontFamily: 'NotoSansSC');
@@ -119,7 +119,7 @@ ThemeData buildSboxTheme() {
     elevatedButtonTheme: ElevatedButtonThemeData(
       style: ElevatedButton.styleFrom(
         minimumSize: const Size(44, 48),
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+        padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 14),
         backgroundColor: SboxColors.accent,
         foregroundColor: const Color(0xFF03211D),
         disabledBackgroundColor: SboxColors.border,
@@ -137,15 +137,17 @@ ThemeData buildSboxTheme() {
       style: OutlinedButton.styleFrom(
         minimumSize: const Size(44, 46),
         padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 13),
-        foregroundColor: SboxColors.text,
-        side: const BorderSide(color: SboxColors.border),
+        foregroundColor: SboxColors.accent,
+        side: const BorderSide(color: SboxColors.accent, width: 1.2),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
+        textStyle: const TextStyle(fontWeight: FontWeight.w700),
       ),
     ),
     textButtonTheme: TextButtonThemeData(
       style: TextButton.styleFrom(
         minimumSize: const Size(44, 44),
         foregroundColor: SboxColors.accent,
+        textStyle: const TextStyle(fontWeight: FontWeight.w700),
       ),
     ),
     checkboxTheme: CheckboxThemeData(
@@ -161,14 +163,15 @@ ThemeData buildSboxTheme() {
     switchTheme: SwitchThemeData(
       thumbColor: WidgetStateProperty.resolveWith(
         (states) => states.contains(WidgetState.selected)
-            ? SboxColors.accent
+            ? Colors.white
             : SboxColors.textDim,
       ),
       trackColor: WidgetStateProperty.resolveWith(
         (states) => states.contains(WidgetState.selected)
-            ? SboxColors.accentDark
+            ? SboxColors.accent
             : SboxColors.borderSoft,
       ),
+      trackOutlineColor: const WidgetStatePropertyAll(Colors.transparent),
     ),
     snackBarTheme: const SnackBarThemeData(
       backgroundColor: SboxColors.panelRaised,

@@ -5,7 +5,7 @@ final class AppSettingsStore {
   AppSettingsStore({SharedPreferences? preferences})
     : _providedPreferences = preferences;
 
-  static const _clearOnExitKey = 'sbox.v1.clear_plaintext_on_exit';
+  static const _clearOnExitKey = 'sbox.v2.clear_plaintext_on_exit';
   final SharedPreferences? _providedPreferences;
 
   Future<bool> loadClearPlaintextOnExit() async {

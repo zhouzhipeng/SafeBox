@@ -1,234 +1,143 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../app/app_controller.dart';
 import '../../app/sbox_theme.dart';
 import '../../app/sbox_widgets.dart';
 
-enum OnboardingStage { welcome, backup, confirm, recover, deriving, complete }
-
-class MnemonicOnboarding extends StatefulWidget {
+final class MnemonicOnboarding extends StatefulWidget {
   const MnemonicOnboarding({
     super.key,
     required this.controller,
     required this.onFinished,
-    this.initialStage = OnboardingStage.welcome,
-    this.previewMnemonic,
+    this.onOpenSettings,
   });
 
   final AppController controller;
-  final ValueChanged<AppSection> onFinished;
-  final OnboardingStage initialStage;
-  final String? previewMnemonic;
+  final VoidCallback onFinished;
+  final VoidCallback? onOpenSettings;
 
   @override
   State<MnemonicOnboarding> createState() => _MnemonicOnboardingState();
 }
 
-class _MnemonicOnboardingState extends State<MnemonicOnboarding>
-    with WidgetsBindingObserver {
-  static const _confirmIndexes = <int>[1, 4, 7, 10];
-  late OnboardingStage _stage;
-  String _mnemonic = '';
-  bool _backedUp = false;
-  String? _inlineError;
-  final _recovery = TextEditingController();
-  final _confirm = <int, TextEditingController>{
-    for (final index in _confirmIndexes) index: TextEditingController(),
-  };
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    _stage = widget.initialStage;
-    if (_stage == OnboardingStage.backup || _stage == OnboardingStage.confirm) {
-      _mnemonic =
-          widget.previewMnemonic ?? widget.controller.generateMnemonic();
-    }
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.inactive ||
-        state == AppLifecycleState.paused ||
-        state == AppLifecycleState.detached ||
-        state == AppLifecycleState.hidden) {
-      _clearSensitiveInputs();
-      if (mounted && _stage != OnboardingStage.deriving) {
-        setState(() {
-          _mnemonic = '';
-          _stage = OnboardingStage.welcome;
-          _backedUp = false;
-          _inlineError = '应用离开前台，未完成的助记词流程已清除。';
-        });
-      }
-    }
-  }
+final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
+  final _restoreControllers = List<TextEditingController>.generate(
+    12,
+    (_) => TextEditingController(),
+  );
+  List<String>? _mnemonic;
+  int _step = 1;
+  bool _restoring = false;
+  bool _busy = false;
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _clearSensitiveInputs();
-    _recovery.dispose();
-    for (final controller in _confirm.values) {
+    for (final controller in _restoreControllers) {
+      controller.clear();
       controller.dispose();
     }
     super.dispose();
   }
 
-  void _clearSensitiveInputs() {
-    _recovery.clear();
-    for (final controller in _confirm.values) {
-      controller.clear();
-    }
-  }
-
-  void _createIdentity() {
-    setState(() {
-      _mnemonic = widget.controller.generateMnemonic();
-      _backedUp = false;
-      _inlineError = null;
-      _stage = OnboardingStage.backup;
-    });
-  }
-
-  Future<void> _confirmAndDerive() async {
-    final words = _mnemonic.split(' ');
-    final valid = _confirmIndexes.every(
-      (index) => _confirm[index]!.text.trim().toLowerCase() == words[index],
-    );
-    if (!valid) {
-      setState(() => _inlineError = '确认词不匹配，请对照离线备份重新填写。');
-      return;
-    }
-    final oneShotMnemonic = _mnemonic;
-    _mnemonic = '';
-    _clearSensitiveInputs();
-    setState(() {
-      _inlineError = null;
-      _stage = OnboardingStage.deriving;
-    });
-    try {
-      await widget.controller.establishIdentity(oneShotMnemonic);
-      if (mounted) setState(() => _stage = OnboardingStage.complete);
-    } catch (_) {
-      if (mounted) {
-        setState(() {
-          _stage = OnboardingStage.welcome;
-          _inlineError = widget.controller.errorMessage;
-        });
-      }
-    }
-  }
-
-  Future<void> _recoverIdentity() async {
-    final oneShotMnemonic = _recovery.text.trim();
-    _recovery.clear();
-    setState(() {
-      _inlineError = null;
-      _stage = OnboardingStage.deriving;
-    });
-    try {
-      await widget.controller.establishIdentity(oneShotMnemonic);
-      if (mounted) setState(() => _stage = OnboardingStage.complete);
-    } catch (_) {
-      if (mounted) {
-        setState(() {
-          _stage = OnboardingStage.recover;
-          _inlineError = widget.controller.errorMessage;
-        });
-      }
-    }
-  }
-
-  Future<void> _openLocalDirectory() async {
-    if (widget.controller.supportsAuthorizedDirectorySelection) {
-      try {
-        final added = await widget.controller
-            .chooseAndAddAuthorizedLocalSource();
-        if (added) widget.onFinished(AppSection.library);
-      } catch (_) {}
-      return;
-    }
-    final path = await widget.controller.chooseLocalCipherDirectory(
-      confirmButtonText: '打开此 SBOX 目录',
-    );
-    if (path == null) return;
-    try {
-      await widget.controller.addLocalSource(
-        displayName: '本地 SBOX 目录',
-        path: path,
-        requestWrite: true,
-        initializeEmptyAsCanonical: true,
-      );
-      widget.onFinished(AppSection.library);
-    } catch (_) {
-      if (mounted) {
-        setState(() => _inlineError = widget.controller.errorMessage);
-      }
-    }
-  }
-
-  Future<void> _createManagedLocalDirectory() async {
-    try {
-      await widget.controller.addManagedWritableLocalSource();
-      widget.onFinished(AppSection.library);
-    } catch (_) {
-      if (mounted) {
-        setState(() => _inlineError = widget.controller.errorMessage);
-      }
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: DecoratedBox(
-        decoration: const BoxDecoration(
-          gradient: RadialGradient(
-            center: Alignment(0.15, -0.85),
-            radius: 1.3,
-            colors: <Color>[
-              Color(0xFF102A36),
-              SboxColors.background,
-              SboxColors.backgroundDeep,
-            ],
-          ),
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final mobile = constraints.maxWidth < 760;
+            return DecoratedBox(
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: <Color>[
+                    SboxColors.backgroundDeep,
+                    SboxColors.background,
+                  ],
+                ),
+              ),
+              child: Column(
+                children: <Widget>[
+                  SboxTopBar(
+                    mobile: mobile,
+                    identityReady: false,
+                    cloudReady: false,
+                    firstUse: true,
+                  ),
+                  SboxTabBar(
+                    mobile: mobile,
+                    settingsSelected: true,
+                    cloudDisabled: true,
+                  ),
+                  Expanded(child: _buildContent(context, mobile)),
+                ],
+              ),
+            );
+          },
         ),
-        child: SafeArea(
+      ),
+    );
+  }
+
+  Widget _buildContent(BuildContext context, bool mobile) {
+    final title = switch (_step) {
+      1 when _mnemonic != null => '保存你的恢复词',
+      1 when _restoring => '恢复已有身份',
+      2 => '连接云端备份',
+      3 => '设置完成',
+      _ => '欢迎使用 SafeBox',
+    };
+    final subtitle = switch (_step) {
+      1 when _mnemonic != null => '请按顺序保存这 12 个词，完成后即可继续设置',
+      1 when _restoring => '输入你的 12 个恢复词，找回安全身份',
+      2 => '身份设置完成后，再连接你的云端备份',
+      3 => '你的文件现在已经准备好受到保护',
+      _ => '完成一次设置，之后只需拖入文件',
+    };
+    return SingleChildScrollView(
+      padding: EdgeInsets.fromLTRB(
+        mobile ? 24 : 28,
+        mobile ? 34 : 36,
+        mobile ? 24 : 28,
+        mobile ? 24 : 30,
+      ),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 800),
           child: Column(
             children: <Widget>[
-              Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 34,
-                  vertical: 22,
-                ),
-                child: Row(
-                  children: <Widget>[
-                    const SboxLogo(),
-                    const Spacer(),
-                    const StatusPill(
-                      label: '本地离线身份',
-                      icon: Icons.wifi_off_rounded,
-                      tone: SboxColors.accent,
-                    ),
-                  ],
+              Text(
+                title,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.displaySmall
+                    ?.copyWith(fontSize: mobile ? 32 : 38),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                subtitle,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                  color: SboxColors.textMuted,
+                  fontSize: mobile ? 15 : 16,
                 ),
               ),
-              Expanded(
-                child: SingleChildScrollView(
-                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 36),
-                  child: Center(
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 940),
-                      child: AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 180),
-                        child: _buildStage(context),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
+              const SizedBox(height: 24),
+              _StepProgress(step: _step, mobile: mobile),
+              const SizedBox(height: 28),
+              if (_step == 1 && _mnemonic == null && !_restoring)
+                _buildIdentityChoice(context, mobile)
+              else if (_step == 1 && _mnemonic != null)
+                _buildRecoveryPhrase(context, mobile)
+              else if (_step == 1)
+                _buildRestoreIdentity(context, mobile)
+              else if (_step == 2)
+                _buildCloudStep(context, mobile)
+              else
+                _buildCompleteStep(context, mobile),
+              const SizedBox(height: 24),
+              _buildBottomHint(context, mobile),
             ],
           ),
         ),
@@ -236,616 +145,664 @@ class _MnemonicOnboardingState extends State<MnemonicOnboarding>
     );
   }
 
-  Widget _buildStage(BuildContext context) {
-    return switch (_stage) {
-      OnboardingStage.welcome => _welcome(context),
-      OnboardingStage.backup => _backup(context),
-      OnboardingStage.confirm => _confirmPage(context),
-      OnboardingStage.recover => _recover(context),
-      OnboardingStage.deriving => _deriving(context),
-      OnboardingStage.complete => _complete(context),
-    };
-  }
-
-  Widget _frame({required Widget child}) {
-    return SboxCard(
-      key: ValueKey<OnboardingStage>(_stage),
-      padding: const EdgeInsets.fromLTRB(46, 38, 46, 42),
-      color: const Color(0xFF101D2A),
-      borderColor: const Color(0xFF304355),
-      radius: 16,
-      child: child,
-    );
-  }
-
-  Widget _welcome(BuildContext context) {
-    return _frame(
-      child: Column(
-        children: <Widget>[
-          const _StepHeader(active: 0),
-          const SizedBox(height: 42),
-          _largeIcon(Icons.shield_outlined),
-          const SizedBox(height: 22),
-          Text(
-            '建立你的 SafeBox 身份',
-            style: Theme.of(context).textTheme.headlineLarge,
-          ),
-          const SizedBox(height: 10),
-          Text(
-            '12 个 BIP39 英文单词会确定性恢复同一组 RSA-3072 与 Catalog 身份公钥。',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodyLarge
-                ?.copyWith(color: SboxColors.textMuted),
-          ),
-          const SizedBox(height: 30),
-          if (_inlineError != null) ...<Widget>[
-            SecurityNotice(
-              title: '流程已停止',
-              message: _inlineError!,
-              warning: true,
-            ),
-            const SizedBox(height: 18),
-          ],
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final narrow = constraints.maxWidth < 620;
-              final create = _IdentityChoice(
-                icon: Icons.add_moderator_outlined,
-                title: '创建新身份',
-                description: '生成全新的 12 词助记词，只在本次流程显示。',
-                action: '开始创建',
-                primary: true,
-                onPressed: _createIdentity,
-              );
-              final recover = _IdentityChoice(
-                icon: Icons.key_outlined,
-                title: '恢复现有身份',
-                description: '临时输入已有助记词，核对并重新保存公开身份。',
-                action: '开始恢复',
-                onPressed: () => setState(() {
-                  _inlineError = null;
-                  _stage = OnboardingStage.recover;
-                }),
-              );
-              return narrow
-                  ? Column(
-                      children: <Widget>[
-                        create,
-                        const SizedBox(height: 14),
-                        recover,
-                      ],
-                    )
-                  : Row(
-                      children: <Widget>[
-                        Expanded(child: create),
-                        const SizedBox(width: 16),
-                        Expanded(child: recover),
-                      ],
-                    );
-            },
-          ),
-          const SizedBox(height: 24),
-          const SecurityNotice(
-            title: '私钥从不保存',
-            message: '应用只永久保存公钥和 Key ID。每次解密都需要重新输入助记词，关闭进程是最终内存清理边界。',
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _backup(BuildContext context) {
-    final words = _mnemonic.split(' ');
-    return _frame(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          const _StepHeader(active: 0),
-          const SizedBox(height: 30),
-          Text(
-            '备份你的助记词',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.headlineLarge,
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '请按顺序离线抄写这 12 个单词。离开此流程后，SafeBox 无法再次显示它们。',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodyMedium,
-          ),
-          const SizedBox(height: 24),
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final columns = constraints.maxWidth < 560 ? 2 : 3;
-              final spacing = 12.0;
-              final width =
-                  (constraints.maxWidth - spacing * (columns - 1)) / columns;
-              return Wrap(
-                spacing: spacing,
-                runSpacing: 12,
-                children: <Widget>[
-                  for (var index = 0; index < words.length; index++)
-                    SizedBox(
-                      width: width,
-                      child: Semantics(
-                        label: '第 ${index + 1} 个助记词 ${words[index]}',
-                        child: Container(
-                          height: 54,
-                          padding: const EdgeInsets.symmetric(horizontal: 13),
-                          decoration: BoxDecoration(
-                            color: SboxColors.panelSoft,
-                            borderRadius: BorderRadius.circular(9),
-                            border: Border.all(color: SboxColors.border),
-                          ),
-                          child: Row(
-                            children: <Widget>[
-                              SizedBox(
-                                width: 25,
-                                child: Text(
-                                  '${index + 1}',
-                                  style: const TextStyle(
-                                    color: SboxColors.textDim,
-                                    fontFamily: 'RobotoMono',
-                                  ),
-                                ),
-                              ),
-                              Expanded(
-                                child: Text(
-                                  words[index],
-                                  style: const TextStyle(
-                                    color: SboxColors.text,
-                                    fontFamily: 'RobotoMono',
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                ],
-              );
-            },
-          ),
-          const SizedBox(height: 20),
-          const SecurityNotice(
-            title: '失去助记词就会永久失去文件',
-            message: '不要截图、不要保存到网盘或聊天工具。操作系统仍可能允许截图，SafeBox 无法承诺绝对阻止。',
-            warning: true,
-          ),
-          const SizedBox(height: 14),
-          CheckboxListTile(
-            value: _backedUp,
-            contentPadding: EdgeInsets.zero,
-            controlAffinity: ListTileControlAffinity.leading,
-            title: const Text('我已按顺序离线保存全部 12 个单词'),
-            subtitle: const Text('应用不会替我保存，也不能通过系统身份验证找回。'),
-            onChanged: (value) => setState(() => _backedUp = value ?? false),
-          ),
-          const SizedBox(height: 16),
-          Row(
-            children: <Widget>[
-              OutlinedButton.icon(
-                onPressed: _createIdentity,
-                icon: const Icon(Icons.refresh_rounded, size: 18),
-                label: const Text('重新生成'),
-              ),
-              const Spacer(),
-              ElevatedButton.icon(
-                onPressed: _backedUp
-                    ? () => setState(() => _stage = OnboardingStage.confirm)
-                    : null,
-                iconAlignment: IconAlignment.end,
-                icon: const Icon(Icons.arrow_forward_rounded, size: 18),
-                label: const Text('下一步：确认备份'),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _confirmPage(BuildContext context) {
-    return _frame(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          const _StepHeader(active: 1),
-          const SizedBox(height: 34),
-          Text(
-            '确认离线备份',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.headlineLarge,
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '请输入指定位置的单词。不会提供自动填充或复制。',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodyMedium,
-          ),
-          const SizedBox(height: 28),
-          Wrap(
-            spacing: 14,
-            runSpacing: 16,
-            children: <Widget>[
-              for (final index in _confirmIndexes)
-                SizedBox(
-                  width: 188,
-                  child: TextField(
-                    controller: _confirm[index],
-                    autocorrect: false,
-                    enableSuggestions: false,
-                    autofillHints: null,
-                    keyboardType: TextInputType.visiblePassword,
-                    textInputAction: TextInputAction.next,
-                    decoration: InputDecoration(
-                      labelText: '第 ${index + 1} 个单词',
-                    ),
-                  ),
-                ),
-            ],
-          ),
-          if (_inlineError != null) ...<Widget>[
-            const SizedBox(height: 18),
-            SecurityNotice(
-              title: '确认失败',
-              message: _inlineError!,
-              warning: true,
-            ),
-          ],
-          const SizedBox(height: 28),
-          Row(
-            children: <Widget>[
-              OutlinedButton(
-                onPressed: () =>
-                    setState(() => _stage = OnboardingStage.backup),
-                child: const Text('返回查看'),
-              ),
-              const Spacer(),
-              ElevatedButton.icon(
-                onPressed: _confirmAndDerive,
-                icon: const Icon(Icons.verified_user_outlined, size: 18),
-                label: const Text('确认并生成公钥'),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _recover(BuildContext context) {
-    return _frame(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          const _StepHeader(active: 0),
-          const SizedBox(height: 34),
-          _largeIcon(Icons.key_outlined),
-          const SizedBox(height: 18),
-          Text(
-            '恢复现有身份',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.headlineLarge,
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '输入 12 个 BIP39 英文单词，仅用于本次公钥恢复，不会保存。',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodyMedium,
-          ),
-          const SizedBox(height: 24),
-          TextField(
-            controller: _recovery,
-            minLines: 3,
-            maxLines: 4,
-            autocorrect: false,
-            enableSuggestions: false,
-            autofillHints: null,
-            keyboardType: TextInputType.visiblePassword,
-            decoration: const InputDecoration(
-              labelText: '12 词助记词',
-              hintText: 'word1 word2 … word12',
-              helperText: '单词之间使用空格；输入内容不会进入日志或持久化存储。',
-            ),
-          ),
-          if (_inlineError != null) ...<Widget>[
-            const SizedBox(height: 18),
-            SecurityNotice(
-              title: '无法恢复',
-              message: _inlineError!,
-              warning: true,
-            ),
-          ],
-          const SizedBox(height: 24),
-          Row(
-            children: <Widget>[
-              OutlinedButton(
-                onPressed: () =>
-                    setState(() => _stage = OnboardingStage.welcome),
-                child: const Text('返回'),
-              ),
-              const Spacer(),
-              ElevatedButton.icon(
-                onPressed: _recoverIdentity,
-                icon: const Icon(Icons.lock_open_outlined, size: 18),
-                label: const Text('临时恢复并核对'),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _deriving(BuildContext context) {
-    return _frame(
-      child: Column(
-        children: <Widget>[
-          const _StepHeader(active: 2),
-          const SizedBox(height: 52),
-          const SizedBox(
-            width: 70,
-            height: 70,
-            child: CircularProgressIndicator(strokeWidth: 5),
-          ),
-          const SizedBox(height: 28),
-          Text(
-            '正在恢复 RSA-3072 公钥',
-            style: Theme.of(context).textTheme.headlineMedium,
-          ),
-          const SizedBox(height: 10),
-          Text(
-            '正在执行确定性素数搜索，这可能需要数秒。界面仍保持响应，请不要退出应用。',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodyLarge
-                ?.copyWith(color: SboxColors.textMuted),
-          ),
-          const SizedBox(height: 28),
-          const SboxProgressCard(
-            title: '一次性 Crypto Isolate',
-            detail: '派生完成后只返回公钥，私钥引用随 Isolate 终止。',
-          ),
-          const SizedBox(height: 30),
-        ],
-      ),
-    );
-  }
-
-  Widget _complete(BuildContext context) {
-    return _frame(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          const _StepHeader(active: 2),
-          const SizedBox(height: 30),
-          _largeIcon(Icons.verified_user_outlined),
-          const SizedBox(height: 18),
-          Text(
-            '公开身份已就绪',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.headlineLarge,
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '只保存了公钥和 Key ID。私钥未保存，解密时仍需助记词。',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodyMedium,
-          ),
-          const SizedBox(height: 24),
-          SboxCard(
-            color: SboxColors.panelSoft,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                const Text(
-                  'RSA Key ID',
-                  style: TextStyle(color: SboxColors.textMuted, fontSize: 12),
-                ),
-                const SizedBox(height: 6),
-                MonospaceValue(
-                  widget.controller.recipientKeyId ?? '',
-                  maxLines: 3,
-                ),
-                const SizedBox(height: 14),
-                const Text(
-                  'Catalog Signer Key ID',
-                  style: TextStyle(color: SboxColors.textMuted, fontSize: 12),
-                ),
-                const SizedBox(height: 6),
-                MonospaceValue(
-                  widget.controller.signerKeyId ?? '',
-                  maxLines: 3,
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 20),
-          const SecurityNotice(
-            title: '仅保存公钥 · 私钥不落盘',
-            message: '现在可以直接打开本地目录，也可以稍后配置公开 GitHub/Gitee 仓库；云端不是必需步骤。',
-          ),
-          const SizedBox(height: 22),
-          Wrap(
-            spacing: 12,
-            runSpacing: 12,
-            alignment: WrapAlignment.center,
-            children: <Widget>[
-              ElevatedButton.icon(
-                onPressed: _openLocalDirectory,
-                icon: const Icon(Icons.folder_open_outlined),
-                label: const Text('打开本地 SBOX 目录'),
-              ),
-              if (widget.controller.supportsAuthorizedDirectorySelection)
-                OutlinedButton.icon(
-                  onPressed: _createManagedLocalDirectory,
-                  icon: const Icon(Icons.create_new_folder_outlined),
-                  label: const Text('创建本机可写保险箱'),
-                ),
-              OutlinedButton.icon(
-                onPressed: () => widget.onFinished(AppSection.sources),
-                icon: const Icon(Icons.cloud_outlined),
-                label: const Text('配置云端数据源'),
-              ),
-              TextButton(
-                onPressed: () => widget.onFinished(AppSection.library),
-                child: const Text('暂不配置'),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _largeIcon(IconData icon) {
-    return Container(
-      width: 70,
-      height: 70,
-      decoration: BoxDecoration(
-        color: SboxColors.accent.withValues(alpha: 0.1),
-        shape: BoxShape.circle,
-        border: Border.all(color: SboxColors.accent.withValues(alpha: 0.28)),
-      ),
-      child: Icon(icon, color: SboxColors.accent, size: 34),
-    );
-  }
-}
-
-class _StepHeader extends StatelessWidget {
-  const _StepHeader({required this.active});
-
-  final int active;
-
-  @override
-  Widget build(BuildContext context) {
-    const labels = <String>['备份助记词', '确认备份', '生成公钥'];
-    return Row(
+  Widget _buildIdentityChoice(BuildContext context, bool mobile) {
+    return Column(
       children: <Widget>[
-        for (var index = 0; index < labels.length; index++) ...<Widget>[
-          Expanded(
-            child: Column(
-              children: <Widget>[
-                Row(
+        SboxCard(
+          padding: EdgeInsets.all(mobile ? 24 : 30),
+          child: mobile
+              ? Column(
                   children: <Widget>[
-                    Expanded(
-                      child: Container(
-                        height: 1,
-                        color: index == 0
-                            ? Colors.transparent
-                            : (index <= active
-                                  ? SboxColors.accent
-                                  : SboxColors.border),
-                      ),
-                    ),
-                    Container(
-                      width: 30,
-                      height: 30,
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: index <= active
-                            ? SboxColors.accent
-                            : SboxColors.panelSoft,
-                        border: Border.all(
-                          color: index <= active
-                              ? SboxColors.accent
-                              : SboxColors.border,
-                        ),
-                      ),
-                      child: index < active
-                          ? const Icon(
-                              Icons.check,
-                              size: 16,
-                              color: Color(0xFF03211D),
-                            )
-                          : Text(
-                              '${index + 1}',
-                              style: TextStyle(
-                                color: index <= active
-                                    ? const Color(0xFF03211D)
-                                    : SboxColors.textMuted,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                    ),
-                    Expanded(
-                      child: Container(
-                        height: 1,
-                        color: index == labels.length - 1
-                            ? Colors.transparent
-                            : (index < active
-                                  ? SboxColors.accent
-                                  : SboxColors.border),
-                      ),
-                    ),
+                    const _ShieldArt(size: 190),
+                    const SizedBox(height: 12),
+                    _identityChoiceActions(context, mobile),
+                  ],
+                )
+              : Row(
+                  children: <Widget>[
+                    const Expanded(child: _ShieldArt(size: 250)),
+                    const SizedBox(width: 36),
+                    Expanded(child: _identityChoiceActions(context, mobile)),
                   ],
                 ),
-                const SizedBox(height: 7),
-                Text(
-                  labels[index],
-                  style: TextStyle(
-                    color: index <= active
-                        ? SboxColors.text
-                        : SboxColors.textDim,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
+        ),
+        const SizedBox(height: 14),
+        _buildPendingCloudCard(context, mobile),
+        const SizedBox(height: 18),
+        _continueButton(
+          context,
+          mobile: mobile,
+          label: '继续设置',
+          onPressed: _busy
+              ? null
+              : widget.controller.hasIdentity
+              ? () => setState(() => _step = 2)
+              : () => _showFeedback('请先创建或恢复安全身份。'),
+        ),
       ],
     );
   }
+
+  Widget _identityChoiceActions(BuildContext context, bool mobile) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text('创建安全身份', style: Theme.of(context).textTheme.headlineMedium),
+        const SizedBox(height: 8),
+        Text(
+          '用于保护你的文件',
+          style: Theme.of(context).textTheme.bodyLarge
+              ?.copyWith(color: SboxColors.textMuted),
+        ),
+        const SizedBox(height: 22),
+        SizedBox(
+          width: double.infinity,
+          child: ElevatedButton(
+            onPressed: _busy ? null : _create,
+            child: const Text('创建安全身份'),
+          ),
+        ),
+        const SizedBox(height: 12),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton(
+            onPressed: _busy ? null : () => setState(() => _restoring = true),
+            child: const Text('恢复已有身份'),
+          ),
+        ),
+        const SizedBox(height: 15),
+        const SboxLockHint(text: '恢复信息只保存在你手中'),
+      ],
+    );
+  }
+
+  Widget _buildPendingCloudCard(BuildContext context, bool mobile) {
+    return SboxCard(
+      padding: EdgeInsets.symmetric(
+        horizontal: mobile ? 20 : 28,
+        vertical: mobile ? 20 : 22,
+      ),
+      child: Row(
+        children: <Widget>[
+          const Icon(
+            Icons.cloud_upload_outlined,
+            color: SboxColors.accent,
+            size: 52,
+          ),
+          SizedBox(width: mobile ? 18 : 25),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text('云端备份', style: Theme.of(context).textTheme.titleLarge),
+                const SizedBox(height: 4),
+                Text(
+                  '完成身份设置后再连接云端',
+                  style: Theme.of(context).textTheme.bodyLarge
+                      ?.copyWith(color: SboxColors.textMuted),
+                ),
+              ],
+            ),
+          ),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: <Widget>[
+              const StatusPill(
+                label: '待设置',
+                icon: Icons.more_horiz,
+                tone: SboxColors.textMuted,
+                compact: true,
+              ),
+              const SizedBox(height: 8),
+              TextButton(
+                onPressed: widget.controller.hasIdentity
+                    ? (widget.onOpenSettings ?? widget.onFinished)
+                    : () => _showFeedback('请先创建或恢复安全身份。'),
+                child: const Text('稍后设置  ›'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRecoveryPhrase(BuildContext context, bool mobile) {
+    final words = _mnemonic ?? const <String>[];
+    return SboxCard(
+      padding: EdgeInsets.fromLTRB(
+        mobile ? 16 : 30,
+        mobile ? 24 : 22,
+        mobile ? 16 : 30,
+        mobile ? 18 : 20,
+      ),
+      child: Column(
+        children: <Widget>[
+          Text('你的 12 个恢复词', style: Theme.of(context).textTheme.headlineMedium),
+          const SizedBox(height: 5),
+          const Text('这些词只显示一次，请抄写并妥善保管'),
+          const SizedBox(height: 18),
+          _WordGrid(words: words, inputs: false, mobile: mobile),
+          const SizedBox(height: 14),
+          const SecurityNotice(
+            title: '不要截图或发送给任何人',
+            message: '恢复词只保存在你手中。',
+            compact: true,
+            icon: Icons.shield_outlined,
+          ),
+          const SizedBox(height: 14),
+          if (mobile)
+            Column(
+              children: <Widget>[
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    onPressed: _copyMnemonic,
+                    child: const Text('复制恢复词'),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _busy ? null : () => setState(() => _step = 2),
+                    child: const Text('我已妥善保存，继续'),
+                  ),
+                ),
+              ],
+            )
+          else
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: _copyMnemonic,
+                    child: const Text('复制恢复词'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: _busy ? null : () => setState(() => _step = 2),
+                    child: const Text('我已妥善保存，继续'),
+                  ),
+                ),
+              ],
+            ),
+          const SizedBox(height: 10),
+          const Text('恢复词只显示一次，完成后请离线保管'),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRestoreIdentity(BuildContext context, bool mobile) {
+    return SboxCard(
+      padding: EdgeInsets.fromLTRB(
+        mobile ? 16 : 30,
+        mobile ? 24 : 22,
+        mobile ? 16 : 30,
+        mobile ? 18 : 20,
+      ),
+      child: Column(
+        children: <Widget>[
+          Text('输入 12 个恢复词', style: Theme.of(context).textTheme.headlineMedium),
+          const SizedBox(height: 5),
+          const Text('按顺序输入恢复词，恢复词只保存在你手中'),
+          const SizedBox(height: 18),
+          _WordGrid(
+            words: const <String>[],
+            inputs: true,
+            mobile: mobile,
+            controllers: _restoreControllers,
+          ),
+          const SizedBox(height: 14),
+          if (mobile)
+            Column(
+              children: <Widget>[
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    onPressed: _busy ? null : _pasteRecoveryPhrase,
+                    child: const Text('粘贴恢复词'),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _busy ? null : _restore,
+                    child: Text(_busy ? '正在恢复…' : '恢复身份'),
+                  ),
+                ),
+              ],
+            )
+          else
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: _busy ? null : _pasteRecoveryPhrase,
+                    child: const Text('粘贴恢复词'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: _busy ? null : _restore,
+                    child: Text(_busy ? '正在恢复…' : '恢复身份'),
+                  ),
+                ),
+              ],
+            ),
+          const SizedBox(height: 10),
+          const SboxLockHint(text: '恢复词仅用于本地恢复，不会上传'),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCloudStep(BuildContext context, bool mobile) {
+    return Column(
+      children: <Widget>[
+        SboxCard(
+          padding: EdgeInsets.all(mobile ? 24 : 30),
+          child: Column(
+            children: <Widget>[
+              const Icon(
+                Icons.cloud_done_outlined,
+                color: SboxColors.accent,
+                size: 78,
+              ),
+              const SizedBox(height: 14),
+              Text('云端备份', style: Theme.of(context).textTheme.headlineMedium),
+              const SizedBox(height: 8),
+              Text(
+                '你的安全身份已经准备好。现在可以连接 GitHub 和 Gitee，保存文件的云端副本。',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodyLarge
+                    ?.copyWith(color: SboxColors.textMuted),
+              ),
+              const SizedBox(height: 20),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: widget.onOpenSettings ?? widget.onFinished,
+                  child: const Text('配置云端备份'),
+                ),
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton(
+                  onPressed: () => setState(() => _step = 3),
+                  child: const Text('稍后设置'),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _continueButton(
+          context,
+          mobile: mobile,
+          label: '继续设置',
+          onPressed: () => setState(() => _step = 3),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCompleteStep(BuildContext context, bool mobile) {
+    return Column(
+      children: <Widget>[
+        SboxCard(
+          padding: EdgeInsets.all(mobile ? 28 : 40),
+          child: Column(
+            children: <Widget>[
+              const SboxShieldMark(size: 104, filled: true),
+              const SizedBox(height: 18),
+              Text('一切准备就绪', style: Theme.of(context).textTheme.headlineMedium),
+              const SizedBox(height: 8),
+              const Text('之后只需拖入文件，SafeBox 会自动保护它们。'),
+              const SizedBox(height: 24),
+              SizedBox(
+                width: mobile ? double.infinity : 280,
+                child: ElevatedButton(
+                  onPressed: widget.onFinished,
+                  child: const Text('开始使用 SafeBox'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _continueButton(
+    BuildContext context, {
+    required bool mobile,
+    required String label,
+    required VoidCallback? onPressed,
+  }) {
+    return Align(
+      alignment: mobile ? Alignment.center : Alignment.centerRight,
+      child: SizedBox(
+        width: mobile ? double.infinity : 220,
+        child: ElevatedButton.icon(
+          onPressed: onPressed,
+          icon: const Icon(Icons.arrow_forward_rounded),
+          label: Text(label),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBottomHint(BuildContext context, bool mobile) {
+    return Align(
+      alignment: mobile ? Alignment.centerLeft : Alignment.centerLeft,
+      child: const SboxLockHint(text: '设置完成后即可开始上传文件'),
+    );
+  }
+
+  Future<void> _create() async {
+    setState(() => _busy = true);
+    try {
+      final mnemonic = await widget.controller.createIdentity();
+      final words = mnemonic.trim().split(RegExp(r'\s+'));
+      if (!mounted) return;
+      setState(() {
+        _mnemonic = words.length == 12 ? words : List<String>.filled(12, '—');
+        _busy = false;
+      });
+    } catch (error) {
+      if (mounted) {
+        setState(() => _busy = false);
+        _showFeedback('安全身份创建失败，请重试。');
+      }
+    }
+  }
+
+  Future<void> _restore() async {
+    final words = _restoreControllers.map(
+      (controller) => controller.text.trim(),
+    );
+    if (words.any((word) => word.isEmpty)) {
+      _showFeedback('请按顺序填写全部 12 个恢复词。');
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      await widget.controller.restoreIdentity(words.join(' '));
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _step = 2;
+      });
+    } catch (error) {
+      if (mounted) {
+        setState(() => _busy = false);
+        _showFeedback('恢复词不正确，请检查后重试。');
+      }
+    }
+  }
+
+  Future<void> _copyMnemonic() async {
+    final words = _mnemonic;
+    if (words == null) return;
+    await Clipboard.setData(ClipboardData(text: words.join(' ')));
+    if (mounted) _showFeedback('恢复词已复制，请立即离线保存。');
+  }
+
+  Future<void> _pasteRecoveryPhrase() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text ?? '';
+    final words = text.trim().split(RegExp(r'\s+'));
+    if (words.length != 12) {
+      _showFeedback('剪贴板中没有找到 12 个恢复词。');
+      return;
+    }
+    for (var index = 0; index < words.length; index++) {
+      _restoreControllers[index].text = words[index];
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _showFeedback(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
 }
 
-class _IdentityChoice extends StatelessWidget {
-  const _IdentityChoice({
-    required this.icon,
-    required this.title,
-    required this.description,
-    required this.action,
-    required this.onPressed,
-    this.primary = false,
-  });
+final class _StepProgress extends StatelessWidget {
+  const _StepProgress({required this.step, required this.mobile});
 
-  final IconData icon;
-  final String title;
-  final String description;
-  final String action;
-  final VoidCallback onPressed;
-  final bool primary;
+  final int step;
+  final bool mobile;
 
   @override
   Widget build(BuildContext context) {
-    return SboxCard(
-      color: SboxColors.panelSoft,
-      borderColor: primary
-          ? SboxColors.accent.withValues(alpha: 0.4)
-          : SboxColors.border,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+    const labels = <String>['安全身份', '云端备份', '完成'];
+    return SizedBox(
+      width: mobile ? double.infinity : 600,
+      child: Row(
         children: <Widget>[
-          Icon(
-            icon,
-            color: primary ? SboxColors.accent : SboxColors.textMuted,
-            size: 28,
+          for (var index = 0; index < labels.length; index++) ...<Widget>[
+            Expanded(
+              child: Column(
+                children: <Widget>[
+                  Row(
+                    children: <Widget>[
+                      if (index > 0)
+                        Expanded(
+                          child: Container(
+                            height: 1.5,
+                            color: index < step
+                                ? SboxColors.accent
+                                : SboxColors.border,
+                          ),
+                        ),
+                      Container(
+                        width: mobile ? 42 : 40,
+                        height: mobile ? 42 : 40,
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: index + 1 <= step
+                              ? SboxColors.accent
+                              : Colors.transparent,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: index + 1 <= step
+                                ? SboxColors.accent
+                                : SboxColors.border,
+                            width: 1.4,
+                          ),
+                        ),
+                        child: Text(
+                          '${index + 1}',
+                          style: TextStyle(
+                            color: index + 1 <= step
+                                ? const Color(0xFF03211D)
+                                : SboxColors.textMuted,
+                            fontSize: 18,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      if (index < labels.length - 1)
+                        Expanded(
+                          child: Container(
+                            height: 1.5,
+                            color: index + 1 < step
+                                ? SboxColors.accent
+                                : SboxColors.border,
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 7),
+                  Text(
+                    labels[index],
+                    style: TextStyle(
+                      color: index + 1 == step
+                          ? SboxColors.accent
+                          : SboxColors.textMuted,
+                      fontSize: mobile ? 13 : 14,
+                      fontWeight: index + 1 == step
+                          ? FontWeight.w700
+                          : FontWeight.w500,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+final class _WordGrid extends StatelessWidget {
+  const _WordGrid({
+    required this.words,
+    required this.inputs,
+    required this.mobile,
+    this.controllers,
+  });
+
+  final List<String> words;
+  final bool inputs;
+  final bool mobile;
+  final List<TextEditingController>? controllers;
+
+  @override
+  Widget build(BuildContext context) {
+    final columns = mobile ? 2 : 3;
+    return GridView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      itemCount: 12,
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: columns,
+        crossAxisSpacing: mobile ? 8 : 12,
+        mainAxisSpacing: 8,
+        childAspectRatio: mobile ? 2.4 : 3.7,
+      ),
+      itemBuilder: (context, index) {
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          decoration: BoxDecoration(
+            color: SboxColors.panelRaised.withValues(alpha: 0.62),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: SboxColors.border),
           ),
-          const SizedBox(height: 16),
-          Text(title, style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 7),
-          Text(description, style: Theme.of(context).textTheme.bodyMedium),
-          const SizedBox(height: 18),
-          SizedBox(
-            width: double.infinity,
-            child: primary
-                ? ElevatedButton(onPressed: onPressed, child: Text(action))
-                : OutlinedButton(onPressed: onPressed, child: Text(action)),
+          child: Row(
+            children: <Widget>[
+              SizedBox(
+                width: index >= 9 ? 27 : 18,
+                child: Text(
+                  '${index + 1}',
+                  style: const TextStyle(
+                    color: SboxColors.accent,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              if (inputs)
+                Expanded(
+                  child: TextField(
+                    controller: controllers![index],
+                    decoration: InputDecoration(
+                      hintText: '第 ${index + 1} 个词',
+                      border: InputBorder.none,
+                      enabledBorder: InputBorder.none,
+                      focusedBorder: InputBorder.none,
+                      filled: false,
+                      contentPadding: EdgeInsets.zero,
+                      hintStyle: const TextStyle(color: SboxColors.textMuted),
+                    ),
+                    style: const TextStyle(color: SboxColors.text),
+                  ),
+                )
+              else
+                Expanded(
+                  child: Text(
+                    index < words.length ? words[index] : '—',
+                    style: const TextStyle(
+                      color: SboxColors.text,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+final class _ShieldArt extends StatelessWidget {
+  const _ShieldArt({required this.size});
+
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: size,
+      height: size,
+      child: Stack(
+        alignment: Alignment.center,
+        children: <Widget>[
+          Container(
+            width: size * 0.86,
+            height: size * 0.32,
+            decoration: BoxDecoration(
+              border: Border.all(
+                color: SboxColors.accent.withValues(alpha: 0.3),
+              ),
+              borderRadius: BorderRadius.all(
+                Radius.elliptical(size, size * 0.3),
+              ),
+            ),
+          ),
+          Container(
+            width: size * 0.7,
+            height: size * 0.2,
+            decoration: BoxDecoration(
+              border: Border.all(
+                color: SboxColors.accent.withValues(alpha: 0.18),
+              ),
+              borderRadius: BorderRadius.all(
+                Radius.elliptical(size, size * 0.3),
+              ),
+            ),
+          ),
+          const SboxShieldMark(size: 136, filled: true),
+          Positioned(
+            bottom: size * 0.12,
+            child: Container(
+              width: size * 0.26,
+              height: 5,
+              decoration: BoxDecoration(
+                color: SboxColors.accent,
+                borderRadius: BorderRadius.circular(999),
+                boxShadow: <BoxShadow>[
+                  BoxShadow(
+                    color: SboxColors.accent.withValues(alpha: 0.8),
+                    blurRadius: 18,
+                  ),
+                ],
+              ),
+            ),
           ),
         ],
       ),

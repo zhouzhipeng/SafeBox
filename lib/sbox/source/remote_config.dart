@@ -6,8 +6,8 @@ final class RepositorySourceConfig {
     required String repository,
     required String branch,
     String pathPrefix = '',
-  }) : owner = _repositoryComponent(owner, 'owner'),
-       repository = _repositoryComponent(repository, 'repository'),
+  }) : owner = _component(owner, 'owner'),
+       repository = _component(repository, 'repository'),
        branch = _branch(branch),
        pathPrefix = _prefix(pathPrefix);
 
@@ -16,11 +16,12 @@ final class RepositorySourceConfig {
   final String branch;
   final String pathPrefix;
 
-  SourcePath resolve(SourcePath path) =>
-      SourcePath(pathPrefix.isEmpty ? path.value : '$pathPrefix/${path.value}');
+  String resolveBasename(SourcePath path) =>
+      pathPrefix.isEmpty ? path.value : '$pathPrefix/${path.value}';
 
-  static String _repositoryComponent(String value, String name) {
-    if (value.length > 100 ||
+  static String _component(String value, String name) {
+    if (value.isEmpty ||
+        value.length > 100 ||
         !RegExp(r'^[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?$')
             .hasMatch(value) ||
         value == '.' ||
@@ -40,16 +41,26 @@ final class RepositorySourceConfig {
         value.endsWith('.') ||
         value.endsWith('.lock') ||
         RegExp(r'[\x00-\x20\x7f~^:?*\\\[]').hasMatch(value)) {
-      throw ArgumentError.value(value, 'branch', 'Invalid writable branch');
+      throw ArgumentError.value(value, 'branch', 'Invalid branch');
     }
     return value;
   }
 
   static String _prefix(String value) {
-    if (value.isEmpty) {
-      return '';
+    if (value.isEmpty) return '';
+    if (value.startsWith('/') ||
+        value.endsWith('/') ||
+        value.contains('\\') ||
+        value.contains('%')) {
+      throw ArgumentError.value(value, 'pathPrefix', 'Invalid path prefix');
     }
-    return SourcePath(value).value;
+    final segments = value.split('/');
+    if (segments.any(
+      (segment) => segment.isEmpty || segment == '.' || segment == '..',
+    )) {
+      throw ArgumentError.value(value, 'pathPrefix', 'Invalid path prefix');
+    }
+    return value;
   }
 }
 
@@ -66,17 +77,15 @@ final class HttpsSourceConfig {
   final Uri baseUri;
   final int maxObjectBytes;
 
-  Uri resolve(SourcePath path) {
-    return Uri(
-      scheme: 'https',
-      host: baseUri.host,
-      port: baseUri.hasPort ? baseUri.port : null,
-      pathSegments: <String>[
-        ...baseUri.pathSegments.where((segment) => segment.isNotEmpty),
-        ...path.segments,
-      ],
-    );
-  }
+  Uri resolve(SourcePath path) => Uri(
+    scheme: 'https',
+    host: baseUri.host,
+    port: baseUri.hasPort ? baseUri.port : null,
+    pathSegments: <String>[
+      ...baseUri.pathSegments.where((segment) => segment.isNotEmpty),
+      path.value,
+    ],
+  );
 
   static Uri _validateBase(Uri value) {
     if (value.scheme != 'https' ||

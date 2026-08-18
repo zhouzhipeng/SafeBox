@@ -4,16 +4,19 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
-import '../catalog/strict_json.dart';
+import '../../app/app_logger.dart';
 import '../errors.dart';
+import '../format/strict_json.dart';
 
-enum RemoteFailureContext { read, immutableCreate, conditionalWrite }
+enum RemoteFailureContext { read, immutableCreate, delete }
 
 final class RemoteHttp {
   RemoteHttp(
     this.client, {
     this.requestTimeout = const Duration(seconds: 30),
     this.streamIdleTimeout = const Duration(seconds: 30),
+    this.logger,
+    this.sourceName = '云端数据源',
   });
 
   static const int maximumRedirects = 5;
@@ -24,12 +27,23 @@ final class RemoteHttp {
   final http.Client client;
   final Duration requestTimeout;
   final Duration streamIdleTimeout;
+  final AppLogger? logger;
+  final String sourceName;
 
   Future<http.StreamedResponse> get(
     Uri uri, {
     Map<String, String> headers = const <String, String>{},
   }) async {
-    _requireHttps(uri);
+    try {
+      _requireHttps(uri);
+    } on Object catch (error) {
+      _logError(
+        error,
+        operation: '$sourceName：检查 HTTPS 地址',
+        context: _endpoint(uri),
+      );
+      rethrow;
+    }
     var current = uri;
     var currentHeaders = Map<String, String>.of(headers);
     for (var redirects = 0; ; redirects++) {
@@ -38,40 +52,74 @@ final class RemoteHttp {
         ..headers.addAll(currentHeaders);
       final response = await _send(request);
       _checkHeaderLimit(response.headers);
-      if (!_isRedirect(response.statusCode)) {
-        return response;
-      }
+      if (!_isRedirect(response.statusCode)) return response;
       if (redirects >= maximumRedirects) {
-        await _discard(response.stream);
+        await discard(response.stream);
+        logger?.warning(
+          '$sourceName：重定向次数超过上限',
+          detail: 'GET ${_endpoint(uri)} · 最多允许 $maximumRedirects 次',
+        );
         throw _networkError();
       }
       final location = response.headers['location'];
       if (location == null) {
-        await _discard(response.stream);
+        await discard(response.stream);
+        logger?.warning(
+          '$sourceName：响应缺少重定向地址',
+          detail: 'GET ${_endpoint(current)} · HTTP ${response.statusCode}',
+        );
         throw _networkError();
       }
-      final next = current.resolve(location);
-      _requireHttps(next);
-      if (!_sameOrigin(current, next)) {
-        currentHeaders.removeWhere((name, _) {
-          final lower = name.toLowerCase();
-          return lower == 'authorization' || lower == 'cookie';
-        });
+      late final Uri next;
+      try {
+        next = current.resolve(location);
+        _requireHttps(next);
+      } on Object catch (error) {
+        await discard(response.stream);
+        _logError(
+          error,
+          operation: '$sourceName：拒绝不安全重定向',
+          context: 'GET ${_endpoint(current)} · HTTP ${response.statusCode}',
+        );
+        rethrow;
       }
-      await _discard(response.stream);
+      if (!_sameOrigin(current, next)) {
+        currentHeaders.removeWhere(
+          (key, _) =>
+              key.toLowerCase() == 'authorization' ||
+              key.toLowerCase() == 'cookie',
+        );
+      }
+      logger?.info(
+        '$sourceName：跟随 HTTPS 重定向',
+        detail: '${_endpoint(current)} → ${_endpoint(next)}',
+      );
+      await discard(response.stream);
       current = next;
     }
   }
 
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
-    _requireHttps(request.url);
+    try {
+      _requireHttps(request.url);
+    } on Object catch (error) {
+      _logError(
+        error,
+        operation: '$sourceName：检查 HTTPS 地址',
+        context: '${request.method} ${_endpoint(request.url)}',
+      );
+      rethrow;
+    }
     request.followRedirects = false;
     final response = await _send(request);
     _checkHeaderLimit(response.headers);
     if (_isRedirect(response.statusCode)) {
-      await _discard(response.stream);
-      // Upload streams cannot safely be replayed after a provider redirect.
-      // Canonical API endpoints must not redirect writes, so fail closed.
+      await discard(response.stream);
+      logger?.warning(
+        '$sourceName：写入请求被重定向',
+        detail:
+            '${request.method} ${_endpoint(request.url)} · HTTP ${response.statusCode}',
+      );
       throw _networkError();
     }
     return response;
@@ -80,12 +128,41 @@ final class RemoteHttp {
   Stream<List<int>> withIdleTimeout(Stream<List<int>> source) => source.timeout(
     streamIdleTimeout,
     onTimeout: (sink) {
+      logger?.error(
+        _networkError(),
+        operation: '$sourceName：读取云端响应超时',
+        context: '响应流连续 $streamIdleTimeout 无数据',
+      );
       sink.addError(_networkError());
       sink.close();
     },
   );
 
   Future<Map<String, Object?>> readJsonObject(
+    http.StreamedResponse response, {
+    int maximumBytes = maximumMetadataBytes,
+  }) async {
+    final value = await readJsonValue(response, maximumBytes: maximumBytes);
+    if (value is! Map<String, Object?>) {
+      logger?.warning('$sourceName：云端对象响应格式错误', detail: '期望 JSON 对象');
+      throw const SboxException(SboxErrorCode.sourceNetwork, '数据源返回了无效对象响应');
+    }
+    return value;
+  }
+
+  Future<List<Object?>> readJsonList(
+    http.StreamedResponse response, {
+    int maximumBytes = maximumMetadataBytes,
+  }) async {
+    final value = await readJsonValue(response, maximumBytes: maximumBytes);
+    if (value is! List<Object?>) {
+      logger?.warning('$sourceName：云端列表响应格式错误', detail: '期望 JSON 列表');
+      throw const SboxException(SboxErrorCode.sourceNetwork, '数据源返回了无效列表响应');
+    }
+    return value;
+  }
+
+  Future<Object?> readJsonValue(
     http.StreamedResponse response, {
     int maximumBytes = maximumMetadataBytes,
   }) async {
@@ -96,15 +173,19 @@ final class RemoteHttp {
     try {
       final value = StrictJsonParser(
         utf8.decode(bytes, allowMalformed: false),
-        maximumDepth: 16,
         maximumStringCodeUnits: maximumBytes,
       ).parse();
-      if (value is! Map<String, Object?>) {
-        throw const FormatException('Expected JSON object');
-      }
       return value;
-    } on FormatException {
-      throw _networkError();
+    } on Object catch (error) {
+      _logError(
+        error,
+        operation: '$sourceName：解析云端 JSON 失败',
+        context: '响应体未记录',
+      );
+      throw const SboxException(
+        SboxErrorCode.sourceNetwork,
+        '数据源返回了无效 JSON 响应',
+      );
     }
   }
 
@@ -118,17 +199,42 @@ final class RemoteHttp {
       await for (final chunk in withIdleTimeout(source)) {
         count += chunk.length;
         if (count > maximumBytes) {
+          logger?.warning(
+            '$sourceName：云端响应超过大小上限',
+            detail: '读取上限 $maximumBytes 字节',
+          );
           throw _networkError();
         }
         output.add(chunk);
       }
-      return output.takeBytes();
     } on SboxException {
       rethrow;
-    } on TimeoutException {
+    } on Object catch (error) {
+      _logError(
+        error,
+        operation: '$sourceName：读取云端响应失败',
+        context: '已读取 $count 字节',
+      );
       throw _networkError();
-    } on http.ClientException {
-      throw _networkError();
+    }
+    return output.takeBytes();
+  }
+
+  Future<void> discard(Stream<List<int>> source) async {
+    var count = 0;
+    try {
+      await for (final chunk in withIdleTimeout(source)) {
+        count += chunk.length;
+        if (count > maximumErrorBodyBytes) break;
+      }
+    } on Object catch (error) {
+      // Draining an error body is cleanup. Preserve the original HTTP status
+      // classification even if the provider closes the body unexpectedly.
+      _logError(
+        error,
+        operation: '$sourceName：清理云端错误响应失败',
+        context: '已读取 $count 字节',
+      );
     }
   }
 
@@ -136,40 +242,41 @@ final class RemoteHttp {
     http.StreamedResponse response,
     RemoteFailureContext context,
   ) async {
-    await _discard(response.stream);
-    final code = response.statusCode;
-    if (code == 401 || code == 403) {
-      throw const SboxException(
-        SboxErrorCode.sourceAuthentication,
-        '数据源授权缺失、过期或权限不足',
-      );
+    final statusCode = response.statusCode;
+    logger?.warning(
+      '$sourceName：云端请求返回错误',
+      detail:
+          '${response.request?.method ?? 'REQUEST'} ${_endpoint(response.request?.url)} · '
+          'HTTP $statusCode · 阶段 ${context.name}',
+    );
+    await discard(response.stream);
+    switch (statusCode) {
+      case 401:
+      case 403:
+        throw const SboxException(
+          SboxErrorCode.sourceAuthentication,
+          '数据源授权失败',
+        );
+      case 404:
+        throw const SboxException(SboxErrorCode.sourceNotFound, '数据源对象不存在');
+      case 409:
+      case 412:
+        throw SboxException(
+          context == RemoteFailureContext.immutableCreate
+              ? SboxErrorCode.immutableConflict
+              : SboxErrorCode.shardConflict,
+          '远端对象状态发生冲突',
+        );
+      case 429:
+        throw const SboxException(SboxErrorCode.sourceRateLimit, '数据源暂时限制请求频率');
+      case 413:
+        throw const SboxException(SboxErrorCode.sourceLimit, '对象超过数据源上限');
+      default:
+        throw SboxException(
+          SboxErrorCode.sourceNetwork,
+          '数据源请求失败（HTTP $statusCode）',
+        );
     }
-    if (code == 404) {
-      throw const SboxException(SboxErrorCode.sourceNotFound, '数据源对象不存在');
-    }
-    if (code == 409 || code == 412) {
-      if (context == RemoteFailureContext.immutableCreate) {
-        throw const SboxException(SboxErrorCode.remoteChanged, '远端对象路径已被占用');
-      }
-      throw const SboxException(SboxErrorCode.syncConflict, '远端已变化，请处理同步冲突');
-    }
-    if (code == 429) {
-      throw const SboxException(SboxErrorCode.sourceRateLimit, '数据源暂时限制请求频率');
-    }
-    if (code == 413) {
-      throw const SboxException(SboxErrorCode.sourceLimit, '对象超过数据源请求上限');
-    }
-    if (code == 422 && context != RemoteFailureContext.read) {
-      throw SboxException(
-        context == RemoteFailureContext.conditionalWrite
-            ? SboxErrorCode.syncConflict
-            : SboxErrorCode.remoteChanged,
-        context == RemoteFailureContext.conditionalWrite
-            ? '远端条件更新被拒绝'
-            : '远端对象创建被拒绝',
-      );
-    }
-    throw _networkError();
   }
 
   Future<http.StreamedResponse> _send(http.BaseRequest request) async {
@@ -177,35 +284,43 @@ final class RemoteHttp {
       return await client.send(request).timeout(requestTimeout);
     } on SboxException {
       rethrow;
-    } on TimeoutException {
-      throw _networkError();
-    } on http.ClientException {
-      throw _networkError();
-    } on Object {
-      // Socket/TLS implementations vary between native and web clients. Do
-      // not expose their messages because they can include sensitive URLs.
+    } on Object catch (error) {
+      _logError(
+        error,
+        operation: '$sourceName：建立 HTTPS 请求失败',
+        context:
+            '${request.method} ${_endpoint(request.url)} · 请求超时 ${requestTimeout.inSeconds}s',
+      );
       throw _networkError();
     }
   }
 
-  Future<void> _discard(Stream<List<int>> stream) async {
-    var count = 0;
-    await for (final chunk in withIdleTimeout(stream)) {
-      count += chunk.length;
-      if (count > maximumErrorBodyBytes) {
-        break;
-      }
-    }
-  }
-
-  static void _checkHeaderLimit(Map<String, String> headers) {
-    var size = 0;
+  void _checkHeaderLimit(Map<String, String> headers) {
+    var total = 0;
     for (final entry in headers.entries) {
-      size += entry.key.length + entry.value.length + 4;
-      if (size > maximumHeaderBytes) {
+      total += entry.key.length + entry.value.length + 4;
+      if (total > maximumHeaderBytes) {
+        logger?.warning(
+          '$sourceName：云端响应头超过大小上限',
+          detail: '读取上限 $maximumHeaderBytes 字节',
+        );
         throw _networkError();
       }
     }
+  }
+
+  void _logError(
+    Object error, {
+    required String operation,
+    required String context,
+  }) {
+    logger?.error(error, operation: operation, context: context);
+  }
+
+  static String _endpoint(Uri? uri) {
+    if (uri == null || uri.host.isEmpty) return '未知地址';
+    final port = uri.hasPort ? ':${uri.port}' : '';
+    return '${uri.scheme}://${uri.host}$port';
   }
 
   static bool _isRedirect(int status) =>

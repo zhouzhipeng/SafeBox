@@ -1,0 +1,943 @@
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:path/path.dart' as p;
+
+import '../../app/app_controller.dart';
+import '../../app/sbox_theme.dart';
+import '../../app/sbox_widgets.dart';
+import '../../platform/app_settings_store.dart';
+import '../../platform/cloud_backup_configuration_store.dart';
+import '../../platform/secure_credential_store.dart';
+import '../../platform/temporary_plaintext_platform.dart';
+import '../../sbox/bytes.dart';
+import '../../sbox/source/cloud_backup_config.dart';
+import '../../sbox/source/credential.dart';
+import '../../sbox/source/gitee_source.dart';
+import '../../sbox/source/github_source.dart';
+import '../../sbox/storage/temporary_plaintext_store.dart';
+
+final class SettingsPage extends StatefulWidget {
+  const SettingsPage({
+    super.key,
+    required this.controller,
+    this.onOpenOnboarding,
+    this.onCloudStateChanged,
+  });
+
+  final AppController controller;
+  final VoidCallback? onOpenOnboarding;
+  final VoidCallback? onCloudStateChanged;
+
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+final class _SettingsPageState extends State<SettingsPage> {
+  static final _githubCredential = SourceCredentialId('safebox-github-token');
+  static final _giteeCredential = SourceCredentialId('safebox-gitee-token');
+
+  final _configurationStore = CloudBackupConfigurationStore();
+  final _credentialStore = PlatformCredentialStore();
+  final _temporaryStore = TemporaryPlaintextStore();
+  final _appSettingsStore = AppSettingsStore();
+  final _githubAddressController = TextEditingController(
+    text: 'https://github.com/your-account/your-repository',
+  );
+  final _giteeAddressController = TextEditingController(
+    text: 'https://gitee.com/your-account/your-repository',
+  );
+  final _githubTokenController = TextEditingController();
+  final _giteeTokenController = TextEditingController();
+  bool _cloudExpanded = false;
+  bool _autoSync = true;
+  bool _clearOnExit = false;
+  bool _loading = true;
+  bool _saving = false;
+  bool _githubConnected = false;
+  bool _giteeConnected = false;
+  String? _testingProvider;
+  String? _activeTokenField;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    for (final controller in <TextEditingController>[
+      _githubAddressController,
+      _giteeAddressController,
+      _githubTokenController,
+      _giteeTokenController,
+    ]) {
+      controller.clear();
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final mobile = constraints.maxWidth < 760;
+        return SingleChildScrollView(
+          padding: EdgeInsets.fromLTRB(
+            mobile ? 24 : 32,
+            mobile ? 28 : 40,
+            mobile ? 24 : 32,
+            mobile ? 32 : 44,
+          ),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 1480),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const PageHeading(title: '设置', subtitle: '管理安全身份、云端备份和使用习惯'),
+                  SizedBox(height: mobile ? 28 : 24),
+                  _buildIdentityCard(context, mobile),
+                  const SizedBox(height: 14),
+                  _buildCloudCard(context, mobile),
+                  if (_cloudExpanded) ...<Widget>[
+                    const SizedBox(height: 14),
+                    _buildAutoSyncCard(context, mobile),
+                  ],
+                  const SizedBox(height: 14),
+                  _buildHabitsCard(context, mobile),
+                  if (_loading) ...<Widget>[
+                    const SizedBox(height: 14),
+                    const LinearProgressIndicator(minHeight: 2),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildIdentityCard(BuildContext context, bool mobile) {
+    final identityReady = widget.controller.hasIdentity;
+    final details = Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: <Widget>[
+        SboxShieldMark(size: mobile ? 100 : 98),
+        SizedBox(width: mobile ? 18 : 30),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(
+                identityReady ? '已保护' : '待设置',
+                style: TextStyle(
+                  color: identityReady ? SboxColors.accent : SboxColors.warning,
+                  fontSize: mobile ? 20 : 18,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                identityReady ? _identityLabel : '还没有安全身份',
+                style: Theme.of(context).textTheme.headlineMedium
+                    ?.copyWith(fontSize: mobile ? 24 : 23),
+              ),
+              const SizedBox(height: 5),
+              Text(
+                '用于保护你的文件',
+                style: Theme.of(context).textTheme.bodyLarge
+                    ?.copyWith(color: SboxColors.textMuted),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+    final actions = Row(
+      children: <Widget>[
+        Expanded(
+          child: OutlinedButton.icon(
+            onPressed: identityReady ? _showRecoveryPhraseNotice : null,
+            icon: const Icon(Icons.assignment_turned_in_outlined),
+            label: const Text('备份恢复词'),
+          ),
+        ),
+        const SizedBox(width: 14),
+        Expanded(
+          child: OutlinedButton.icon(
+            onPressed: widget.onOpenOnboarding,
+            icon: const Icon(Icons.refresh_rounded),
+            label: const Text('恢复身份'),
+          ),
+        ),
+      ],
+    );
+    return SboxCard(
+      padding: EdgeInsets.fromLTRB(
+        mobile ? 18 : 30,
+        mobile ? 22 : 24,
+        mobile ? 18 : 30,
+        mobile ? 20 : 24,
+      ),
+      radius: mobile ? 16 : 14,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text('安全身份', style: Theme.of(context).textTheme.headlineMedium),
+          SizedBox(height: mobile ? 22 : 16),
+          if (mobile) ...<Widget>[
+            details,
+            const SizedBox(height: 22),
+            actions,
+            const SizedBox(height: 14),
+            const _LockHint(text: '恢复词只保存在你手中'),
+          ] else
+            Row(
+              children: <Widget>[
+                Expanded(child: details),
+                const SizedBox(width: 44),
+                SizedBox(width: 532, child: actions),
+              ],
+            ),
+          if (!mobile) ...<Widget>[
+            const SizedBox(height: 12),
+            const Align(
+              alignment: Alignment.centerRight,
+              child: _LockHint(text: '恢复词只保存在你手中'),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCloudCard(BuildContext context, bool mobile) {
+    return SboxCard(
+      padding: EdgeInsets.fromLTRB(
+        mobile ? 18 : 30,
+        mobile ? 22 : 24,
+        mobile ? 18 : 24,
+        mobile ? 20 : 24,
+      ),
+      radius: mobile ? 16 : 14,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          InkWell(
+            onTap: () => setState(() => _cloudExpanded = !_cloudExpanded),
+            borderRadius: BorderRadius.circular(10),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Row(
+                children: <Widget>[
+                  const Icon(
+                    Icons.cloud_download_outlined,
+                    color: SboxColors.accent,
+                    size: 40,
+                  ),
+                  const SizedBox(width: 20),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(
+                          '云端备份',
+                          style: Theme.of(context).textTheme.headlineMedium,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '粘贴完整地址即可，不需要分别填写账号和仓库名',
+                          style: Theme.of(context).textTheme.bodyLarge
+                              ?.copyWith(
+                                color: SboxColors.textMuted,
+                                fontSize: mobile ? 13 : 15,
+                              ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Icon(
+                    _cloudExpanded
+                        ? Icons.keyboard_arrow_up_rounded
+                        : Icons.keyboard_arrow_down_rounded,
+                    color: SboxColors.textMuted,
+                    size: 28,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 18),
+          if (_cloudExpanded)
+            _buildCloudEditor(context, mobile)
+          else
+            _buildCloudSummary(context, mobile),
+          if (!_cloudExpanded) ...<Widget>[
+            const SizedBox(height: 14),
+            _buildAutoSyncRow(context, mobile),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCloudSummary(BuildContext context, bool mobile) {
+    final children = <Widget>[
+      _CloudSummaryLine(
+        icon: Icons.cloud_outlined,
+        label: '主备份',
+        connected: _githubConnected,
+      ),
+      if (!mobile) const SizedBox(width: 36),
+      if (!mobile)
+        Container(width: 1, height: 34, color: SboxColors.textDim)
+      else
+        const Divider(height: 24),
+      if (!mobile) const SizedBox(width: 36),
+      _CloudSummaryLine(
+        icon: Icons.cloud_outlined,
+        label: '备用备份',
+        connected: _giteeConnected,
+      ),
+    ];
+    return mobile ? Column(children: children) : Row(children: children);
+  }
+
+  Widget _buildCloudEditor(BuildContext context, bool mobile) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final width = mobile
+                ? constraints.maxWidth
+                : (constraints.maxWidth - 30) / 2;
+            return Wrap(
+              spacing: 30,
+              runSpacing: 14,
+              children: <Widget>[
+                SizedBox(
+                  width: width,
+                  child: _buildRepositoryCard(
+                    context,
+                    provider: 'GitHub',
+                    addressController: _githubAddressController,
+                    tokenController: _githubTokenController,
+                    connected: _githubConnected,
+                  ),
+                ),
+                SizedBox(
+                  width: width,
+                  child: _buildRepositoryCard(
+                    context,
+                    provider: 'Gitee',
+                    addressController: _giteeAddressController,
+                    tokenController: _giteeTokenController,
+                    connected: _giteeConnected,
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+        const SizedBox(height: 16),
+        Align(
+          alignment: Alignment.center,
+          child: SizedBox(
+            width: mobile ? double.infinity : 250,
+            child: ElevatedButton(
+              onPressed: _saving ? null : _saveConfiguration,
+              child: Text(_saving ? '保存中…' : '保存设置'),
+            ),
+          ),
+        ),
+        const SizedBox(height: 9),
+        const _LockHint(text: '凭证仅保存在本机'),
+      ],
+    );
+  }
+
+  Widget _buildRepositoryCard(
+    BuildContext context, {
+    required String provider,
+    required TextEditingController addressController,
+    required TextEditingController tokenController,
+    required bool connected,
+  }) {
+    final tokenField = '$provider-token';
+    final tokenVisible = _activeTokenField == tokenField;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
+      decoration: BoxDecoration(
+        color: SboxColors.panelSoft,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: SboxColors.borderSoft),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              _ProviderMark(provider: provider),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  provider,
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+              ),
+              StatusPill(
+                label: connected ? '已连接' : '待设置',
+                icon: connected ? Icons.check_circle_outline : Icons.more_horiz,
+                tone: connected ? SboxColors.accent : SboxColors.warning,
+                compact: true,
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: addressController,
+            keyboardType: TextInputType.url,
+            decoration: const InputDecoration(
+              labelText: '完整地址',
+              hintText: 'https://github.com/your-account/your-repository',
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: tokenController,
+            obscureText: !tokenVisible,
+            decoration: InputDecoration(
+              labelText: '访问凭证',
+              hintText: connected ? '••••••••••••••••' : '输入访问凭证',
+              suffixIcon: IconButton(
+                tooltip: tokenVisible ? '隐藏凭证' : '显示凭证',
+                onPressed: () => setState(() {
+                  _activeTokenField = tokenVisible ? null : tokenField;
+                }),
+                icon: Icon(
+                  tokenVisible
+                      ? Icons.visibility_off_outlined
+                      : Icons.visibility_outlined,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton(
+            onPressed: _testingProvider == provider
+                ? null
+                : () => _testConnection(provider),
+            child: Text(_testingProvider == provider ? '测试中…' : '测试连接'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAutoSyncCard(BuildContext context, bool mobile) {
+    return SboxCard(
+      padding: EdgeInsets.symmetric(
+        horizontal: mobile ? 18 : 30,
+        vertical: mobile ? 18 : 20,
+      ),
+      radius: mobile ? 16 : 14,
+      child: _buildAutoSyncRow(context, mobile),
+    );
+  }
+
+  Widget _buildAutoSyncRow(BuildContext context, bool mobile) {
+    return Row(
+      children: <Widget>[
+        const Icon(Icons.sync_rounded, color: SboxColors.accent, size: 40),
+        const SizedBox(width: 20),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(
+                '自动同步',
+                style: Theme.of(context).textTheme.titleLarge
+                    ?.copyWith(fontSize: mobile ? 18 : 20),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                '文件保存后自动备份',
+                style: Theme.of(context).textTheme.bodyLarge
+                    ?.copyWith(color: SboxColors.textMuted),
+              ),
+            ],
+          ),
+        ),
+        Switch(
+          value: _autoSync,
+          onChanged: (value) => setState(() => _autoSync = value),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildHabitsCard(BuildContext context, bool mobile) {
+    final themeRow = _HabitRow(
+      icon: Icons.palette_outlined,
+      title: '界面主题',
+      value: '深色',
+      onTap: _showThemeNotice,
+    );
+    final fileRow = _HabitRow(
+      icon: Icons.description_outlined,
+      title: '打开文件后',
+      value: _clearOnExit ? '不保留临时文件' : '保留临时文件',
+      onTap: () async {
+        final value = !_clearOnExit;
+        setState(() => _clearOnExit = value);
+        try {
+          await _appSettingsStore.saveClearPlaintextOnExit(value);
+        } catch (error) {
+          if (mounted) widget.controller.setError(error, operation: '保存使用习惯失败');
+        }
+      },
+    );
+    return SboxCard(
+      padding: EdgeInsets.fromLTRB(
+        mobile ? 18 : 30,
+        mobile ? 22 : 24,
+        mobile ? 18 : 30,
+        mobile ? 22 : 24,
+      ),
+      radius: mobile ? 16 : 14,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text('使用习惯', style: Theme.of(context).textTheme.headlineMedium),
+          SizedBox(height: mobile ? 18 : 18),
+          if (mobile) ...<Widget>[
+            themeRow,
+            const Divider(height: 1),
+            fileRow,
+            const SizedBox(height: 14),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: OutlinedButton.icon(
+                onPressed: _clearTemporaryPlaintext,
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('清理临时文件'),
+              ),
+            ),
+            const SizedBox(height: 18),
+            const _HealthyStatus(),
+          ] else
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: <Widget>[
+                Expanded(child: themeRow),
+                const SizedBox(width: 28),
+                Container(width: 1, height: 42, color: SboxColors.textDim),
+                const SizedBox(width: 28),
+                Expanded(child: fileRow),
+                const SizedBox(width: 40),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: <Widget>[
+                    OutlinedButton.icon(
+                      onPressed: _clearTemporaryPlaintext,
+                      icon: const Icon(Icons.delete_outline),
+                      label: const Text('清理临时文件'),
+                    ),
+                    const SizedBox(height: 16),
+                    const _HealthyStatus(),
+                  ],
+                ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+
+  String get _identityLabel {
+    final identity = widget.controller.identityRecord;
+    if (identity == null) return '未设置';
+    final id = hexLower(identity.recipientKeyId);
+    return 'SB••••${id.substring(id.length - 4).toUpperCase()}';
+  }
+
+  Future<void> _load() async {
+    try {
+      final configuration = await _configurationStore.load();
+      if (configuration != null) {
+        _githubAddressController.text = _webUrl(configuration.github);
+        _giteeAddressController.text = _webUrl(configuration.gitee);
+        _githubConnected = await _hasToken(configuration.github.credentialId);
+        _giteeConnected = await _hasToken(configuration.gitee.credentialId);
+      }
+      _clearOnExit = await _appSettingsStore.loadClearPlaintextOnExit();
+    } catch (error) {
+      if (mounted) widget.controller.setError(error, operation: '读取设置失败');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _saveConfiguration() async {
+    final existing = await _configurationStore.load();
+    final githubUrl = _githubAddressController.text.trim();
+    final giteeUrl = _giteeAddressController.text.trim();
+    if (githubUrl.isEmpty || giteeUrl.isEmpty) {
+      _showFeedback('请填写 GitHub 和 Gitee 的完整地址。');
+      return;
+    }
+    late final CloudBackupConfiguration configuration;
+    try {
+      configuration = CloudBackupConfiguration(
+        backupDirectory:
+            existing?.backupDirectory ??
+            p.join(Directory.systemTemp.path, 'SafeBox', 'backup'),
+        github: CloudRepositoryEndpoint.fromRepositoryUrl(
+          githubUrl,
+          credentialId: _githubCredential,
+          expectedHost: 'github.com',
+        ),
+        gitee: CloudRepositoryEndpoint.fromRepositoryUrl(
+          giteeUrl,
+          credentialId: _giteeCredential,
+          expectedHost: 'gitee.com',
+        ),
+      );
+    } catch (_) {
+      _showFeedback('请填写有效的 GitHub / Gitee 完整地址。');
+      return;
+    }
+    setState(() => _saving = true);
+    try {
+      await _saveToken(_githubCredential, _githubTokenController.text.trim());
+      await _saveToken(_giteeCredential, _giteeTokenController.text.trim());
+      await _configurationStore.save(configuration);
+      _githubConnected = await _hasToken(_githubCredential);
+      _giteeConnected = await _hasToken(_giteeCredential);
+      _githubTokenController.clear();
+      _giteeTokenController.clear();
+      if (mounted) {
+        setState(() {});
+        _showFeedback('云端备份设置已保存。');
+      }
+      widget.onCloudStateChanged?.call();
+    } catch (error) {
+      if (mounted) {
+        widget.controller.setError(error, operation: '保存云端备份设置失败');
+        _showFeedback('设置暂时没有保存成功，请稍后重试。');
+      }
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Future<void> _testConnection(String provider) async {
+    final isGithub = provider == 'GitHub';
+    final address =
+        (isGithub ? _githubAddressController : _giteeAddressController).text
+            .trim();
+    final tokenController = isGithub
+        ? _githubTokenController
+        : _giteeTokenController;
+    final credential = isGithub ? _githubCredential : _giteeCredential;
+    late final CloudRepositoryEndpoint endpoint;
+    try {
+      endpoint = CloudRepositoryEndpoint.fromRepositoryUrl(
+        address,
+        credentialId: credential,
+        expectedHost: isGithub ? 'github.com' : 'gitee.com',
+      );
+    } catch (_) {
+      _showFeedback('请先填写有效的完整地址。');
+      return;
+    }
+    setState(() => _testingProvider = provider);
+    final client = http.Client();
+    try {
+      await _saveToken(credential, tokenController.text.trim());
+      if (isGithub) {
+        await GitHubDataSource(
+          config: endpoint.repositoryConfig,
+          client: client,
+          credentialStore: _credentialStore,
+          credentialId: credential,
+          logger: widget.controller.logger,
+        ).verifyRepository();
+      } else {
+        await GiteeDataSource(
+          config: endpoint.repositoryConfig,
+          client: client,
+          credentialStore: _credentialStore,
+          credentialId: credential,
+          logger: widget.controller.logger,
+        ).verifyRepository();
+      }
+      if (mounted) {
+        setState(() {
+          if (isGithub) {
+            _githubConnected = true;
+          } else {
+            _giteeConnected = true;
+          }
+        });
+        _showFeedback('$provider 已连接。');
+      }
+    } catch (error) {
+      if (mounted) {
+        widget.controller.logger.warning(
+          '$provider：测试连接失败',
+          detail: error.toString(),
+        );
+        _showFeedback('$provider 暂时无法连接，请检查地址和凭证。');
+      }
+    } finally {
+      client.close();
+      if (mounted) setState(() => _testingProvider = null);
+    }
+  }
+
+  Future<void> _saveToken(SourceCredentialId id, String value) async {
+    if (value.isEmpty) return;
+    final token = SourceAccessToken.fromUtf8(value);
+    try {
+      await _credentialStore.putAccessToken(id, token);
+    } finally {
+      token.dispose();
+    }
+  }
+
+  Future<bool> _hasToken(SourceCredentialId id) async {
+    final token = await _credentialStore.getAccessToken(id);
+    if (token == null) return false;
+    token.dispose();
+    return true;
+  }
+
+  Future<void> _showRecoveryPhraseNotice() async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('备份恢复词'),
+        content: const Text('恢复词只在创建安全身份时显示一次。请使用离线保存的恢复词，并妥善保管，不要截图或发送给任何人。'),
+        actions: <Widget>[
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showThemeNotice() async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('界面主题'),
+        content: const Text('当前使用深色主题。'),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _clearTemporaryPlaintext() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('清理临时文件？'),
+        content: const Text('这会删除已经准备好的临时文件，云端安全文件不会受到影响。'),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('确认清理'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await TemporaryPlaintextPlatform.protectRoot(_temporaryStore.path);
+      await _temporaryStore.clearAll();
+      if (mounted) _showFeedback('临时文件已清理。');
+    } catch (error) {
+      if (mounted) {
+        widget.controller.setError(error, operation: '清理临时文件失败');
+        _showFeedback('临时文件没有完全清理，请稍后重试。');
+      }
+    }
+  }
+
+  void _showFeedback(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  static String _webUrl(CloudRepositoryEndpoint endpoint) => endpoint.webUrl;
+}
+
+final class _CloudSummaryLine extends StatelessWidget {
+  const _CloudSummaryLine({
+    required this.icon,
+    required this.label,
+    required this.connected,
+  });
+
+  final IconData icon;
+  final String label;
+  final bool connected;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        Icon(icon, color: SboxColors.textMuted, size: 40),
+        const SizedBox(width: 18),
+        Text(label, style: Theme.of(context).textTheme.titleLarge),
+        const SizedBox(width: 12),
+        Text(
+          '·  ${connected ? '已连接' : '待设置'}',
+          style: TextStyle(
+            color: connected ? SboxColors.accent : SboxColors.warning,
+            fontSize: 18,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+final class _ProviderMark extends StatelessWidget {
+  const _ProviderMark({required this.provider});
+
+  final String provider;
+
+  @override
+  Widget build(BuildContext context) {
+    if (provider == 'GitHub') {
+      return const CircleAvatar(
+        radius: 21,
+        backgroundColor: Colors.white,
+        child: Icon(Icons.code_rounded, color: Color(0xFF142033), size: 29),
+      );
+    }
+    return const CircleAvatar(
+      radius: 21,
+      backgroundColor: Color(0xFFE33B43),
+      child: Text(
+        'G',
+        style: TextStyle(
+          color: Colors.white,
+          fontSize: 24,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+    );
+  }
+}
+
+final class _HabitRow extends StatelessWidget {
+  const _HabitRow({
+    required this.icon,
+    required this.title,
+    required this.value,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String title;
+  final String value;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(10),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(
+          children: <Widget>[
+            Icon(icon, color: SboxColors.textMuted, size: 38),
+            const SizedBox(width: 18),
+            Expanded(
+              child: Text(
+                '$title  ·  $value',
+                style: Theme.of(context).textTheme.titleLarge
+                    ?.copyWith(fontSize: 17),
+              ),
+            ),
+            const Icon(
+              Icons.chevron_right_rounded,
+              color: SboxColors.textMuted,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+final class _LockHint extends StatelessWidget {
+  const _LockHint({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        const Icon(Icons.lock_outline, color: SboxColors.textMuted, size: 20),
+        const SizedBox(width: 8),
+        Text(
+          text,
+          style: Theme.of(context).textTheme.bodyLarge
+              ?.copyWith(color: SboxColors.textMuted),
+        ),
+      ],
+    );
+  }
+}
+
+final class _HealthyStatus extends StatelessWidget {
+  const _HealthyStatus();
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        const Icon(
+          Icons.check_circle_outline,
+          color: SboxColors.accent,
+          size: 23,
+        ),
+        const SizedBox(width: 8),
+        Text(
+          '当前运行正常',
+          style: Theme.of(context).textTheme.bodyLarge
+              ?.copyWith(color: SboxColors.accent, fontWeight: FontWeight.w600),
+        ),
+      ],
+    );
+  }
+}

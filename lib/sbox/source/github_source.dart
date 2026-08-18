@@ -8,24 +8,19 @@ final class GitHubDataSource extends RepositoryDataSource {
     required super.client,
     super.credentialStore,
     super.credentialId,
+    super.logger,
+    super.sourceName = 'GitHub',
   });
-
-  static final BigInt _maxObjectBytes = BigInt.from(100 * 1024 * 1024);
-  static final BigInt _maxRequestBytes = BigInt.from(140 * 1024 * 1024);
 
   @override
   SourceCapabilities get capabilities => SourceCapabilities(
     canRead: true,
     canWrite: credentialStore != null && credentialId != null,
     canDelete: credentialStore != null && credentialId != null,
-    conditionalWrite: true,
-    history: true,
-    maxObjectBytes: _maxObjectBytes,
-    maxRequestBodyBytes: _maxRequestBytes,
-    uploadEncoding: UploadEncoding.base64Json,
-    maxParallelObjectTransfers: 4,
-    supportsStreamingDownload: true,
-    supportsResumableObjectDownload: false,
+    canListObjects: true,
+    supportsRangeRead: true,
+    maxObjectBytes: 100 * 1024 * 1024,
+    maxParallelTransfers: 4,
   );
 
   @override
@@ -38,24 +33,7 @@ final class GitHubDataSource extends RepositoryDataSource {
   Uri metadataUri(SourcePath path) => _contentsUri(path, includeRef: true);
 
   @override
-  Uri writeUri(SourcePath path) => _contentsUri(path, includeRef: false);
-
-  @override
-  Uri rawUri(SourcePath path, RepositoryObjectMetadata metadata) => Uri(
-    scheme: 'https',
-    host: 'api.github.com',
-    pathSegments: <String>[
-      'repos',
-      config.owner,
-      config.repository,
-      'git',
-      'blobs',
-      metadata.blobSha,
-    ],
-  );
-
-  @override
-  Uri repositoryProbeUri() => Uri(
+  Uri listUri({String? cursor, int pageSize = 1000}) => Uri(
     scheme: 'https',
     host: 'api.github.com',
     pathSegments: <String>[
@@ -65,33 +43,49 @@ final class GitHubDataSource extends RepositoryDataSource {
       'contents',
       if (config.pathPrefix.isNotEmpty) ...config.pathPrefix.split('/'),
     ],
-    queryParameters: <String, String>{'ref': config.branch},
+    queryParameters: <String, String>{
+      'ref': config.branch,
+      'page': cursor ?? '1',
+      'per_page': (pageSize < providerPageSize ? pageSize : providerPageSize)
+          .toString(),
+    },
   );
 
   @override
+  Uri writeUri(SourcePath path) => _contentsUri(path, includeRef: false);
+
+  @override
+  Uri rawUri(SourcePath path, RepositoryObjectMetadata metadata) => Uri(
+    scheme: 'https',
+    host: 'raw.githubusercontent.com',
+    pathSegments: <String>[
+      config.owner,
+      config.repository,
+      config.branch,
+      ...config.resolveBasename(path).split('/'),
+    ],
+  );
+
+  @override
+  Uri repositoryProbeUri() => listUri();
+
+  @override
   Map<String, String> publicHeaders({required bool raw}) => <String, String>{
-    'Accept': raw
-        ? 'application/vnd.github.raw+json'
-        : 'application/vnd.github.object+json',
-    'X-GitHub-Api-Version': '2026-03-10',
-    'User-Agent': 'SafeBox-v1',
+    'Accept': raw ? 'application/octet-stream' : apiAcceptHeader,
+    'User-Agent': 'SafeBox',
+    'X-GitHub-Api-Version': '2022-11-28',
   };
 
-  Uri _contentsUri(SourcePath path, {required bool includeRef}) {
-    final resolved = config.resolve(path);
-    return Uri(
-      scheme: 'https',
-      host: 'api.github.com',
-      pathSegments: <String>[
-        'repos',
-        config.owner,
-        config.repository,
-        'contents',
-        ...resolved.segments,
-      ],
-      queryParameters: includeRef
-          ? <String, String>{'ref': config.branch}
-          : null,
-    );
-  }
+  Uri _contentsUri(SourcePath path, {required bool includeRef}) => Uri(
+    scheme: 'https',
+    host: 'api.github.com',
+    pathSegments: <String>[
+      'repos',
+      config.owner,
+      config.repository,
+      'contents',
+      ...config.resolveBasename(path).split('/'),
+    ],
+    queryParameters: includeRef ? <String, String>{'ref': config.branch} : null,
+  );
 }

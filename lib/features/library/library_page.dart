@@ -1,841 +1,433 @@
-import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
+import 'package:http/http.dart' as http;
+import 'package:path/path.dart' as p;
 
 import '../../app/app_controller.dart';
-import '../../app/sbox_dialogs.dart';
+import '../../app/app_logger.dart';
 import '../../app/sbox_theme.dart';
 import '../../app/sbox_widgets.dart';
-import '../../sbox/engine/crypto_task_runner.dart';
-import '../../sbox/source/local_scanner.dart';
-import '../../sbox/source/source_config.dart';
+import '../../platform/cloud_backup_configuration_store.dart';
+import '../../platform/file_opener.dart';
+import '../../platform/secure_credential_store.dart';
+import '../../platform/temporary_plaintext_platform.dart';
+import '../../sbox/constants.dart';
+import '../../sbox/engine/bundle_probe.dart';
+import '../../sbox/engine/bundle_encryptor.dart';
+import '../../sbox/format/bundle_manifest.dart';
+import '../../sbox/identity/public_identity_record.dart';
+import '../../sbox/source/bundle_listing.dart';
+import '../../sbox/source/bundle_sync.dart';
+import '../../sbox/source/cloud_backup_config.dart';
+import '../../sbox/source/cloud_bundle_uploader.dart';
+import '../../sbox/source/cloud_repository_pair.dart';
+import '../../sbox/source/data_source.dart';
+import '../../sbox/storage/temporary_plaintext_store.dart';
 
-class LibraryPage extends StatefulWidget {
+final class LibraryPage extends StatefulWidget {
   const LibraryPage({
     super.key,
     required this.controller,
-    required this.onOpenSources,
-    required this.onDecryptEntry,
-    required this.onStandaloneSelected,
+    this.onOpenCloudSettings,
   });
 
   final AppController controller;
-  final VoidCallback onOpenSources;
-  final ValueChanged<String> onDecryptEntry;
-  final VoidCallback onStandaloneSelected;
+  final VoidCallback? onOpenCloudSettings;
 
   @override
   State<LibraryPage> createState() => _LibraryPageState();
 }
 
-class _LibraryPageState extends State<LibraryPage> {
-  final _search = TextEditingController();
-  String? _tag;
+final class _LibraryPageState extends State<LibraryPage> {
+  static const List<_PreviewFile> _previewFiles = <_PreviewFile>[
+    _PreviewFile(
+      name: '项目资料.pdf',
+      time: '今天 14:30',
+      type: 'PDF',
+      color: Color(0xFFFF4E42),
+    ),
+    _PreviewFile(
+      name: '照片.zip',
+      time: '今天 10:18',
+      type: 'ZIP',
+      color: Color(0xFFFFB52E),
+    ),
+    _PreviewFile(
+      name: '合同.docx',
+      time: '昨天 16:45',
+      type: 'W\nDOCX',
+      color: Color(0xFF2E86F3),
+    ),
+  ];
+
+  final _configurationStore = CloudBackupConfigurationStore();
+  final _credentialStore = PlatformCredentialStore();
+  final _temporaryStore = TemporaryPlaintextStore();
+  final _searchController = TextEditingController();
+  List<_LibraryBundle> _bundles = const <_LibraryBundle>[];
+  http.Client? _client;
+  CloudBackupConfiguration? _configuration;
+  XFile? _selectedFile;
+  int? _selectedFileLength;
+  bool _credentialsReady = false;
+  bool _busy = true;
+  bool _loading = true;
+  bool _dragging = false;
+  bool _showPreview = true;
+  String _busyTitle = '正在读取文件';
+  String _busyDetail = '正在同步你的安全文件。';
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
 
   @override
   void dispose() {
-    _search.dispose();
+    _searchController.dispose();
+    _client?.close();
     super.dispose();
   }
 
-  Future<void> _openLocal() async {
-    if (widget.controller.supportsAuthorizedDirectorySelection) {
-      try {
-        await widget.controller.chooseAndAddAuthorizedLocalSource();
-      } catch (_) {}
-      return;
-    }
-    final path = await widget.controller.chooseLocalCipherDirectory(
-      confirmButtonText: '打开此 SBOX 目录',
-    );
-    if (path == null || !mounted) return;
-    try {
-      final probe = await widget.controller.inspectLocalDirectory(path);
-      if (!mounted) return;
-      final initialize =
-          probe.catalogHeader == null &&
-          await Directory(path).list(followLinks: false).isEmpty;
-      await widget.controller.addLocalSource(
-        displayName: '本地 SBOX 目录',
-        path: path,
-        requestWrite: true,
-        initializeEmptyAsCanonical: initialize,
-      );
-    } catch (_) {}
-  }
-
-  Future<void> _openManagedLocal() async {
-    try {
-      await widget.controller.addManagedWritableLocalSource();
-    } catch (_) {}
-  }
-
-  Future<void> _selectStandalone() async {
-    const group = XTypeGroup(
-      label: 'SBOX encrypted file',
-      extensions: <String>['sbox'],
-    );
-    final file = await openFile(acceptedTypeGroups: const <XTypeGroup>[group]);
-    if (file == null) return;
-    try {
-      await widget.controller.inspectStandalone(file.path);
-      widget.onStandaloneSelected();
-    } catch (_) {}
-  }
-
-  Future<void> _unlock() async {
-    final mnemonic = await showMnemonicPrompt(
-      context,
-      title: '验证并打开加密目录',
-      actionLabel: '验证目录',
-    );
-    if (mnemonic == null || !mounted) return;
-    try {
-      await widget.controller.unlockSelectedCatalog(mnemonic);
-    } catch (_) {}
-  }
-
-  Future<void> _refreshOrSync() async {
-    final source = widget.controller.selectedSource;
-    if (source == null) return;
-    try {
-      if (!source.hasPendingCatalog) {
-        await widget.controller.refreshSelectedSource();
-        return;
-      }
-      final mnemonic = await showMnemonicPrompt(
-        context,
-        title: '同步本地待提交目录',
-        actionLabel: '验证、合并并同步',
-      );
-      if (mnemonic == null || !mounted) return;
-      await widget.controller.syncPendingCatalog(mnemonic);
-    } catch (_) {}
-  }
-
-  Future<void> _discardPending() async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('放弃本地待同步目录版本？'),
-        content: const Text(
-          '将恢复最后一个已验证的远端 Catalog 基线。已加密的 SBOX 对象仍会永久保留，不会删除远端内容，也不会产生明文。',
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: TextButton.styleFrom(foregroundColor: SboxColors.danger),
-            child: const Text('放弃目录改动'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    try {
-      await widget.controller.discardPendingCatalogAndRestoreBase();
-    } catch (_) {}
-  }
-
-  Future<void> _resolveConflicts() async {
-    final resolutions = await _showCatalogConflictResolutionDialog(
-      context,
-      widget.controller.catalogConflicts,
-    );
-    if (resolutions == null || !mounted) return;
-    final mnemonic = await showMnemonicPrompt(
-      context,
-      title: '应用冲突选择并加密提交',
-      actionLabel: '加密并条件提交',
-    );
-    if (mnemonic == null || !mounted) return;
-    try {
-      await widget.controller.resolveCatalogConflicts(
-        mnemonic: mnemonic,
-        resolutions: resolutions,
-      );
-    } catch (_) {}
-  }
-
-  Future<void> _editEntry(CatalogEntryViewData entry) async {
-    final edit = await _showCatalogMetadataDialog(context, entry);
-    if (edit == null || !mounted) return;
-    final mnemonic = await showMnemonicPrompt(
-      context,
-      title: '解锁并加密 Catalog 修改',
-      actionLabel: '保存修改',
-    );
-    if (mnemonic == null || !mounted) return;
-    try {
-      await widget.controller.updateCatalogEntryMetadata(
-        entryId: entry.entryId,
-        title: edit.title,
-        description: edit.description,
-        tags: edit.tags,
-        mnemonic: mnemonic,
-        syncRemote: widget.controller.selectedSource?.isRemote ?? false,
-      );
-    } catch (_) {}
-  }
-
-  Future<void> _deleteEntry(CatalogEntryViewData entry) async {
-    final confirmed = await showDestructiveConfirmation(
-      context,
-      title: '从 Catalog 中删除“${entry.title}”？',
-      message:
-          '这会提交带墓碑的新加密 Catalog，使项目不再出现在资料库中。'
-          '本地永久 SBOX 原件不会删除，公开仓库历史中的旧密文也可能永久保留。',
-      actionLabel: '确认逻辑删除',
-    );
-    if (!confirmed || !mounted) return;
-    final mnemonic = await showMnemonicPrompt(
-      context,
-      title: '解锁并加密删除墓碑',
-      actionLabel: '加密并删除',
-    );
-    if (mnemonic == null || !mounted) return;
-    try {
-      await widget.controller.deleteCatalogEntry(
-        entryId: entry.entryId,
-        mnemonic: mnemonic,
-        syncRemote: widget.controller.selectedSource?.isRemote ?? false,
-      );
-    } catch (_) {}
-  }
-
   @override
   Widget build(BuildContext context) {
-    final controller = widget.controller;
-    final source = controller.selectedSource;
-    final catalog = controller.catalog;
-    final allEntries = catalog?.entries ?? const <CatalogEntryViewData>[];
-    final query = _search.text.trim().toLowerCase();
-    final entries = allEntries
-        .where((entry) {
-          final matchesText =
-              query.isEmpty ||
-              entry.title.toLowerCase().contains(query) ||
-              entry.description.toLowerCase().contains(query) ||
-              entry.originalName.toLowerCase().contains(query);
-          return matchesText && (_tag == null || entry.tags.contains(_tag));
-        })
-        .toList(growable: false);
-    final tags = allEntries.expand((entry) => entry.tags).toSet().toList()
-      ..sort();
-
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(34, 34, 34, 30),
-      children: <Widget>[
-        PageHeading(
-          title: '资料库',
-          subtitle: '只展示通过 Catalog 解密与结构校验的可信索引；旧版 Ed25519 目录会额外验证',
-          trailing: source == null
-              ? null
-              : ElevatedButton.icon(
-                  onPressed: controller.isBusy ? null : _refreshOrSync,
-                  icon: const Icon(Icons.sync_rounded, size: 18),
-                  label: Text(
-                    source.hasPendingCatalog
-                        ? '同步待提交'
-                        : source.provider == SourceProvider.local
-                        ? '刷新目录'
-                        : '立即同步',
-                  ),
-                ),
-        ),
-        const SizedBox(height: 26),
-        if (source == null)
-          EmptyState(
-            icon: Icons.folder_off_outlined,
-            title: '尚未打开 SBOX 数据源',
-            message: '可以完全跳过云端，直接使用本地目录或选择单个 SBOX 文件。GitHub/Gitee 只是可选的公开密文存储。',
-            actions: <Widget>[
-              ElevatedButton.icon(
-                onPressed: _openLocal,
-                icon: const Icon(Icons.folder_open_outlined),
-                label: const Text('打开本地 SBOX 目录'),
-              ),
-              if (controller.supportsAuthorizedDirectorySelection)
-                OutlinedButton.icon(
-                  onPressed: _openManagedLocal,
-                  icon: const Icon(Icons.create_new_folder_outlined),
-                  label: const Text('创建本机可写保险箱'),
-                ),
-              OutlinedButton.icon(
-                onPressed: _selectStandalone,
-                icon: const Icon(Icons.insert_drive_file_outlined),
-                label: const Text('选择单个 SBOX 文件'),
-              ),
-              TextButton(
-                onPressed: widget.onOpenSources,
-                child: const Text('配置 GitHub/Gitee（可选）'),
-              ),
-            ],
-          )
-        else ...<Widget>[
-          _SourceBar(controller: controller, source: source),
-          const SizedBox(height: 18),
-          if (controller.catalogConflicts.isNotEmpty) ...<Widget>[
-            _CatalogConflictCard(
-              conflicts: controller.catalogConflicts,
-              onResolve: _resolveConflicts,
-              onRetry: _refreshOrSync,
-              onDiscard: _discardPending,
-            ),
-            const SizedBox(height: 18),
-          ] else if (source.hasPendingCatalog) ...<Widget>[
-            SecurityNotice(
-              title: '本地 Catalog 等待条件同步',
-              message: '本地密文和目录已永久保存。远端刷新不会覆盖该版本；同步时会先上传全部不可变 SBOX 对象，再条件提交 catalog.sbox。',
-              warning: true,
-              icon: Icons.cloud_upload_outlined,
-            ),
-            const SizedBox(height: 18),
-          ],
-          if (source.localDirectoryMode == ConfiguredLocalMode.looseReadOnly)
-            _LooseLibrary(
-              controller: controller,
-              onSelected: (candidate) async {
-                try {
-                  await controller.inspectLooseCandidate(candidate);
-                  widget.onStandaloneSelected();
-                } catch (_) {}
-              },
-            )
-          else if (catalog == null)
-            EmptyState(
-              icon: Icons.lock_outline_rounded,
-              title:
-                  File(
-                    '${source.localSyncPath}${Platform.pathSeparator}catalog.sbox',
-                  ).existsSync()
-                  ? '加密目录尚未验证'
-                  : '此规范目录还是空的',
-              message:
-                  File(
-                    '${source.localSyncPath}${Platform.pathSeparator}catalog.sbox',
-                  ).existsSync()
-                  ? 'catalog.sbox 已作为密文永久保存在本地。没有匹配的明文缓存时，输入助记词才能显示标题、说明和原始文件名。'
-                  : '首次“加密保存”只用公钥创建加密的 catalog.sbox；也可以先从远端同步。',
-              actions: <Widget>[
-                if (File(
-                  '${source.localSyncPath}${Platform.pathSeparator}catalog.sbox',
-                ).existsSync())
-                  ElevatedButton.icon(
-                    onPressed: controller.isBusy ? null : _unlock,
-                    icon: const Icon(Icons.verified_user_outlined),
-                    label: const Text('验证并打开目录'),
-                  ),
-                OutlinedButton.icon(
-                  onPressed: controller.isBusy ? null : _refreshOrSync,
-                  icon: const Icon(Icons.sync_rounded),
-                  label: Text(
-                    source.hasPendingCatalog
-                        ? '验证并同步待提交目录'
-                        : source.isRemote
-                        ? '拉取加密目录'
-                        : '刷新目录',
-                  ),
-                ),
-              ],
-            )
-          else ...<Widget>[
-            _VerifiedSummary(controller: controller),
-            const SizedBox(height: 18),
-            LayoutBuilder(
-              builder: (context, constraints) {
-                final search = TextField(
-                  controller: _search,
-                  onChanged: (_) => setState(() {}),
-                  decoration: const InputDecoration(
-                    prefixIcon: Icon(Icons.search_rounded),
-                    hintText: '搜索标题、说明或原始文件名',
-                  ),
-                );
-                final filter = DropdownButtonFormField<String?>(
-                  initialValue: _tag,
-                  decoration: const InputDecoration(
-                    prefixIcon: Icon(Icons.sell_outlined),
-                    hintText: '全部标签',
-                  ),
-                  items: <DropdownMenuItem<String?>>[
-                    const DropdownMenuItem<String?>(
-                      value: null,
-                      child: Text('全部标签'),
-                    ),
-                    for (final tag in tags)
-                      DropdownMenuItem<String?>(value: tag, child: Text(tag)),
-                  ],
-                  onChanged: (value) => setState(() => _tag = value),
-                );
-                return constraints.maxWidth < 620
-                    ? Column(
-                        children: <Widget>[
-                          search,
-                          const SizedBox(height: 10),
-                          filter,
-                        ],
-                      )
-                    : Row(
-                        children: <Widget>[
-                          Expanded(child: search),
-                          const SizedBox(width: 12),
-                          SizedBox(width: 170, child: filter),
-                        ],
-                      );
-              },
-            ),
-            const SizedBox(height: 14),
-            if (entries.isEmpty)
-              const EmptyState(
-                icon: Icons.inventory_2_outlined,
-                title: '没有匹配的项目',
-                message: '调整搜索或标签筛选；空目录可以从“加密”页添加第一个文件。',
-              )
-            else
-              ...entries.map(
-                (entry) => Padding(
-                  padding: const EdgeInsets.only(bottom: 11),
-                  child: _CatalogRow(
-                    entry: entry,
-                    useUtcForPreview: controller.isPreview,
-                    onDecrypt: () => widget.onDecryptEntry(entry.entryId),
-                    onEdit:
-                        source.isWritable &&
-                            !controller.isBusy &&
-                            controller.catalogConflicts.isEmpty
-                        ? () => _editEntry(entry)
-                        : null,
-                    onDelete:
-                        source.isWritable &&
-                            !controller.isBusy &&
-                            controller.catalogConflicts.isEmpty
-                        ? () => _deleteEntry(entry)
-                        : null,
-                  ),
-                ),
-              ),
-          ],
-        ],
-        if (controller.isBusy) ...<Widget>[
-          const SizedBox(height: 18),
-          SboxProgressCard(
-            title: _operationLabel(controller.operation),
-            detail: controller.syncProgress == null
-                ? '密码学与大文件任务在一次性工作 Isolate 中执行。'
-                : '${controller.syncProgress!.completed} / ${controller.syncProgress!.total}',
-            value:
-                controller.syncProgress == null ||
-                    controller.syncProgress!.total == 0
-                ? null
-                : controller.syncProgress!.completed /
-                      controller.syncProgress!.total,
-            onCancel: controller.operation == AppOperation.exporting
-                ? null
-                : controller.cancelSensitiveWork,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final mobile = constraints.maxWidth < 760;
+        final content = Padding(
+          padding: EdgeInsets.fromLTRB(
+            mobile ? 24 : 32,
+            mobile ? 28 : 52,
+            mobile ? 24 : 32,
+            mobile ? 28 : 38,
           ),
-        ],
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 1360),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  PageHeading(
+                    title: '云端文件',
+                    subtitle: '上传、查看和打开文件都在这里',
+                    trailing: mobile
+                        ? StatusPill(
+                            label: _cloudStatus,
+                            icon: Icons.cloud_upload_outlined,
+                            tone: _cloudReady
+                                ? SboxColors.accent
+                                : SboxColors.warning,
+                            compact: true,
+                          )
+                        : null,
+                  ),
+                  SizedBox(height: mobile ? 28 : 38),
+                  if (mobile)
+                    _buildMobileContent(context)
+                  else
+                    _buildDesktopContent(context),
+                  const SizedBox(height: 28),
+                  _buildFooter(context),
+                ],
+              ),
+            ),
+          ),
+        );
+        return SingleChildScrollView(child: content);
+      },
+    );
+  }
+
+  bool get _cloudReady => _configuration != null && _credentialsReady;
+
+  String get _cloudStatus => _cloudReady ? '云端同步已开启' : '云端同步未设置';
+
+  Widget _buildDesktopContent(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Expanded(flex: 4, child: _buildUploadArea(context, false)),
+        const SizedBox(width: 40),
+        Expanded(flex: 8, child: _buildFilesCard(context, false)),
       ],
     );
   }
-}
 
-class _CatalogConflictCard extends StatelessWidget {
-  const _CatalogConflictCard({
-    required this.conflicts,
-    required this.onResolve,
-    required this.onRetry,
-    required this.onDiscard,
-  });
+  Widget _buildMobileContent(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        _buildUploadArea(context, true),
+        const SizedBox(height: 34),
+        _buildFilesCard(context, true),
+      ],
+    );
+  }
 
-  final List<CatalogConflictViewData> conflicts;
-  final VoidCallback onResolve;
-  final VoidCallback onRetry;
-  final VoidCallback onDiscard;
-
-  @override
-  Widget build(BuildContext context) {
-    return SboxCard(
-      borderColor: SboxColors.warning.withValues(alpha: 0.48),
-      color: SboxColors.warning.withValues(alpha: 0.065),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          const SectionTitle(
-            title: 'Catalog 并发冲突',
-            subtitle: '未使用时间戳或最后写入者覆盖；本地待同步版本仍保持加密并永久保留',
-          ),
-          const SizedBox(height: 14),
-          for (final conflict in conflicts) ...<Widget>[
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: SboxColors.panelSoft,
-                borderRadius: BorderRadius.circular(9),
-                border: Border.all(color: SboxColors.border),
+  Widget _buildUploadArea(BuildContext context, bool mobile) {
+    return _DashedDropTarget(
+      dragging: _dragging,
+      onDragEntered: () {
+        if (!_busy && mounted) setState(() => _dragging = true);
+      },
+      onDragExited: () {
+        if (mounted) setState(() => _dragging = false);
+      },
+      onDragDone: (files) async {
+        if (_busy) return;
+        if (mounted) setState(() => _dragging = false);
+        if (files.isNotEmpty) await _setFile(files.first);
+      },
+      onTap: _busy ? null : _pickFile,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 140),
+        constraints: BoxConstraints(minHeight: mobile ? 452 : 454),
+        padding: EdgeInsets.symmetric(
+          horizontal: mobile ? 22 : 18,
+          vertical: mobile ? 38 : 30,
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            _UploadFolderIcon(size: mobile ? 104 : 92),
+            SizedBox(height: mobile ? 28 : 22),
+            Text(
+              _selectedFile == null ? '拖入文件或点击选择' : _selectedFile!.name,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                fontSize: mobile ? 25 : 22,
+                color: SboxColors.text,
               ),
+            ),
+            const SizedBox(height: 22),
+            SizedBox(
+              width: mobile ? 292 : 250,
+              child: ElevatedButton.icon(
+                onPressed: _busy
+                    ? null
+                    : (_selectedFile == null ? _pickFile : _upload),
+                icon: Icon(
+                  _selectedFile == null
+                      ? Icons.file_upload_outlined
+                      : Icons.lock_outline,
+                  size: 23,
+                ),
+                label: Text(_busy ? '正在准备' : '上传文件'),
+              ),
+            ),
+            const SizedBox(height: 18),
+            Text(
+              _selectedFile == null
+                  ? '文件会自动安全保存'
+                  : '${_formatBytes(_selectedFileLength ?? 0)} · 点击可更换文件',
+              style: Theme.of(context).textTheme.bodyLarge
+                  ?.copyWith(color: SboxColors.textMuted),
+              textAlign: TextAlign.center,
+            ),
+            if (_busy) ...<Widget>[
+              const SizedBox(height: 18),
+              Text(
+                _busyTitle,
+                style: const TextStyle(color: SboxColors.accent, fontSize: 13),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFilesCard(BuildContext context, bool mobile) {
+    final rows = _visibleRows;
+    return SboxCard(
+      padding: EdgeInsets.fromLTRB(
+        mobile ? 16 : 22,
+        mobile ? 22 : 25,
+        mobile ? 16 : 22,
+        mobile ? 0 : 0,
+      ),
+      radius: mobile ? 16 : 14,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: <Widget>[
+              Expanded(
+                child: Text(
+                  '我的文件',
+                  style: Theme.of(context).textTheme.headlineMedium
+                      ?.copyWith(fontSize: mobile ? 25 : 27),
+                ),
+              ),
+              Flexible(
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  child: StatusPill(
+                    label: '${rows.length} 个文件 · 已安全保存',
+                    icon: Icons.verified_user_outlined,
+                    tone: SboxColors.accent,
+                    compact: true,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: mobile ? 22 : 20),
+          SizedBox(
+            width: mobile ? double.infinity : 330,
+            child: TextField(
+              controller: _searchController,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                hintText: '搜索文件',
+                prefixIcon: Icon(Icons.search, size: 30),
+                contentPadding: EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 12,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 20),
+          if (_busy && !_loading)
+            SboxProgressCard(title: _busyTitle, detail: _busyDetail)
+          else if (rows.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 42),
+              child: Center(
+                child: Column(
+                  children: <Widget>[
+                    const Icon(
+                      Icons.folder_open_outlined,
+                      color: SboxColors.textDim,
+                      size: 40,
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      '没有找到文件',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 5),
+                    const Text('试试其他名称，或上传一个新文件。'),
+                  ],
+                ),
+              ),
+            )
+          else
+            ClipRRect(
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(14),
+              ),
+              child: Column(
+                children: <Widget>[
+                  for (var index = 0; index < rows.length; index++) ...<Widget>[
+                    _buildFileRow(context, rows[index], mobile),
+                    if (index != rows.length - 1)
+                      const Divider(height: 1, color: SboxColors.borderSoft),
+                  ],
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFileRow(BuildContext context, _FileRow row, bool mobile) {
+    return Padding(
+      padding: EdgeInsets.symmetric(
+        horizontal: mobile ? 6 : 14,
+        vertical: mobile ? 18 : 20,
+      ),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final narrow = constraints.maxWidth < 570;
+          final details = Expanded(
+            child: Padding(
+              padding: const EdgeInsets.only(left: 14),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
                   Text(
-                    conflict.reason,
-                    style: const TextStyle(
-                      color: SboxColors.warning,
-                      fontWeight: FontWeight.w700,
-                    ),
+                    row.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    semanticsLabel: row.name,
+                    style: Theme.of(context).textTheme.titleLarge
+                        ?.copyWith(fontSize: mobile ? 17 : 18),
                   ),
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 5),
                   Text(
-                    '本地：${conflict.localTitle} · ${conflict.localPartCount} 分片'
-                    '${conflict.remoteTitle == null ? '' : '\n远端：${conflict.remoteTitle} · ${conflict.remotePartCount ?? 0} 分片'}',
-                    style: Theme.of(context).textTheme.bodyMedium,
-                  ),
-                  const SizedBox(height: 8),
-                  MonospaceValue(
-                    '${conflict.entryId}\nlocal ${conflict.localPayloadSha256}'
-                    '${conflict.remotePayloadSha256 == null ? '' : '\nremote ${conflict.remotePayloadSha256}'}',
-                    maxLines: 3,
-                    color: SboxColors.textMuted,
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 10),
-          ],
-          Wrap(
-            spacing: 10,
-            runSpacing: 10,
-            children: <Widget>[
-              ElevatedButton.icon(
-                onPressed: onResolve,
-                icon: const Icon(Icons.rule_folder_outlined),
-                label: const Text('逐条处理冲突'),
-              ),
-              ElevatedButton.icon(
-                onPressed: onRetry,
-                icon: const Icon(Icons.refresh_rounded),
-                label: const Text('重新验证并合并'),
-              ),
-              OutlinedButton.icon(
-                onPressed: onDiscard,
-                icon: const Icon(Icons.undo_rounded),
-                label: const Text('放弃本地目录改动'),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _SourceBar extends StatelessWidget {
-  const _SourceBar({required this.controller, required this.source});
-
-  final AppController controller;
-  final SourceConfiguration source;
-
-  @override
-  Widget build(BuildContext context) {
-    final isLocal = source.provider == SourceProvider.local;
-    return SboxCard(
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 15),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          final icon = Container(
-            width: 42,
-            height: 42,
-            decoration: BoxDecoration(
-              color: SboxColors.accent.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(9),
-            ),
-            child: Icon(
-              isLocal ? Icons.folder_outlined : Icons.cloud_outlined,
-              color: SboxColors.accent,
-            ),
-          );
-          final selector = DropdownButtonHideUnderline(
-            child: DropdownButton<SourceId>(
-              value: source.sourceId,
-              isExpanded: true,
-              dropdownColor: SboxColors.panelRaised,
-              items: controller.sources
-                  .map(
-                    (item) => DropdownMenuItem<SourceId>(
-                      value: item.sourceId,
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: <Widget>[
-                          Text(
-                            item.displayName,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontWeight: FontWeight.w600),
-                          ),
-                          Text(
-                            _providerLine(item),
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontSize: 11,
-                              color: SboxColors.textMuted,
-                            ),
-                          ),
-                        ],
-                      ),
+                    row.time,
+                    style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                      color: SboxColors.textMuted,
+                      fontSize: mobile ? 14 : 15,
                     ),
-                  )
-                  .toList(),
-              onChanged: (value) {
-                if (value != null) controller.selectSource(value);
-              },
-            ),
-          );
-          final state = StatusPill(
-            label: source.hasPendingCatalog
-                ? '本地已保存 · 等待条件同步'
-                : isLocal
-                ? source.isAuthorizedDirectory
-                      ? '系统目录 · 只读密文镜像'
-                      : '本地目录 · 离线'
-                : (source.isWritable ? '匿名读取 · 已授权写入' : '公开匿名读取'),
-            icon: source.hasPendingCatalog
-                ? Icons.cloud_upload_outlined
-                : isLocal
-                ? Icons.wifi_off_rounded
-                : Icons.public_rounded,
-            tone: source.hasPendingCatalog
-                ? SboxColors.warning
-                : SboxColors.accent,
-          );
-          final lastSync = source.lastLocalSyncAt == null
-              ? null
-              : Text(
-                  '本地同步 ${DateFormat('MM-dd HH:mm').format(controller.isPreview ? source.lastLocalSyncAt!.toUtc() : source.lastLocalSyncAt!.toLocal())}',
-                  style: Theme.of(context).textTheme.bodyMedium,
-                );
-          if (constraints.maxWidth < 660) {
-            return Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                Row(
-                  children: <Widget>[
-                    icon,
-                    const SizedBox(width: 12),
-                    Expanded(child: selector),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                Wrap(
-                  spacing: 10,
-                  runSpacing: 8,
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  children: <Widget>[state, ?lastSync],
-                ),
-              ],
-            );
-          }
-          return Row(
-            children: <Widget>[
-              icon,
-              const SizedBox(width: 12),
-              Expanded(child: selector),
-              const SizedBox(width: 14),
-              state,
-              if (lastSync != null) ...<Widget>[
-                const SizedBox(width: 14),
-                lastSync,
-              ],
-            ],
-          );
-        },
-      ),
-    );
-  }
-}
-
-class _VerifiedSummary extends StatelessWidget {
-  const _VerifiedSummary({required this.controller});
-
-  final AppController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    final catalog = controller.catalog!;
-    return SboxCard(
-      color: const Color(0xFF0E211F),
-      borderColor: SboxColors.accent.withValues(alpha: 0.25),
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
-      child: Row(
-        children: <Widget>[
-          const Icon(Icons.verified_outlined, color: SboxColors.accent),
-          const SizedBox(width: 10),
-          const Expanded(
-            child: Text('目录已验证', style: TextStyle(fontWeight: FontWeight.w700)),
-          ),
-          Text(
-            '${catalog.entries.length} 个项目',
-            style: Theme.of(context).textTheme.bodyMedium,
-          ),
-          const SizedBox(width: 18),
-          MonospaceValue(
-            'generation ${catalog.generation}',
-            color: SboxColors.accent,
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _CatalogRow extends StatelessWidget {
-  const _CatalogRow({
-    required this.entry,
-    required this.useUtcForPreview,
-    required this.onDecrypt,
-    this.onEdit,
-    this.onDelete,
-  });
-
-  final CatalogEntryViewData entry;
-  final bool useUtcForPreview;
-  final VoidCallback onDecrypt;
-  final VoidCallback? onEdit;
-  final VoidCallback? onDelete;
-
-  @override
-  Widget build(BuildContext context) {
-    return SboxCard(
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          final icon = Container(
-            width: 48,
-            height: 48,
-            decoration: BoxDecoration(
-              color: _fileColor(entry.mediaType).withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Icon(
-              _fileIcon(entry.mediaType),
-              color: _fileColor(entry.mediaType),
-              size: 25,
-            ),
-          );
-          final summary = Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Text(
-                entry.title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
-              const SizedBox(height: 4),
-              Text(
-                entry.description.isEmpty ? '无说明' : entry.description,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.bodyMedium,
-              ),
-              const SizedBox(height: 6),
-              Wrap(
-                spacing: 6,
-                runSpacing: 5,
-                children: entry.tags
-                    .map(
-                      (tag) => StatusPill(
-                        label: tag,
-                        icon: Icons.sell_outlined,
-                        tone: SboxColors.info,
-                        compact: true,
-                      ),
-                    )
-                    .toList(),
-              ),
-            ],
-          );
-          final fileDetails = Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Text(
-                entry.originalName,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: SboxColors.text,
-                  fontFamily: 'RobotoMono',
-                  fontSize: 12,
-                ),
-              ),
-              const SizedBox(height: 5),
-              Text(
-                '${_formatBytes(BigInt.parse(entry.plaintextSize))} · '
-                '${_formatTime(entry.updatedAt, useUtc: useUtcForPreview)} · revision ${entry.revision}',
-                style: Theme.of(context).textTheme.bodyMedium,
-              ),
-            ],
-          );
-          final multipart = entry.partCount > 1
-              ? StatusPill(
-                  label: '${entry.partCount} 个加密分片',
-                  icon: Icons.segment_rounded,
-                  tone: SboxColors.warning,
-                )
-              : null;
-          final action = OutlinedButton.icon(
-            onPressed: onDecrypt,
-            icon: const Icon(Icons.download_for_offline_outlined, size: 18),
-            label: const Text('下载并解密'),
-          );
-          final menu = onEdit == null && onDelete == null
-              ? null
-              : _CatalogEntryMenu(onEdit: onEdit, onDelete: onDelete);
-          if (constraints.maxWidth < 700) {
-            return Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    icon,
-                    const SizedBox(width: 13),
-                    Expanded(child: summary),
-                    if (menu != null) ...<Widget>[
-                      const SizedBox(width: 4),
-                      menu,
-                    ],
-                  ],
-                ),
-                const SizedBox(height: 13),
-                fileDetails,
-                if (multipart != null) ...<Widget>[
-                  const SizedBox(height: 11),
-                  Align(alignment: Alignment.centerLeft, child: multipart),
+                  ),
                 ],
-                const SizedBox(height: 13),
-                action,
+              ),
+            ),
+          );
+          final action = OutlinedButton.icon(
+            onPressed: _busy ? null : () => _openRow(row),
+            icon: Icon(
+              mobile ? Icons.open_in_new : Icons.download_outlined,
+              size: mobile ? 20 : 22,
+            ),
+            label: Text(mobile ? '打开' : '下载并打开'),
+          );
+          final status = Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              const Icon(
+                Icons.verified_user_rounded,
+                color: SboxColors.accent,
+                size: 25,
+              ),
+              const SizedBox(width: 7),
+              Text(
+                '已保护',
+                style: TextStyle(
+                  color: SboxColors.accent,
+                  fontSize: mobile ? 15 : 16,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          );
+          if (narrow) {
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: <Widget>[
+                FileTypeBadge(type: row.type, color: row.color),
+                details,
+                const SizedBox(width: 8),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: <Widget>[
+                    status,
+                    const SizedBox(height: 10),
+                    action,
+                  ],
+                ),
               ],
             );
           }
           return Row(
             children: <Widget>[
-              icon,
-              const SizedBox(width: 15),
-              Expanded(flex: 4, child: summary),
-              const SizedBox(width: 16),
-              Expanded(flex: 3, child: fileDetails),
-              if (multipart != null) ...<Widget>[
-                const SizedBox(width: 12),
-                multipart,
-              ],
-              if (menu != null) ...<Widget>[const SizedBox(width: 4), menu],
-              const SizedBox(width: 12),
+              FileTypeBadge(type: row.type, color: row.color),
+              details,
+              const SizedBox(width: 18),
+              status,
+              const SizedBox(width: 48),
               action,
             ],
           );
@@ -843,432 +435,630 @@ class _CatalogRow extends StatelessWidget {
       ),
     );
   }
-}
 
-enum _CatalogRowAction { edit, delete }
-
-class _CatalogEntryMenu extends StatelessWidget {
-  const _CatalogEntryMenu({required this.onEdit, required this.onDelete});
-
-  final VoidCallback? onEdit;
-  final VoidCallback? onDelete;
-
-  @override
-  Widget build(BuildContext context) {
-    return PopupMenuButton<_CatalogRowAction>(
-      tooltip: '更多目录操作',
-      icon: const Icon(Icons.more_horiz_rounded, color: SboxColors.textMuted),
-      onSelected: (action) {
-        switch (action) {
-          case _CatalogRowAction.edit:
-            onEdit?.call();
-            break;
-          case _CatalogRowAction.delete:
-            onDelete?.call();
-            break;
-        }
-      },
-      itemBuilder: (context) => <PopupMenuEntry<_CatalogRowAction>>[
-        if (onEdit != null)
-          const PopupMenuItem<_CatalogRowAction>(
-            value: _CatalogRowAction.edit,
-            child: ListTile(
-              dense: true,
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.edit_outlined),
-              title: Text('编辑标题、说明与标签'),
-            ),
-          ),
-        if (onDelete != null)
-          const PopupMenuItem<_CatalogRowAction>(
-            value: _CatalogRowAction.delete,
-            child: ListTile(
-              dense: true,
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.delete_outline, color: SboxColors.danger),
-              title: Text(
-                '从 Catalog 逻辑删除',
-                style: TextStyle(color: SboxColors.danger),
-              ),
-            ),
-          ),
-      ],
-    );
-  }
-}
-
-class _LooseLibrary extends StatelessWidget {
-  const _LooseLibrary({required this.controller, required this.onSelected});
-
-  final AppController controller;
-  final ValueChanged<ScannedSboxCandidate> onSelected;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+  Widget _buildFooter(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
       children: <Widget>[
-        const SecurityNotice(
-          title: '未编目本地 SBOX · 不受信索引',
-          message: '只显示公共头部信息。没有已认证 Catalog 时不能显示原始文件名，也不能重组 content_kind = 4 的 multipart。',
-          warning: true,
+        const Icon(Icons.lock_outline, color: SboxColors.textMuted, size: 24),
+        const SizedBox(width: 10),
+        Text(
+          '所有文件均经过加密，安全存储在云端',
+          style: Theme.of(context).textTheme.bodyLarge
+              ?.copyWith(color: SboxColors.textMuted),
         ),
-        const SizedBox(height: 14),
-        if (controller.looseCandidates.isEmpty)
-          const EmptyState(
-            icon: Icons.find_in_page_outlined,
-            title: '没有发现可识别的 SBOX',
-            message: '扫描不会跟随符号链接，最大深度为 8，候选上限为 100,000。',
-          )
-        else
-          ...controller.looseCandidates.map(
-            (item) => Padding(
-              padding: const EdgeInsets.only(bottom: 10),
-              child: SboxCard(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 17,
-                  vertical: 14,
-                ),
-                child: Row(
-                  children: <Widget>[
-                    const Icon(Icons.lock_outline, color: SboxColors.accent),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: <Widget>[
-                          Text(
-                            item.relativePath,
-                            style: const TextStyle(
-                              fontFamily: 'RobotoMono',
-                              color: SboxColors.text,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            'file ID ${item.header.fileId.map((byte) => byte.toRadixString(16).padLeft(2, '0')).join()} · ${_formatBytes(BigInt.from(item.ciphertextSize))}',
-                            style: Theme.of(context).textTheme.bodyMedium,
-                          ),
-                        ],
-                      ),
-                    ),
-                    if (item.hasFileIdConflict)
-                      const StatusPill(
-                        label: 'File ID 冲突',
-                        icon: Icons.error_outline,
-                        tone: SboxColors.danger,
-                      ),
-                    const SizedBox(width: 10),
-                    OutlinedButton(
-                      onPressed: () => onSelected(item),
-                      child: const Text('验证并解密'),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
       ],
     );
   }
+
+  List<_FileRow> get _visibleRows {
+    final query = _searchController.text.trim().toLowerCase();
+    final source = _showPreview
+        ? _previewFiles
+              .map(
+                (file) => _FileRow(
+                  name: file.name,
+                  time: file.time,
+                  type: file.type,
+                  color: file.color,
+                  preview: true,
+                ),
+              )
+              .toList(growable: false)
+        : _bundles.map(_rowForBundle).toList(growable: false);
+    if (query.isEmpty) return source;
+    return source
+        .where((file) => file.name.toLowerCase().contains(query))
+        .toList(growable: false);
+  }
+
+  _FileRow _rowForBundle(_LibraryBundle bundle) {
+    final manifest = bundle.manifest;
+    final name = manifest?.originalName ?? '安全文件';
+    final extension = p.extension(name).replaceFirst('.', '').toUpperCase();
+    final type = extension.isEmpty ? 'FILE' : extension;
+    final color = switch (extension) {
+      'PDF' => const Color(0xFFFF4E42),
+      'ZIP' || 'RAR' || '7Z' => const Color(0xFFFFB52E),
+      'DOC' || 'DOCX' => const Color(0xFF2E86F3),
+      _ => SboxColors.accentStrong,
+    };
+    final date = manifest == null ? '已同步' : _formatDate(manifest.createdAt);
+    return _FileRow(
+      name: name,
+      time: date,
+      type: type,
+      color: color,
+      bundle: bundle,
+    );
+  }
+
+  Future<void> _load() async {
+    await _loadConfiguration();
+    await _scan();
+  }
+
+  Future<void> _loadConfiguration() async {
+    try {
+      final configuration = await _configurationStore.load();
+      var credentialsReady = false;
+      if (configuration != null) {
+        final github = await _credentialStore.getAccessToken(
+          configuration.github.credentialId,
+        );
+        final gitee = await _credentialStore.getAccessToken(
+          configuration.gitee.credentialId,
+        );
+        credentialsReady = github != null && gitee != null;
+        github?.dispose();
+        gitee?.dispose();
+      }
+      if (!mounted) return;
+      setState(() {
+        _configuration = configuration;
+        _credentialsReady = credentialsReady;
+        _showPreview = configuration == null;
+        _loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _showPreview = true;
+      });
+      widget.controller.logger.warning(
+        '读取云端配置失败',
+        detail: AppLogger.describeError(error),
+      );
+    }
+  }
+
+  Future<void> _scan() async {
+    if (!mounted) return;
+    setState(() {
+      _busy = true;
+      _busyTitle = '正在读取文件';
+      _busyDetail = '正在同步你的安全文件。';
+    });
+    final configuration = _configuration ?? await _configurationStore.load();
+    if (configuration == null) {
+      if (mounted) {
+        setState(() {
+          _showPreview = true;
+          _busy = false;
+        });
+      }
+      return;
+    }
+    http.Client? nextClient;
+    try {
+      final client = http.Client();
+      nextClient = client;
+      final pair = CloudRepositoryPair.fromConfiguration(
+        configuration: configuration,
+        client: client,
+        logger: widget.controller.logger,
+      );
+      final listed = await Future.wait<List<ListedBundleRoot>?>(
+        <Future<List<ListedBundleRoot>?>>[
+          _listSource(pair.github, 'GitHub'),
+          _listSource(pair.gitee, 'Gitee'),
+        ],
+      );
+      final byPath = <String, _LibraryBundle>{};
+      for (final root in listed[0] ?? const <ListedBundleRoot>[]) {
+        byPath[root.path.value] = _LibraryBundle(
+          root: root,
+          source: pair.github,
+          sourceName: 'GitHub',
+        );
+      }
+      for (final root in listed[1] ?? const <ListedBundleRoot>[]) {
+        byPath.putIfAbsent(
+          root.path.value,
+          () => _LibraryBundle(
+            root: root,
+            source: pair.gitee,
+            sourceName: 'Gitee',
+          ),
+        );
+      }
+      if (!mounted) return;
+      _client?.close();
+      _client = client;
+      nextClient = null;
+      setState(() {
+        _bundles = byPath.values.toList(growable: false);
+        _showPreview = false;
+        _busy = false;
+      });
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _showPreview = false;
+        });
+        widget.controller.logger.warning(
+          '读取云端文件失败',
+          detail: AppLogger.describeError(error),
+        );
+        _showFeedback('暂时无法读取云端文件，请稍后重试。');
+      }
+    } finally {
+      nextClient?.close();
+    }
+  }
+
+  Future<List<ListedBundleRoot>?> _listSource(
+    EnumerableDataSource source,
+    String name,
+  ) async {
+    try {
+      return await BundleListing.listRoots(source);
+    } catch (error) {
+      widget.controller.logger.warning(
+        '$name：读取云端文件失败',
+        detail: AppLogger.describeError(error),
+      );
+      return null;
+    }
+  }
+
+  Future<void> _pickFile() async {
+    final file = await openFile(confirmButtonText: '选择');
+    if (file != null) await _setFile(file);
+  }
+
+  Future<void> _setFile(XFile file) async {
+    final path = file.path.trim();
+    if (path.isEmpty ||
+        await FileSystemEntity.type(path, followLinks: false) !=
+            FileSystemEntityType.file) {
+      _showFeedback('请选择一个文件。');
+      return;
+    }
+    final length = await File(path).length();
+    if (!mounted) return;
+    setState(() {
+      _selectedFile = file;
+      _selectedFileLength = length;
+    });
+  }
+
+  Future<void> _upload() async {
+    final file = _selectedFile;
+    final record = widget.controller.identityRecord;
+    final configuration = _configuration;
+    if (file == null) {
+      await _pickFile();
+      return;
+    }
+    if (record == null) {
+      _showFeedback('请先完成安全身份设置。');
+      return;
+    }
+    if (configuration == null || !_credentialsReady) {
+      _showFeedback('请先在设置中完成云端备份。');
+      widget.onOpenCloudSettings?.call();
+      return;
+    }
+    final sourceFile = File(file.path);
+    if (!await sourceFile.exists()) {
+      _showFeedback('找不到要上传的文件，请重新选择。');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _busyTitle = '正在安全保存';
+      _busyDetail = '文件正在加密并同步到云端，请稍候。';
+    });
+    try {
+      final identity = PublicIdentityRecord(
+        spkiDer: record.spkiDer,
+        recipientKeyId: record.recipientKeyId,
+      ).toPublicIdentity();
+      final client = http.Client();
+      try {
+        await CloudBundleUploader(
+          credentialStore: _credentialStore,
+          client: client,
+          logger: widget.controller.logger,
+        ).upload(
+          input: FileBundleInput(sourceFile),
+          declaredLength: await sourceFile.length(),
+          options: BundleEncryptionOptions(
+            recipient: identity,
+            contentKind: SboxContentKind.file,
+            originalName: file.name.trim().isEmpty
+                ? p.basename(file.path)
+                : file.name,
+            mediaType: 'application/octet-stream',
+            title: file.name.trim().isEmpty ? p.basename(file.path) : file.name,
+          ),
+          configuration: configuration,
+        );
+      } finally {
+        client.close();
+      }
+      if (!mounted) return;
+      setState(() {
+        _selectedFile = null;
+        _selectedFileLength = null;
+        _busy = false;
+      });
+      _showFeedback('文件已安全保存。');
+      await _scan();
+    } catch (error) {
+      if (mounted) {
+        setState(() => _busy = false);
+        widget.controller.setError(error, operation: '安全保存文件失败');
+        _showFeedback('文件暂时没有保存成功，请稍后重试。');
+      }
+    }
+  }
+
+  Future<void> _openRow(_FileRow row) async {
+    if (row.preview) {
+      _showFeedback('这是预览文件；完成云端备份后即可打开你的文件。');
+      return;
+    }
+    final bundle = row.bundle;
+    if (bundle == null) return;
+    if (bundle.manifest == null) {
+      final mnemonic = await _askMnemonic();
+      if (mnemonic == null || mnemonic.trim().isEmpty) return;
+      await _authenticate(bundle, mnemonic);
+      return;
+    }
+    await _open(bundle);
+  }
+
+  Future<void> _authenticate(_LibraryBundle bundle, String mnemonic) async {
+    setState(() {
+      _busy = true;
+      _busyTitle = '正在准备文件';
+      _busyDetail = '正在验证文件并准备打开。';
+    });
+    try {
+      final read = await bundle.source.get(bundle.root.path);
+      final bytes = await _read(read.body, read.length);
+      final result = await BundleProbe.authenticateManifest(
+        basename: bundle.root.path.value,
+        objectPrefix: bytes,
+        mnemonic: mnemonic,
+      );
+      final destination = await _ensurePlaintext(
+        bundle: bundle,
+        manifest: result.manifest!,
+        mnemonic: mnemonic,
+      );
+      if (!mounted) return;
+      setState(() {
+        bundle.manifest = result.manifest;
+        bundle.plaintextFile = destination;
+        _busy = false;
+      });
+      await FileOpener.open(destination);
+      _showFeedback('文件已准备好。');
+    } catch (error) {
+      if (mounted) {
+        setState(() => _busy = false);
+        widget.controller.setError(error, operation: '准备文件失败');
+        _showFeedback('文件暂时无法打开，请检查恢复词后重试。');
+      }
+    }
+  }
+
+  Future<void> _open(_LibraryBundle bundle) async {
+    final manifest = bundle.manifest;
+    if (manifest == null) return;
+    setState(() {
+      _busy = true;
+      _busyTitle = '正在准备文件';
+      _busyDetail = '正在确认文件完整性。';
+    });
+    try {
+      var destination = bundle.plaintextFile;
+      if (destination == null ||
+          !await _temporaryStore.matches(destination, manifest)) {
+        final mnemonic = await _askMnemonic(
+          title: '重新验证文件',
+          actionLabel: '下载并打开',
+        );
+        if (mnemonic == null || mnemonic.trim().isEmpty) return;
+        destination = await _ensurePlaintext(
+          bundle: bundle,
+          manifest: manifest,
+          mnemonic: mnemonic,
+        );
+        if (mounted) bundle.plaintextFile = destination;
+      }
+      await FileOpener.open(destination);
+      if (mounted) _showFeedback('文件已打开。');
+    } catch (error) {
+      if (mounted) {
+        widget.controller.setError(error, operation: '打开文件失败');
+        _showFeedback('文件暂时无法打开，请稍后重试。');
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<File> _ensurePlaintext({
+    required _LibraryBundle bundle,
+    required BundleManifest manifest,
+    required String mnemonic,
+  }) async {
+    final destination = await _temporaryStore.fileFor(manifest);
+    await TemporaryPlaintextPlatform.protectRoot(_temporaryStore.path);
+    if (await _temporaryStore.matches(destination, manifest)) {
+      return destination;
+    }
+    await _temporaryStore.deleteFile(destination);
+    await BundleSync.fetchAndDecryptToFileStreaming(
+      source: bundle.source,
+      rootPath: bundle.root.path,
+      mnemonic: mnemonic,
+      destination: destination,
+    );
+    return destination;
+  }
+
+  Future<String?> _askMnemonic({
+    String title = '验证文件',
+    String actionLabel = '打开',
+  }) async {
+    final input = TextEditingController();
+    try {
+      return await showDialog<String>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(title),
+          content: TextField(
+            controller: input,
+            autofocus: true,
+            obscureText: true,
+            maxLines: 2,
+            decoration: const InputDecoration(labelText: '输入 12 个恢复词'),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(context).pop(input.text),
+              child: Text(actionLabel),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      input.clear();
+      input.dispose();
+    }
+  }
+
+  void _showFeedback(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  static Future<Uint8List> _read(Stream<List<int>> body, int length) async {
+    final output = BytesBuilder(copy: false);
+    var count = 0;
+    await for (final chunk in body) {
+      count += chunk.length;
+      if (count > length) throw const FormatException('云端对象过长');
+      output.add(chunk);
+    }
+    if (count != length) throw const FormatException('云端对象不完整');
+    return output.takeBytes();
+  }
+
+  static String _formatBytes(int bytes) {
+    if (bytes >= 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GiB';
+    }
+    if (bytes >= 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MiB';
+    }
+    if (bytes >= 1024) return '${(bytes / 1024).toStringAsFixed(1)} KiB';
+    return '$bytes B';
+  }
+
+  static String _formatDate(String value) {
+    final local = DateTime.tryParse(value)?.toLocal();
+    if (local == null) return '已同步';
+    String two(int number) => number.toString().padLeft(2, '0');
+    return '${local.month}月${local.day}日 ${two(local.hour)}:${two(local.minute)}';
+  }
 }
 
-String _providerLine(SourceConfiguration source) => switch (source.provider) {
-  SourceProvider.local =>
-    source.isAuthorizedDirectory
-        ? '系统授权目录 · 只读永久密文镜像'
-        : source.localDirectoryMode == ConfiguredLocalMode.canonicalCatalog
-        ? '本地目录 · canonical_catalog'
-        : '本地目录 · loose_read_only',
-  SourceProvider.github =>
-    'GitHub · ${source.owner}/${source.repository} · ${source.branchOrRef}',
-  SourceProvider.gitee =>
-    'Gitee · ${source.owner}/${source.repository} · ${source.branchOrRef}',
-  SourceProvider.https => '只读 HTTPS · ${source.httpsBaseUri?.host}',
-};
-
-String _operationLabel(AppOperation operation) => switch (operation) {
-  AppOperation.derivingIdentity => '正在恢复公开身份',
-  AppOperation.inspecting => '正在安全检查',
-  AppOperation.refreshing => '正在刷新加密目录',
-  AppOperation.unlockingCatalog => '正在解密并验证 Catalog',
-  AppOperation.syncingObjects => '正在同步全部密文分片到本地',
-  AppOperation.encrypting => '正在加密并本地提交',
-  AppOperation.updatingCatalog => '正在解锁并加密 Catalog 修改',
-  AppOperation.uploading => '正在上传密文并条件提交 Catalog',
-  AppOperation.decrypting => '正在认证、解密与重组',
-  AppOperation.exporting => '正在通过系统选择器导出文件',
-  AppOperation.cleaning => '正在清理受管理临时明文',
-  AppOperation.idle => '任务完成',
-};
-
-final class _CatalogMetadataEdit {
-  const _CatalogMetadataEdit({
-    required this.title,
-    required this.description,
-    required this.tags,
+final class _DashedDropTarget extends StatelessWidget {
+  const _DashedDropTarget({
+    required this.child,
+    required this.dragging,
+    required this.onTap,
+    required this.onDragEntered,
+    required this.onDragExited,
+    required this.onDragDone,
   });
 
-  final String title;
-  final String description;
-  final List<String> tags;
+  final Widget child;
+  final bool dragging;
+  final VoidCallback? onTap;
+  final VoidCallback onDragEntered;
+  final VoidCallback onDragExited;
+  final ValueChanged<List<XFile>> onDragDone;
+
+  @override
+  Widget build(BuildContext context) {
+    final target = DropTarget(
+      onDragEntered: (_) => onDragEntered(),
+      onDragExited: (_) => onDragExited(),
+      onDragDone: (detail) => onDragDone(detail.files),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(14),
+        child: CustomPaint(
+          painter: _DashedBorderPainter(
+            color: dragging ? SboxColors.accent : SboxColors.border,
+            radius: 14,
+            dash: 8,
+            gap: 6,
+          ),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: dragging
+                  ? SboxColors.accent.withValues(alpha: 0.06)
+                  : SboxColors.panelSoft.withValues(alpha: 0.62),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: child,
+          ),
+        ),
+      ),
+    );
+    return target;
+  }
 }
 
-Future<Map<String, CatalogConflictResolution>?>
-_showCatalogConflictResolutionDialog(
-  BuildContext context,
-  List<CatalogConflictViewData> conflicts,
-) {
-  final selected = <String, CatalogConflictResolution>{};
-  return showDialog<Map<String, CatalogConflictResolution>>(
-    context: context,
-    barrierDismissible: false,
-    builder: (context) => StatefulBuilder(
-      builder: (context, setState) => AlertDialog(
-        backgroundColor: SboxColors.panel,
-        surfaceTintColor: Colors.transparent,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(14),
-          side: const BorderSide(color: SboxColors.border),
-        ),
-        title: const Text('逐条处理 Catalog 冲突'),
-        content: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 700, maxHeight: 620),
-          child: SingleChildScrollView(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                const SecurityNotice(
-                  title: '禁止最后写入者自动覆盖',
-                  message: '每个冲突都必须明确选择本地或远端。选择完成后会重新验证最新远端 Catalog、增加 revision/generation，并重新签名和加密。',
-                  warning: true,
-                ),
-                const SizedBox(height: 14),
-                for (final conflict in conflicts) ...<Widget>[
-                  SboxCard(
-                    padding: const EdgeInsets.all(14),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: <Widget>[
-                        Text(
-                          conflict.reason,
-                          style: const TextStyle(fontWeight: FontWeight.w700),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          '本地：${conflict.localTitle}\n'
-                          '远端：${conflict.remoteTitle ?? '已删除或不存在'}',
-                          style: Theme.of(context).textTheme.bodyMedium,
-                        ),
-                        const SizedBox(height: 10),
-                        SegmentedButton<CatalogConflictResolution>(
-                          emptySelectionAllowed: true,
-                          showSelectedIcon: false,
-                          segments: <ButtonSegment<CatalogConflictResolution>>[
-                            ButtonSegment<CatalogConflictResolution>(
-                              value: CatalogConflictResolution.keepLocal,
-                              icon: Icon(
-                                conflict.localTitle == '本地删除'
-                                    ? Icons.delete_outline
-                                    : Icons.computer_outlined,
-                              ),
-                              label: Text(
-                                conflict.localTitle == '本地删除'
-                                    ? '确认本地删除'
-                                    : '保留本地版本',
-                              ),
-                            ),
-                            ButtonSegment<CatalogConflictResolution>(
-                              value: CatalogConflictResolution.keepRemote,
-                              icon: const Icon(Icons.cloud_outlined),
-                              label: Text(
-                                conflict.remoteTitle == null
-                                    ? '采用远端删除'
-                                    : '采用远端版本',
-                              ),
-                            ),
-                          ],
-                          selected: selected[conflict.entryId] == null
-                              ? const <CatalogConflictResolution>{}
-                              : <CatalogConflictResolution>{
-                                  selected[conflict.entryId]!,
-                                },
-                          onSelectionChanged: (values) => setState(() {
-                            if (values.isEmpty) {
-                              selected.remove(conflict.entryId);
-                            } else {
-                              selected[conflict.entryId] = values.single;
-                            }
-                          }),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                ],
-              ],
+final class _DashedBorderPainter extends CustomPainter {
+  const _DashedBorderPainter({
+    required this.color,
+    required this.radius,
+    required this.dash,
+    required this.gap,
+  });
+
+  final Color color;
+  final double radius;
+  final double dash;
+  final double gap;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color.withValues(alpha: 0.82)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2;
+    final path = Path()
+      ..addRRect(
+        RRect.fromRectAndRadius(Offset.zero & size, Radius.circular(radius)),
+      );
+    for (final metric in path.computeMetrics()) {
+      var distance = 0.0;
+      while (distance < metric.length) {
+        final end = (distance + dash).clamp(0, metric.length).toDouble();
+        canvas.drawPath(metric.extractPath(distance, end), paint);
+        distance += dash + gap;
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _DashedBorderPainter oldDelegate) =>
+      oldDelegate.color != color;
+}
+
+final class _UploadFolderIcon extends StatelessWidget {
+  const _UploadFolderIcon({required this.size});
+
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: size,
+      height: size * 0.76,
+      child: Stack(
+        alignment: Alignment.center,
+        children: <Widget>[
+          Icon(
+            Icons.folder_rounded,
+            color: SboxColors.accentStrong,
+            size: size,
+          ),
+          Positioned(
+            top: size * 0.2,
+            child: Icon(
+              Icons.arrow_upward_rounded,
+              color: const Color(0xFF075F59),
+              size: size * 0.48,
             ),
-          ),
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('取消'),
-          ),
-          ElevatedButton(
-            onPressed: selected.length == conflicts.length
-                ? () => Navigator.of(context).pop(
-                    Map<String, CatalogConflictResolution>.unmodifiable(
-                      selected,
-                    ),
-                  )
-                : null,
-            child: Text('继续（${selected.length}/${conflicts.length}）'),
           ),
         ],
       ),
-    ),
-  );
-}
-
-Future<_CatalogMetadataEdit?> _showCatalogMetadataDialog(
-  BuildContext context,
-  CatalogEntryViewData entry,
-) async {
-  final title = TextEditingController(text: entry.title);
-  final description = TextEditingController(text: entry.description);
-  final tags = TextEditingController(text: entry.tags.join(', '));
-  try {
-    return await showDialog<_CatalogMetadataEdit>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setState) {
-          final normalizedTitle = title.text.trim();
-          final normalizedDescription = description.text.trim();
-          final parsedTags = tags.text
-              .split(RegExp(r'[,，\s]+'))
-              .map((value) => value.trim())
-              .where((value) => value.isNotEmpty)
-              .toSet()
-              .toList(growable: false);
-          final valid =
-              normalizedTitle.isNotEmpty &&
-              utf8.encode(normalizedTitle).length <= 256 &&
-              utf8.encode(normalizedDescription).length <= 4096 &&
-              parsedTags.length <= 32 &&
-              parsedTags.every((tag) => utf8.encode(tag).length <= 64);
-          return AlertDialog(
-            backgroundColor: SboxColors.panel,
-            surfaceTintColor: Colors.transparent,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(14),
-              side: const BorderSide(color: SboxColors.border),
-            ),
-            title: const Text('编辑 Catalog 条目'),
-            content: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 560),
-              child: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: <Widget>[
-                    const SecurityNotice(
-                      title: '修改需要重新签名',
-                      message: '仅修改加密 Catalog 中的标题、说明和标签；原始 SBOX 密文对象不会被改写。',
-                    ),
-                    const SizedBox(height: 16),
-                    TextField(
-                      controller: title,
-                      autofocus: true,
-                      maxLength: 256,
-                      onChanged: (_) => setState(() {}),
-                      decoration: const InputDecoration(labelText: '标题'),
-                    ),
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: description,
-                      minLines: 3,
-                      maxLines: 6,
-                      maxLength: 4096,
-                      onChanged: (_) => setState(() {}),
-                      decoration: const InputDecoration(labelText: '说明（可选）'),
-                    ),
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: tags,
-                      onChanged: (_) => setState(() {}),
-                      decoration: const InputDecoration(
-                        labelText: '标签（逗号或空格分隔）',
-                        helperText: '最多 32 个标签；每个标签不超过 64 字节',
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            actions: <Widget>[
-              TextButton(
-                onPressed: () => Navigator.of(context).pop(),
-                child: const Text('取消'),
-              ),
-              ElevatedButton(
-                onPressed: valid
-                    ? () => Navigator.of(context).pop(
-                        _CatalogMetadataEdit(
-                          title: normalizedTitle,
-                          description: normalizedDescription,
-                          tags: parsedTags,
-                        ),
-                      )
-                    : null,
-                child: const Text('继续验证助记词'),
-              ),
-            ],
-          );
-        },
-      ),
     );
-  } finally {
-    title.dispose();
-    description.dispose();
-    tags.dispose();
   }
 }
 
-String _formatTime(String value, {bool useUtc = false}) {
-  try {
-    final parsed = DateTime.parse(value);
-    return DateFormat('yyyy-MM-dd HH:mm')
-        .format(useUtc ? parsed.toUtc() : parsed.toLocal());
-  } catch (_) {
-    return value;
-  }
+final class _PreviewFile {
+  const _PreviewFile({
+    required this.name,
+    required this.time,
+    required this.type,
+    required this.color,
+  });
+
+  final String name;
+  final String time;
+  final String type;
+  final Color color;
 }
 
-String _formatBytes(BigInt bytes) {
-  final value = bytes.toDouble();
-  if (value >= 1024 * 1024 * 1024) {
-    return '${(value / (1024 * 1024 * 1024)).toStringAsFixed(2)} GiB';
-  }
-  if (value >= 1024 * 1024) {
-    return '${(value / (1024 * 1024)).toStringAsFixed(2)} MiB';
-  }
-  if (value >= 1024) return '${(value / 1024).toStringAsFixed(1)} KiB';
-  return '${bytes.toString()} B';
+final class _FileRow {
+  const _FileRow({
+    required this.name,
+    required this.time,
+    required this.type,
+    required this.color,
+    this.bundle,
+    this.preview = false,
+  });
+
+  final String name;
+  final String time;
+  final String type;
+  final Color color;
+  final _LibraryBundle? bundle;
+  final bool preview;
 }
 
-IconData _fileIcon(String mediaType) {
-  if (mediaType.startsWith('image/')) return Icons.image_outlined;
-  if (mediaType.startsWith('text/')) return Icons.description_outlined;
-  if (mediaType == 'application/pdf') return Icons.picture_as_pdf_outlined;
-  if (mediaType.contains('zip')) return Icons.folder_zip_outlined;
-  return Icons.insert_drive_file_outlined;
-}
+final class _LibraryBundle {
+  _LibraryBundle({
+    required this.root,
+    required this.source,
+    required this.sourceName,
+  });
 
-Color _fileColor(String mediaType) {
-  if (mediaType == 'application/pdf') return SboxColors.danger;
-  if (mediaType.startsWith('text/')) return SboxColors.info;
-  if (mediaType.contains('zip')) return SboxColors.warning;
-  return SboxColors.accent;
+  final ListedBundleRoot root;
+  final DataSource source;
+  final String sourceName;
+  BundleManifest? manifest;
+  File? plaintextFile;
 }

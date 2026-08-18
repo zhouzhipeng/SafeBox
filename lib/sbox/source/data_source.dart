@@ -3,50 +3,24 @@ import 'dart:typed_data';
 import '../bytes.dart';
 import 'source_path.dart';
 
-enum UploadEncoding { binary, base64Json }
-
 final class SourceCapabilities {
   const SourceCapabilities({
     required this.canRead,
     required this.canWrite,
     required this.canDelete,
-    required this.conditionalWrite,
-    required this.history,
+    required this.canListObjects,
+    required this.supportsRangeRead,
     required this.maxObjectBytes,
-    required this.maxRequestBodyBytes,
-    required this.uploadEncoding,
-    required this.maxParallelObjectTransfers,
-    required this.supportsStreamingDownload,
-    required this.supportsResumableObjectDownload,
-  }) : assert(
-         maxParallelObjectTransfers >= 1 && maxParallelObjectTransfers <= 4,
-       );
+    required this.maxParallelTransfers,
+  });
 
   final bool canRead;
   final bool canWrite;
   final bool canDelete;
-  final bool conditionalWrite;
-  final bool history;
-  final BigInt? maxObjectBytes;
-  final BigInt? maxRequestBodyBytes;
-  final UploadEncoding uploadEncoding;
-  final int maxParallelObjectTransfers;
-  final bool supportsStreamingDownload;
-  final bool supportsResumableObjectDownload;
-
-  static const localReadWrite = SourceCapabilities(
-    canRead: true,
-    canWrite: true,
-    canDelete: true,
-    conditionalWrite: true,
-    history: false,
-    maxObjectBytes: null,
-    maxRequestBodyBytes: null,
-    uploadEncoding: UploadEncoding.binary,
-    maxParallelObjectTransfers: 4,
-    supportsStreamingDownload: true,
-    supportsResumableObjectDownload: true,
-  );
+  final bool canListObjects;
+  final bool supportsRangeRead;
+  final int? maxObjectBytes;
+  final int maxParallelTransfers;
 }
 
 final class RevisionToken {
@@ -72,6 +46,25 @@ final class SourceRead {
   final bool notModified;
 }
 
+final class SourceObjectInfo {
+  const SourceObjectInfo({
+    required this.path,
+    required this.length,
+    required this.revision,
+  });
+
+  final SourcePath path;
+  final int length;
+  final RevisionToken revision;
+}
+
+final class SourceListPage {
+  const SourceListPage({required this.objects, required this.nextCursor});
+
+  final List<SourceObjectInfo> objects;
+  final String? nextCursor;
+}
+
 abstract interface class DataSource {
   SourceCapabilities get capabilities;
 
@@ -84,12 +77,17 @@ abstract interface class DataSource {
     required Uint8List sha256,
   });
 
-  Future<RevisionToken> compareAndSwap(
-    SourcePath path,
-    RevisionToken expected,
-    Stream<List<int>> body, {
-    required int length,
-  });
-
   Future<void> deleteIfMatch(SourcePath path, RevisionToken expected);
+}
+
+abstract interface class EnumerableDataSource implements DataSource {
+  Future<SourceListPage> listObjects({String? cursor, int pageSize = 1000});
+}
+
+abstract interface class RangeReadableDataSource implements DataSource {
+  Future<SourceRead> getRange(
+    SourcePath path, {
+    required int start,
+    required int endExclusive,
+  });
 }

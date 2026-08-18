@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+/// Public RSA material that may be retained by the application.
 final class SboxRsaPublicKey {
   const SboxRsaPublicKey({required this.modulus, required this.exponent});
 
@@ -9,8 +10,7 @@ final class SboxRsaPublicKey {
   int get modulusBytes => (modulus.bitLength + 7) ~/ 8;
 }
 
-/// Ephemeral RSA private material. It must only live inside a disposable
-/// crypto isolate and must never be serialized to persistent storage.
+/// Ephemeral RSA private material. It must never be serialized.
 final class SboxRsaPrivateKey {
   const SboxRsaPrivateKey({
     required this.publicKey,
@@ -45,43 +45,38 @@ final class RsaGenerationResult {
   final int outerAttemptCount;
 }
 
+/// RSA-only public identity. No signing identity is part of SBOX 2.0.
 final class PublicIdentity {
   PublicIdentity({
     required this.rsaPublicKey,
     required List<int> spkiDer,
     required this.spkiPem,
     required List<int> recipientKeyId,
-    required List<int> catalogSigningPublicKey,
-    required List<int> catalogSignerKeyId,
   }) : spkiDer = Uint8List.fromList(spkiDer),
-       recipientKeyId = Uint8List.fromList(recipientKeyId),
-       catalogSigningPublicKey = Uint8List.fromList(catalogSigningPublicKey),
-       catalogSignerKeyId = Uint8List.fromList(catalogSignerKeyId);
+       recipientKeyId = Uint8List.fromList(recipientKeyId);
 
   final SboxRsaPublicKey rsaPublicKey;
   final Uint8List spkiDer;
   final String spkiPem;
   final Uint8List recipientKeyId;
-  final Uint8List catalogSigningPublicKey;
-  final Uint8List catalogSignerKeyId;
 }
 
+/// Private identity wrapper whose secret buffers are explicitly disposable.
 final class EphemeralIdentity {
   EphemeralIdentity({
     required this.publicIdentity,
     required this.rsaPrivateKey,
-    required List<int> catalogSigningSeed,
     required this.pCandidateCount,
     required this.qCandidateCount,
-  }) : catalogSigningSeed = Uint8List.fromList(catalogSigningSeed);
+  });
 
   final PublicIdentity publicIdentity;
   final SboxRsaPrivateKey rsaPrivateKey;
-  final Uint8List catalogSigningSeed;
   final int pCandidateCount;
   final int qCandidateCount;
 
   void disposeControlledSecrets() {
-    catalogSigningSeed.fillRange(0, catalogSigningSeed.length, 0);
+    // BigInt is immutable in Dart; the containing crypto isolate is the final
+    // lifetime boundary for the private integers.
   }
 }
