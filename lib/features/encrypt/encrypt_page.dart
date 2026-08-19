@@ -207,7 +207,7 @@ final class _EncryptPageState extends State<EncryptPage> {
 
   Widget _buildFilePicker(BuildContext context) {
     final file = _selectedFile;
-    final accent = SboxColors.accent;
+    final accent = context.sboxColors.accent;
     return DropTarget(
       enable: !_busy,
       onDragEntered: (_) {
@@ -237,10 +237,10 @@ final class _EncryptPageState extends State<EncryptPage> {
             decoration: BoxDecoration(
               color: _dragging
                   ? accent.withValues(alpha: 0.08)
-                  : SboxColors.panelSoft,
+                  : context.sboxColors.panelSoft,
               borderRadius: BorderRadius.circular(10),
               border: Border.all(
-                color: _dragging ? accent : SboxColors.border,
+                color: _dragging ? accent : context.sboxColors.border,
                 width: _dragging ? 1.5 : 1,
               ),
             ),
@@ -345,7 +345,7 @@ final class _EncryptPageState extends State<EncryptPage> {
                   Text(
                     '第 ${selectedIndex + 1} 帧',
                     style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                      color: SboxColors.accent,
+                      color: context.sboxColors.accent,
                       fontWeight: FontWeight.w700,
                     ),
                   ),
@@ -355,7 +355,7 @@ final class _EncryptPageState extends State<EncryptPage> {
             Text(
               detail,
               style: Theme.of(context).textTheme.bodyMedium
-                  ?.copyWith(color: SboxColors.textMuted),
+                  ?.copyWith(color: context.sboxColors.textMuted),
             ),
             if (_videoPreviewLoading) ...<Widget>[
               const SizedBox(height: 12),
@@ -401,7 +401,7 @@ final class _EncryptPageState extends State<EncryptPage> {
     int index,
     bool selected,
   ) {
-    final accent = SboxColors.accent;
+    final accent = context.sboxColors.accent;
     return Semantics(
       button: true,
       selected: selected,
@@ -417,10 +417,10 @@ final class _EncryptPageState extends State<EncryptPage> {
           height: 108,
           padding: EdgeInsets.all(selected ? 2 : 1),
           decoration: BoxDecoration(
-            color: SboxColors.panelRaised,
+            color: context.sboxColors.panelRaised,
             borderRadius: BorderRadius.circular(9),
             border: Border.all(
-              color: selected ? accent : SboxColors.border,
+              color: selected ? accent : context.sboxColors.border,
               width: selected ? 2 : 1,
             ),
           ),
@@ -433,9 +433,9 @@ final class _EncryptPageState extends State<EncryptPage> {
                   preview.encodedBytesView,
                   fit: BoxFit.cover,
                   gaplessPlayback: true,
-                  errorBuilder: (context, error, stackTrace) => const Icon(
+                  errorBuilder: (context, error, stackTrace) => Icon(
                     Icons.broken_image_outlined,
-                    color: SboxColors.textMuted,
+                    color: context.sboxColors.textMuted,
                   ),
                 ),
               ),

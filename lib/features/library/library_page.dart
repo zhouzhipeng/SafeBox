@@ -216,7 +216,7 @@ final class _LibraryPageState extends State<LibraryPage> {
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.headlineMedium?.copyWith(
                 fontSize: mobile ? 25 : 22,
-                color: SboxColors.text,
+                color: context.sboxColors.text,
               ),
             ),
             const SizedBox(height: 22),
@@ -265,7 +265,10 @@ final class _LibraryPageState extends State<LibraryPage> {
               const SizedBox(height: 18),
               Text(
                 _busyTitle,
-                style: const TextStyle(color: SboxColors.accent, fontSize: 13),
+                style: TextStyle(
+                  color: context.sboxColors.accent,
+                  fontSize: 13,
+                ),
               ),
             ],
           ],
@@ -276,8 +279,9 @@ final class _LibraryPageState extends State<LibraryPage> {
 
   Widget _buildFileSelectionHint(BuildContext context) {
     final file = _selectedFile;
-    final textStyle = Theme.of(context).textTheme.bodyLarge
-        ?.copyWith(color: _busy ? SboxColors.textDim : SboxColors.textMuted);
+    final textStyle = Theme.of(context).textTheme.bodyLarge?.copyWith(
+      color: _busy ? context.sboxColors.textDim : context.sboxColors.textMuted,
+    );
     if (file == null) {
       return Text('文件会自动安全保存', style: textStyle, textAlign: TextAlign.center);
     }
@@ -342,7 +346,7 @@ final class _LibraryPageState extends State<LibraryPage> {
                     Text(
                       '第 ${selectedIndex + 1} 帧',
                       style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                        color: SboxColors.accent,
+                        color: context.sboxColors.accent,
                         fontWeight: FontWeight.w700,
                       ),
                     ),
@@ -352,7 +356,7 @@ final class _LibraryPageState extends State<LibraryPage> {
               Text(
                 detail,
                 style: Theme.of(context).textTheme.bodyMedium
-                    ?.copyWith(color: SboxColors.textMuted),
+                    ?.copyWith(color: context.sboxColors.textMuted),
               ),
               if (_videoPreviewLoading) ...<Widget>[
                 const SizedBox(height: 12),
@@ -399,7 +403,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     int index,
     bool selected,
   ) {
-    final accent = SboxColors.accent;
+    final accent = context.sboxColors.accent;
     return Semantics(
       button: true,
       selected: selected,
@@ -416,10 +420,10 @@ final class _LibraryPageState extends State<LibraryPage> {
           height: 108,
           padding: EdgeInsets.all(selected ? 2 : 1),
           decoration: BoxDecoration(
-            color: SboxColors.panelRaised,
+            color: context.sboxColors.panelRaised,
             borderRadius: BorderRadius.circular(9),
             border: Border.all(
-              color: selected ? accent : SboxColors.border,
+              color: selected ? accent : context.sboxColors.border,
               width: selected ? 2 : 1,
             ),
           ),
@@ -432,9 +436,9 @@ final class _LibraryPageState extends State<LibraryPage> {
                   preview.encodedBytesView,
                   fit: BoxFit.cover,
                   gaplessPlayback: true,
-                  errorBuilder: (context, error, stackTrace) => const Icon(
+                  errorBuilder: (context, error, stackTrace) => Icon(
                     Icons.broken_image_outlined,
-                    color: SboxColors.textMuted,
+                    color: context.sboxColors.textMuted,
                   ),
                 ),
               ),
@@ -495,18 +499,18 @@ final class _LibraryPageState extends State<LibraryPage> {
       child: Container(
         padding: const EdgeInsets.fromLTRB(12, 10, 12, 7),
         decoration: BoxDecoration(
-          color: SboxColors.panelSoft,
+          color: context.sboxColors.panelSoft,
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: SboxColors.borderSoft),
+          border: Border.all(color: context.sboxColors.borderSoft),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
             Row(
               children: <Widget>[
-                const Icon(
+                Icon(
                   Icons.view_in_ar_outlined,
-                  color: SboxColors.accent,
+                  color: context.sboxColors.accent,
                   size: 23,
                 ),
                 const SizedBox(width: 9),
@@ -519,7 +523,7 @@ final class _LibraryPageState extends State<LibraryPage> {
                 Text(
                   '$megabytes MB',
                   style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                    color: SboxColors.accent,
+                    color: context.sboxColors.accent,
                     fontWeight: FontWeight.w700,
                   ),
                 ),
@@ -529,7 +533,7 @@ final class _LibraryPageState extends State<LibraryPage> {
             Text(
               _savingShardSize ? '正在保存…' : '默认 16 MB，云端限制时自动适配',
               style: Theme.of(context).textTheme.bodySmall
-                  ?.copyWith(color: SboxColors.textMuted),
+                  ?.copyWith(color: context.sboxColors.textMuted),
             ),
             Slider(
               value: megabytes.toDouble(),
@@ -659,7 +663,7 @@ final class _LibraryPageState extends State<LibraryPage> {
                     : '${rows.length} 个文件 · '
                           '总加密大小：${_formatBytes(BigInt.from(totalEncryptedBytes))}',
                 icon: Icons.verified_user_outlined,
-                tone: SboxColors.accent,
+                tone: context.sboxColors.accent,
                 compact: true,
               ),
             ],
@@ -683,9 +687,9 @@ final class _LibraryPageState extends State<LibraryPage> {
               child: Center(
                 child: Column(
                   children: <Widget>[
-                    const Icon(
+                    Icon(
                       Icons.folder_open_outlined,
-                      color: SboxColors.textDim,
+                      color: context.sboxColors.textDim,
                       size: 40,
                     ),
                     const SizedBox(height: 12),
@@ -709,7 +713,7 @@ final class _LibraryPageState extends State<LibraryPage> {
                   for (var index = 0; index < rows.length; index++) ...<Widget>[
                     _buildFileRow(context, rows[index], mobile),
                     if (index != rows.length - 1)
-                      const Divider(height: 1, color: SboxColors.borderSoft),
+                      Divider(height: 1, color: context.sboxColors.borderSoft),
                   ],
                 ],
               ),
@@ -722,16 +726,16 @@ final class _LibraryPageState extends State<LibraryPage> {
   Widget _buildRefreshButton() {
     return Container(
       decoration: BoxDecoration(
-        color: SboxColors.panelSoft,
-        border: Border.all(color: SboxColors.border),
+        color: context.sboxColors.panelSoft,
+        border: Border.all(color: context.sboxColors.border),
         borderRadius: BorderRadius.circular(10),
       ),
       child: IconButton(
         onPressed: _busy || _listingInBackground ? null : _scan,
         icon: const Icon(Icons.refresh_rounded),
         tooltip: '刷新',
-        color: SboxColors.accent,
-        disabledColor: SboxColors.textDim,
+        color: context.sboxColors.accent,
+        disabledColor: context.sboxColors.textDim,
         iconSize: 24,
         padding: const EdgeInsets.all(10),
         constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
@@ -789,9 +793,9 @@ final class _LibraryPageState extends State<LibraryPage> {
         width: mobile ? double.infinity : null,
         padding: const EdgeInsets.all(3),
         decoration: BoxDecoration(
-          color: SboxColors.backgroundDeep.withValues(alpha: 0.62),
+          color: context.sboxColors.backgroundDeep.withValues(alpha: 0.62),
           borderRadius: BorderRadius.circular(11),
-          border: Border.all(color: SboxColors.border),
+          border: Border.all(color: context.sboxColors.border),
         ),
         child: Row(
           mainAxisSize: mobile ? MainAxisSize.max : MainAxisSize.min,
@@ -808,7 +812,9 @@ final class _LibraryPageState extends State<LibraryPage> {
     required bool mobile,
   }) {
     final selected = _selectedSource == source;
-    final color = selected ? SboxColors.accent : SboxColors.textMuted;
+    final color = selected
+        ? context.sboxColors.accent
+        : context.sboxColors.textMuted;
     final child = AnimatedContainer(
       duration: const Duration(milliseconds: 140),
       padding: EdgeInsets.symmetric(
@@ -816,7 +822,9 @@ final class _LibraryPageState extends State<LibraryPage> {
         vertical: mobile ? 9 : 8,
       ),
       decoration: BoxDecoration(
-        color: selected ? SboxColors.accent.withValues(alpha: 0.14) : null,
+        color: selected
+            ? context.sboxColors.accent.withValues(alpha: 0.14)
+            : null,
         borderRadius: BorderRadius.circular(8),
       ),
       child: Row(
@@ -880,7 +888,7 @@ final class _LibraryPageState extends State<LibraryPage> {
                   Text(
                     row.time,
                     style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                      color: SboxColors.textMuted,
+                      color: context.sboxColors.textMuted,
                       fontSize: mobile ? 14 : 15,
                     ),
                   ),
@@ -889,7 +897,7 @@ final class _LibraryPageState extends State<LibraryPage> {
                     Text(
                       '原始大小：${_formatBytes(row.bundle!.manifest!.logicalPlaintextSize)}',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        color: SboxColors.textMuted,
+                        color: context.sboxColors.textMuted,
                         fontSize: mobile ? 13 : 14,
                       ),
                     ),
@@ -900,7 +908,7 @@ final class _LibraryPageState extends State<LibraryPage> {
                     Text(
                       '附加信息：${row.bundle!.manifest!.description}',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        color: SboxColors.textMuted,
+                        color: context.sboxColors.textMuted,
                         fontSize: mobile ? 13 : 14,
                       ),
                     ),
@@ -1028,20 +1036,37 @@ final class _LibraryPageState extends State<LibraryPage> {
       ],
     };
     if (_canDeleteCloudBundle(row)) {
-      final errorColor = Theme.of(context).colorScheme.error;
       buttons.add(
         SizedBox(
-          width: buttonWidth,
-          child: OutlinedButton.icon(
-            onPressed: _busy || _listingInBackground
-                ? null
-                : () => _deleteCloudBundle(row),
-            style: OutlinedButton.styleFrom(
-              foregroundColor: errorColor,
-              side: BorderSide(color: errorColor.withValues(alpha: 0.72)),
-            ),
-            icon: Icon(Icons.delete_outline, size: mobile ? 20 : 22),
-            label: const Text('删除云端文件'),
+          width: mobile ? 48 : 52,
+          height: mobile ? 48 : 52,
+          child: PopupMenuButton<_FileRowMenuAction>(
+            enabled: !_busy && !_listingInBackground,
+            tooltip: '更多操作',
+            icon: Icon(Icons.more_vert, size: mobile ? 21 : 23),
+            padding: EdgeInsets.zero,
+            onSelected: (action) {
+              switch (action) {
+                case _FileRowMenuAction.deleteCloudBundle:
+                  _deleteCloudBundle(row);
+              }
+            },
+            itemBuilder: (context) {
+              final errorColor = Theme.of(context).colorScheme.error;
+              return <PopupMenuEntry<_FileRowMenuAction>>[
+                PopupMenuItem<_FileRowMenuAction>(
+                  value: _FileRowMenuAction.deleteCloudBundle,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Icon(Icons.delete_outline, color: errorColor, size: 20),
+                      const SizedBox(width: 10),
+                      Text('删除云端文件', style: TextStyle(color: errorColor)),
+                    ],
+                  ),
+                ),
+              ];
+            },
           ),
         ),
       );
@@ -1063,12 +1088,12 @@ final class _LibraryPageState extends State<LibraryPage> {
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: <Widget>[
-        const Icon(Icons.lock_outline, color: SboxColors.textMuted, size: 24),
+        Icon(Icons.lock_outline, color: context.sboxColors.textMuted, size: 24),
         const SizedBox(width: 10),
         Text(
           '所有文件均经过加密，安全存储在云端',
           style: Theme.of(context).textTheme.bodyLarge
-              ?.copyWith(color: SboxColors.textMuted),
+              ?.copyWith(color: context.sboxColors.textMuted),
         ),
       ],
     );
@@ -1129,7 +1154,7 @@ final class _LibraryPageState extends State<LibraryPage> {
       'PDF' => const Color(0xFFFF4E42),
       'ZIP' || 'RAR' || '7Z' => const Color(0xFFFFB52E),
       'DOC' || 'DOCX' => const Color(0xFF2E86F3),
-      _ => SboxColors.accentStrong,
+      _ => context.sboxColors.accentStrong,
     };
     final date = manifest == null ? '已同步' : _formatDate(manifest.createdAt);
     return _FileRow(
@@ -2321,7 +2346,9 @@ final class _DashedDropTarget extends StatelessWidget {
         borderRadius: BorderRadius.circular(14),
         child: CustomPaint(
           painter: _DashedBorderPainter(
-            color: dragging ? SboxColors.accent : SboxColors.border,
+            color: dragging
+                ? context.sboxColors.accent
+                : context.sboxColors.border,
             radius: 14,
             dash: 8,
             gap: 6,
@@ -2329,8 +2356,8 @@ final class _DashedDropTarget extends StatelessWidget {
           child: DecoratedBox(
             decoration: BoxDecoration(
               color: dragging
-                  ? SboxColors.accent.withValues(alpha: 0.06)
-                  : SboxColors.panelSoft.withValues(alpha: 0.62),
+                  ? context.sboxColors.accent.withValues(alpha: 0.06)
+                  : context.sboxColors.panelSoft.withValues(alpha: 0.62),
               borderRadius: BorderRadius.circular(14),
             ),
             child: child,
@@ -2395,7 +2422,7 @@ final class _UploadFolderIcon extends StatelessWidget {
         children: <Widget>[
           Icon(
             Icons.folder_rounded,
-            color: SboxColors.accentStrong,
+            color: context.sboxColors.accentStrong,
             size: size,
           ),
           Positioned(
@@ -2461,6 +2488,8 @@ final class _LibraryBundle {
 }
 
 enum _FileActionState { localPlaintext, localEncrypted, remoteOnly }
+
+enum _FileRowMenuAction { deleteCloudBundle }
 
 enum _LibrarySource {
   github('GitHub'),

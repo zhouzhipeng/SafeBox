@@ -22,6 +22,7 @@ class _SafeBoxAppState extends State<SafeBoxApp> {
   AppSection _section = AppSection.library;
   bool _booted = false;
   bool _onboarding = false;
+  ThemeMode _themeMode = ThemeMode.dark;
 
   @override
   void initState() {
@@ -32,10 +33,12 @@ class _SafeBoxAppState extends State<SafeBoxApp> {
 
   Future<void> _initialize() async {
     await _controller.initialize();
+    final lightTheme = await _controller.appSettingsStore.loadLightTheme();
     if (!mounted) return;
     setState(() {
       _booted = true;
       _onboarding = !_controller.hasIdentity;
+      _themeMode = lightTheme ? ThemeMode.light : ThemeMode.dark;
     });
   }
 
@@ -55,7 +58,9 @@ class _SafeBoxAppState extends State<SafeBoxApp> {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'SafeBox',
-      theme: buildSboxTheme(),
+      theme: buildSboxTheme(brightness: Brightness.light),
+      darkTheme: buildSboxTheme(),
+      themeMode: _themeMode,
       home: !_booted
           ? const _BootScreen()
           : _onboarding
@@ -75,6 +80,10 @@ class _SafeBoxAppState extends State<SafeBoxApp> {
               section: _section,
               onSectionChanged: (section) => setState(() => _section = section),
               onOpenOnboarding: () => setState(() => _onboarding = true),
+              lightTheme: _themeMode == ThemeMode.light,
+              onThemeChanged: (light) => setState(
+                () => _themeMode = light ? ThemeMode.light : ThemeMode.dark,
+              ),
             ),
     );
   }
@@ -86,12 +95,16 @@ final class _HomeShell extends StatefulWidget {
     required this.section,
     required this.onSectionChanged,
     required this.onOpenOnboarding,
+    required this.lightTheme,
+    required this.onThemeChanged,
   });
 
   final AppController controller;
   final AppSection section;
   final ValueChanged<AppSection> onSectionChanged;
   final VoidCallback onOpenOnboarding;
+  final bool lightTheme;
+  final ValueChanged<bool> onThemeChanged;
 
   @override
   State<_HomeShell> createState() => _HomeShellState();
@@ -99,9 +112,11 @@ final class _HomeShell extends StatefulWidget {
 
 final class _HomeShellState extends State<_HomeShell> {
   var _cloudConfigurationVersion = 0;
-  late final Widget _settingsPage = SettingsPage(
+  Widget _buildSettingsPage() => SettingsPage(
     controller: widget.controller,
     onOpenOnboarding: widget.onOpenOnboarding,
+    isLightTheme: widget.lightTheme,
+    onThemeChanged: widget.onThemeChanged,
     onCloudStateChanged: () {
       if (!mounted) return;
       setState(() => _cloudConfigurationVersion++);
@@ -123,13 +138,13 @@ final class _HomeShellState extends State<_HomeShell> {
             final mobile = constraints.maxWidth < 760;
             final settingsSelected = widget.section == AppSection.settings;
             return DecoratedBox(
-              decoration: const BoxDecoration(
+              decoration: BoxDecoration(
                 gradient: LinearGradient(
                   begin: Alignment.topCenter,
                   end: Alignment.bottomCenter,
                   colors: <Color>[
-                    SboxColors.backgroundDeep,
-                    SboxColors.background,
+                    context.sboxColors.backgroundDeep,
+                    context.sboxColors.background,
                   ],
                 ),
               ),
@@ -147,7 +162,10 @@ final class _HomeShellState extends State<_HomeShell> {
                   Expanded(
                     child: IndexedStack(
                       index: settingsSelected ? 1 : 0,
-                      children: <Widget>[_buildLibraryPage(), _settingsPage],
+                      children: <Widget>[
+                        _buildLibraryPage(),
+                        _buildSettingsPage(),
+                      ],
                     ),
                   ),
                 ],
@@ -167,11 +185,14 @@ final class _BootScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       body: DecoratedBox(
-        decoration: const BoxDecoration(
+        decoration: BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
-            colors: <Color>[SboxColors.backgroundDeep, SboxColors.background],
+            colors: <Color>[
+              context.sboxColors.backgroundDeep,
+              context.sboxColors.background,
+            ],
           ),
         ),
         child: const Center(

@@ -26,11 +26,15 @@ final class SettingsPage extends StatefulWidget {
     required this.controller,
     this.onOpenOnboarding,
     this.onCloudStateChanged,
+    this.isLightTheme = false,
+    this.onThemeChanged,
   });
 
   final AppController controller;
   final VoidCallback? onOpenOnboarding;
   final VoidCallback? onCloudStateChanged;
+  final bool isLightTheme;
+  final ValueChanged<bool>? onThemeChanged;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -43,7 +47,7 @@ final class _SettingsPageState extends State<SettingsPage> {
   final _configurationStore = CloudBackupConfigurationStore();
   final _credentialStore = PlatformCredentialStore();
   final _temporaryStore = TemporaryPlaintextStore();
-  final _appSettingsStore = AppSettingsStore();
+  AppSettingsStore get _appSettingsStore => widget.controller.appSettingsStore;
   final _githubAddressController = TextEditingController(
     text: 'https://github.com/your-account/your-repository',
   );
@@ -53,8 +57,8 @@ final class _SettingsPageState extends State<SettingsPage> {
   final _githubTokenController = TextEditingController();
   final _giteeTokenController = TextEditingController();
   bool _cloudExpanded = false;
-  bool _autoSync = true;
   bool _clearOnExit = false;
+  bool _lightTheme = false;
   bool _loading = true;
   bool _saving = false;
   bool _githubConnected = false;
@@ -68,7 +72,17 @@ final class _SettingsPageState extends State<SettingsPage> {
   @override
   void initState() {
     super.initState();
+    _lightTheme = widget.isLightTheme;
     _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant SettingsPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.isLightTheme != widget.isLightTheme &&
+        _lightTheme != widget.isLightTheme) {
+      setState(() => _lightTheme = widget.isLightTheme);
+    }
   }
 
   @override
@@ -106,10 +120,6 @@ final class _SettingsPageState extends State<SettingsPage> {
                   _buildIdentityCard(context, mobile),
                   const SizedBox(height: 14),
                   _buildCloudCard(context, mobile),
-                  if (_cloudExpanded) ...<Widget>[
-                    const SizedBox(height: 14),
-                    _buildAutoSyncCard(context, mobile),
-                  ],
                   const SizedBox(height: 14),
                   _buildHabitsCard(context, mobile),
                   if (_loading) ...<Widget>[
@@ -139,7 +149,9 @@ final class _SettingsPageState extends State<SettingsPage> {
               Text(
                 identityReady ? '已保护' : '待设置',
                 style: TextStyle(
-                  color: identityReady ? SboxColors.accent : SboxColors.warning,
+                  color: identityReady
+                      ? context.sboxColors.accent
+                      : context.sboxColors.warning,
                   fontSize: mobile ? 20 : 18,
                   fontWeight: FontWeight.w700,
                 ),
@@ -154,7 +166,7 @@ final class _SettingsPageState extends State<SettingsPage> {
               Text(
                 '用于保护你的文件',
                 style: Theme.of(context).textTheme.bodyLarge
-                    ?.copyWith(color: SboxColors.textMuted),
+                    ?.copyWith(color: context.sboxColors.textMuted),
               ),
             ],
           ),
@@ -240,9 +252,9 @@ final class _SettingsPageState extends State<SettingsPage> {
               padding: const EdgeInsets.symmetric(vertical: 2),
               child: Row(
                 children: <Widget>[
-                  const Icon(
+                  Icon(
                     Icons.cloud_download_outlined,
-                    color: SboxColors.accent,
+                    color: context.sboxColors.accent,
                     size: 40,
                   ),
                   const SizedBox(width: 20),
@@ -259,7 +271,7 @@ final class _SettingsPageState extends State<SettingsPage> {
                           '粘贴完整地址即可，不需要分别填写账号和仓库名',
                           style: Theme.of(context).textTheme.bodyLarge
                               ?.copyWith(
-                                color: SboxColors.textMuted,
+                                color: context.sboxColors.textMuted,
                                 fontSize: mobile ? 13 : 15,
                               ),
                         ),
@@ -270,7 +282,7 @@ final class _SettingsPageState extends State<SettingsPage> {
                     _cloudExpanded
                         ? Icons.keyboard_arrow_up_rounded
                         : Icons.keyboard_arrow_down_rounded,
-                    color: SboxColors.textMuted,
+                    color: context.sboxColors.textMuted,
                     size: 28,
                   ),
                 ],
@@ -282,10 +294,6 @@ final class _SettingsPageState extends State<SettingsPage> {
             _buildCloudEditor(context, mobile)
           else
             _buildCloudSummary(context, mobile),
-          if (!_cloudExpanded) ...<Widget>[
-            const SizedBox(height: 14),
-            _buildAutoSyncRow(context, mobile),
-          ],
         ],
       ),
     );
@@ -300,7 +308,7 @@ final class _SettingsPageState extends State<SettingsPage> {
       ),
       if (!mobile) const SizedBox(width: 36),
       if (!mobile)
-        Container(width: 1, height: 34, color: SboxColors.textDim)
+        Container(width: 1, height: 34, color: context.sboxColors.textDim)
       else
         const Divider(height: 24),
       if (!mobile) const SizedBox(width: 36),
@@ -382,9 +390,9 @@ final class _SettingsPageState extends State<SettingsPage> {
     return Container(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
       decoration: BoxDecoration(
-        color: SboxColors.panelSoft,
+        color: context.sboxColors.panelSoft,
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: SboxColors.borderSoft),
+        border: Border.all(color: context.sboxColors.borderSoft),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -402,7 +410,9 @@ final class _SettingsPageState extends State<SettingsPage> {
               StatusPill(
                 label: connected ? '已连接' : '待设置',
                 icon: connected ? Icons.check_circle_outline : Icons.more_horiz,
-                tone: connected ? SboxColors.accent : SboxColors.warning,
+                tone: connected
+                    ? context.sboxColors.accent
+                    : context.sboxColors.warning,
                 compact: true,
               ),
             ],
@@ -477,54 +487,12 @@ final class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  Widget _buildAutoSyncCard(BuildContext context, bool mobile) {
-    return SboxCard(
-      padding: EdgeInsets.symmetric(
-        horizontal: mobile ? 18 : 30,
-        vertical: mobile ? 18 : 20,
-      ),
-      radius: mobile ? 16 : 14,
-      child: _buildAutoSyncRow(context, mobile),
-    );
-  }
-
-  Widget _buildAutoSyncRow(BuildContext context, bool mobile) {
-    return Row(
-      children: <Widget>[
-        const Icon(Icons.sync_rounded, color: SboxColors.accent, size: 40),
-        const SizedBox(width: 20),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Text(
-                '自动同步',
-                style: Theme.of(context).textTheme.titleLarge
-                    ?.copyWith(fontSize: mobile ? 18 : 20),
-              ),
-              const SizedBox(height: 3),
-              Text(
-                '文件保存后自动备份',
-                style: Theme.of(context).textTheme.bodyLarge
-                    ?.copyWith(color: SboxColors.textMuted),
-              ),
-            ],
-          ),
-        ),
-        Switch(
-          value: _autoSync,
-          onChanged: (value) => setState(() => _autoSync = value),
-        ),
-      ],
-    );
-  }
-
   Widget _buildHabitsCard(BuildContext context, bool mobile) {
     final themeRow = _HabitRow(
       icon: Icons.palette_outlined,
       title: '界面主题',
-      value: '深色',
-      onTap: _showThemeNotice,
+      value: _lightTheme ? '亮色' : '深色',
+      onTap: _chooseTheme,
     );
     final fileRow = _HabitRow(
       icon: Icons.description_outlined,
@@ -575,7 +543,11 @@ final class _SettingsPageState extends State<SettingsPage> {
               children: <Widget>[
                 Expanded(child: themeRow),
                 const SizedBox(width: 28),
-                Container(width: 1, height: 42, color: SboxColors.textDim),
+                Container(
+                  width: 1,
+                  height: 42,
+                  color: context.sboxColors.textDim,
+                ),
                 const SizedBox(width: 28),
                 Expanded(child: fileRow),
                 const SizedBox(width: 40),
@@ -633,6 +605,7 @@ final class _SettingsPageState extends State<SettingsPage> {
         _giteeConnected = await _hasToken(configuration.gitee.credentialId);
       }
       _clearOnExit = await _appSettingsStore.loadClearPlaintextOnExit();
+      _lightTheme = await _appSettingsStore.loadLightTheme();
     } catch (error) {
       if (mounted) {
         widget.controller.setError(error, operation: '读取设置失败');
@@ -817,20 +790,38 @@ final class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  Future<void> _showThemeNotice() async {
-    await showDialog<void>(
+  Future<void> _chooseTheme() async {
+    final selected = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('界面主题'),
-        content: const Text('当前使用深色主题。'),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('关闭'),
+        content: RadioGroup<bool>(
+          groupValue: _lightTheme,
+          onChanged: (value) => Navigator.of(context).pop(value),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              const RadioListTile<bool>(value: false, title: Text('深色')),
+              const RadioListTile<bool>(value: true, title: Text('亮色')),
+            ],
           ),
-        ],
+        ),
       ),
     );
+    if (selected == null || selected == _lightTheme || !mounted) return;
+
+    final previous = _lightTheme;
+    setState(() => _lightTheme = selected);
+    widget.onThemeChanged?.call(selected);
+    try {
+      await _appSettingsStore.saveLightTheme(selected);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _lightTheme = previous);
+      widget.onThemeChanged?.call(previous);
+      widget.controller.setError(error, operation: '保存界面主题失败');
+      _showFeedback('界面主题暂时无法保存，请稍后重试。', error: true);
+    }
   }
 
   Future<void> _clearTemporaryPlaintext() async {
@@ -901,14 +892,16 @@ final class _CloudSummaryLine extends StatelessWidget {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: <Widget>[
-        Icon(icon, color: SboxColors.textMuted, size: 40),
+        Icon(icon, color: context.sboxColors.textMuted, size: 40),
         const SizedBox(width: 18),
         Text(label, style: Theme.of(context).textTheme.titleLarge),
         const SizedBox(width: 12),
         Text(
           '·  ${connected ? '已连接' : '待设置'}',
           style: TextStyle(
-            color: connected ? SboxColors.accent : SboxColors.warning,
+            color: connected
+                ? context.sboxColors.accent
+                : context.sboxColors.warning,
             fontSize: 18,
             fontWeight: FontWeight.w600,
           ),
@@ -969,7 +962,7 @@ final class _HabitRow extends StatelessWidget {
         padding: const EdgeInsets.symmetric(vertical: 6),
         child: Row(
           children: <Widget>[
-            Icon(icon, color: SboxColors.textMuted, size: 38),
+            Icon(icon, color: context.sboxColors.textMuted, size: 38),
             const SizedBox(width: 18),
             Expanded(
               child: Text(
@@ -978,9 +971,9 @@ final class _HabitRow extends StatelessWidget {
                     ?.copyWith(fontSize: 17),
               ),
             ),
-            const Icon(
+            Icon(
               Icons.chevron_right_rounded,
-              color: SboxColors.textMuted,
+              color: context.sboxColors.textMuted,
             ),
           ],
         ),
@@ -999,12 +992,12 @@ final class _LockHint extends StatelessWidget {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: <Widget>[
-        const Icon(Icons.lock_outline, color: SboxColors.textMuted, size: 20),
+        Icon(Icons.lock_outline, color: context.sboxColors.textMuted, size: 20),
         const SizedBox(width: 8),
         Text(
           text,
           style: Theme.of(context).textTheme.bodyLarge
-              ?.copyWith(color: SboxColors.textMuted),
+              ?.copyWith(color: context.sboxColors.textMuted),
         ),
       ],
     );

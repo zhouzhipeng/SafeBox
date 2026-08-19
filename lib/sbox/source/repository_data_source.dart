@@ -305,13 +305,24 @@ abstract base class RepositoryDataSource
       try {
         final path = SourcePath(name);
         if (!name.endsWith('.sbox')) continue;
+        var resolvedSize = size is int ? size : null;
+        if (resolvedSize == null || resolvedSize == 0) {
+          try {
+            resolvedSize = await _resolveListedObjectSize(path);
+          } on Object catch (error) {
+            // Directory listings are still useful when a provider cannot
+            // expose a size. Keep the existing unknown-size sentinel and let
+            // range/full reads validate the object when it is used.
+            logger?.warning('$sourceName：无法读取对象大小', detail: '$name · $error');
+          }
+        }
         objects.add(
           SourceObjectInfo(
             path: path,
             // Some provider directory responses omit size even for files.
             // Providers with a direct raw endpoint can read without it;
             // other providers retrieve metadata on demand.
-            length: size is int ? size : 0,
+            length: resolvedSize ?? 0,
             revision: RevisionToken(ascii.encode(revision)),
             downloadUri: downloadUri,
           ),
@@ -337,6 +348,38 @@ abstract base class RepositoryDataSource
       objects: List.unmodifiable(objects),
       nextCursor: nextCursor,
     );
+  }
+
+  Future<int?> _resolveListedObjectSize(SourcePath path) async {
+    final directUri = rawUriWithoutMetadata(path);
+    if (directUri != null) {
+      final response = await httpTransport.get(
+        directUri,
+        headers: <String, String>{
+          ...await _requestHeaders(raw: true),
+          'Range': 'bytes=0-0',
+        },
+      );
+      if (response.statusCode != 200 && response.statusCode != 206) {
+        await httpTransport.throwForStatus(response, RemoteFailureContext.read);
+      }
+      final size =
+          _responseTotalSize(response) ??
+          (response.statusCode == 200 ? _responseSize(response) : null);
+      await httpTransport.discard(response.stream);
+      if (size != null && size > 0) return size;
+
+      // Some raw endpoints omit both Content-Length and Content-Range. The
+      // existing bounded raw-read fallback can still determine the exact
+      // length without allowing an unbounded response.
+      final read = await get(path);
+      try {
+        return read.length;
+      } finally {
+        await httpTransport.discard(read.body);
+      }
+    }
+    return (await _readMetadata(path)).size;
   }
 
   @override
@@ -724,6 +767,15 @@ abstract base class RepositoryDataSource
     if (size != null) return size;
     final header = response.headers['content-length'];
     final parsed = header == null ? null : int.tryParse(header);
+    return parsed != null && parsed >= 0 ? parsed : null;
+  }
+
+  static int? _responseTotalSize(http.StreamedResponse response) {
+    final header = response.headers['content-range'];
+    if (header == null) return null;
+    final separator = header.lastIndexOf('/');
+    if (separator < 0 || separator == header.length - 1) return null;
+    final parsed = int.tryParse(header.substring(separator + 1).trim());
     return parsed != null && parsed >= 0 ? parsed : null;
   }
 }

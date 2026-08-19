@@ -49,13 +49,13 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
           builder: (context, constraints) {
             final mobile = constraints.maxWidth < 760;
             return DecoratedBox(
-              decoration: const BoxDecoration(
+              decoration: BoxDecoration(
                 gradient: LinearGradient(
                   begin: Alignment.topCenter,
                   end: Alignment.bottomCenter,
                   colors: <Color>[
-                    SboxColors.backgroundDeep,
-                    SboxColors.background,
+                    context.sboxColors.backgroundDeep,
+                    context.sboxColors.background,
                   ],
                 ),
               ),
@@ -110,7 +110,7 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
                 subtitle,
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                  color: SboxColors.textMuted,
+                  color: context.sboxColors.textMuted,
                   fontSize: mobile ? 15 : 16,
                 ),
               ),
@@ -183,7 +183,7 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
         Text(
           '用于保护你的文件',
           style: Theme.of(context).textTheme.bodyLarge
-              ?.copyWith(color: SboxColors.textMuted),
+              ?.copyWith(color: context.sboxColors.textMuted),
         ),
         const SizedBox(height: 22),
         SizedBox(
@@ -215,9 +215,9 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
       ),
       child: Row(
         children: <Widget>[
-          const Icon(
+          Icon(
             Icons.cloud_upload_outlined,
-            color: SboxColors.accent,
+            color: context.sboxColors.accent,
             size: 52,
           ),
           SizedBox(width: mobile ? 18 : 25),
@@ -230,7 +230,7 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
                 Text(
                   '完成身份设置后再连接云端',
                   style: Theme.of(context).textTheme.bodyLarge
-                      ?.copyWith(color: SboxColors.textMuted),
+                      ?.copyWith(color: context.sboxColors.textMuted),
                 ),
               ],
             ),
@@ -238,10 +238,10 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
           Column(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: <Widget>[
-              const StatusPill(
+              StatusPill(
                 label: '待设置',
                 icon: Icons.more_horiz,
-                tone: SboxColors.textMuted,
+                tone: context.sboxColors.textMuted,
                 compact: true,
               ),
               const SizedBox(height: 8),
@@ -400,9 +400,9 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
           padding: EdgeInsets.all(mobile ? 24 : 30),
           child: Column(
             children: <Widget>[
-              const Icon(
+              Icon(
                 Icons.cloud_done_outlined,
-                color: SboxColors.accent,
+                color: context.sboxColors.accent,
                 size: 78,
               ),
               const SizedBox(height: 14),
@@ -412,7 +412,7 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
                 '你的安全身份已经准备好。现在可以连接 GitHub 和 Gitee，保存文件的云端副本。',
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.bodyLarge
-                    ?.copyWith(color: SboxColors.textMuted),
+                    ?.copyWith(color: context.sboxColors.textMuted),
               ),
               const SizedBox(height: 20),
               SizedBox(
@@ -590,8 +590,8 @@ final class _StepProgress extends StatelessWidget {
                           child: Container(
                             height: 1.5,
                             color: index < step
-                                ? SboxColors.accent
-                                : SboxColors.border,
+                                ? context.sboxColors.accent
+                                : context.sboxColors.border,
                           ),
                         ),
                       Container(
@@ -600,13 +600,13 @@ final class _StepProgress extends StatelessWidget {
                         alignment: Alignment.center,
                         decoration: BoxDecoration(
                           color: index + 1 <= step
-                              ? SboxColors.accent
+                              ? context.sboxColors.accent
                               : Colors.transparent,
                           shape: BoxShape.circle,
                           border: Border.all(
                             color: index + 1 <= step
-                                ? SboxColors.accent
-                                : SboxColors.border,
+                                ? context.sboxColors.accent
+                                : context.sboxColors.border,
                             width: 1.4,
                           ),
                         ),
@@ -615,7 +615,7 @@ final class _StepProgress extends StatelessWidget {
                           style: TextStyle(
                             color: index + 1 <= step
                                 ? const Color(0xFF03211D)
-                                : SboxColors.textMuted,
+                                : context.sboxColors.textMuted,
                             fontSize: 18,
                             fontWeight: FontWeight.w700,
                           ),
@@ -626,8 +626,8 @@ final class _StepProgress extends StatelessWidget {
                           child: Container(
                             height: 1.5,
                             color: index + 1 < step
-                                ? SboxColors.accent
-                                : SboxColors.border,
+                                ? context.sboxColors.accent
+                                : context.sboxColors.border,
                           ),
                         ),
                     ],
@@ -637,8 +637,8 @@ final class _StepProgress extends StatelessWidget {
                     labels[index],
                     style: TextStyle(
                       color: index + 1 == step
-                          ? SboxColors.accent
-                          : SboxColors.textMuted,
+                          ? context.sboxColors.accent
+                          : context.sboxColors.textMuted,
                       fontSize: mobile ? 13 : 14,
                       fontWeight: index + 1 == step
                           ? FontWeight.w700
@@ -685,9 +685,9 @@ final class _WordGrid extends StatelessWidget {
         return Container(
           padding: const EdgeInsets.symmetric(horizontal: 12),
           decoration: BoxDecoration(
-            color: SboxColors.panelRaised.withValues(alpha: 0.62),
+            color: context.sboxColors.panelRaised.withValues(alpha: 0.62),
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: SboxColors.border),
+            border: Border.all(color: context.sboxColors.border),
           ),
           child: Row(
             children: <Widget>[
@@ -695,8 +695,8 @@ final class _WordGrid extends StatelessWidget {
                 width: index >= 9 ? 27 : 18,
                 child: Text(
                   '${index + 1}',
-                  style: const TextStyle(
-                    color: SboxColors.accent,
+                  style: TextStyle(
+                    color: context.sboxColors.accent,
                     fontSize: 16,
                     fontWeight: FontWeight.w700,
                   ),
@@ -714,17 +714,17 @@ final class _WordGrid extends StatelessWidget {
                       focusedBorder: InputBorder.none,
                       filled: false,
                       contentPadding: EdgeInsets.zero,
-                      hintStyle: const TextStyle(color: SboxColors.textMuted),
+                      hintStyle: TextStyle(color: context.sboxColors.textMuted),
                     ),
-                    style: const TextStyle(color: SboxColors.text),
+                    style: TextStyle(color: context.sboxColors.text),
                   ),
                 )
               else
                 Expanded(
                   child: Text(
                     index < words.length ? words[index] : '—',
-                    style: const TextStyle(
-                      color: SboxColors.text,
+                    style: TextStyle(
+                      color: context.sboxColors.text,
                       fontSize: 15,
                       fontWeight: FontWeight.w600,
                     ),
@@ -756,7 +756,7 @@ final class _ShieldArt extends StatelessWidget {
             height: size * 0.32,
             decoration: BoxDecoration(
               border: Border.all(
-                color: SboxColors.accent.withValues(alpha: 0.3),
+                color: context.sboxColors.accent.withValues(alpha: 0.3),
               ),
               borderRadius: BorderRadius.all(
                 Radius.elliptical(size, size * 0.3),
@@ -768,7 +768,7 @@ final class _ShieldArt extends StatelessWidget {
             height: size * 0.2,
             decoration: BoxDecoration(
               border: Border.all(
-                color: SboxColors.accent.withValues(alpha: 0.18),
+                color: context.sboxColors.accent.withValues(alpha: 0.18),
               ),
               borderRadius: BorderRadius.all(
                 Radius.elliptical(size, size * 0.3),
@@ -782,11 +782,11 @@ final class _ShieldArt extends StatelessWidget {
               width: size * 0.26,
               height: 5,
               decoration: BoxDecoration(
-                color: SboxColors.accent,
+                color: context.sboxColors.accent,
                 borderRadius: BorderRadius.circular(999),
                 boxShadow: <BoxShadow>[
                   BoxShadow(
-                    color: SboxColors.accent.withValues(alpha: 0.8),
+                    color: context.sboxColors.accent.withValues(alpha: 0.8),
                     blurRadius: 18,
                   ),
                 ],

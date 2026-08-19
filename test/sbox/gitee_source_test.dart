@@ -53,6 +53,23 @@ void main() {
     },
   );
 
+  test(
+    'Gitee directory listings resolve omitted sizes from raw range headers',
+    () async {
+      final client = _MissingSizeClient();
+      final source = GiteeDataSource(
+        config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
+        client: client,
+      );
+
+      final page = await source.listObjects();
+
+      expect(page.objects, hasLength(1));
+      expect(page.objects.single.length, 16992);
+      expect(client.rawRequest?.headers['range'], 'bytes=0-0');
+    },
+  );
+
   test('Gitee creates files with form-encoded API parameters', () async {
     final client = _RecordingClient();
     final source = GiteeDataSource(
@@ -213,6 +230,40 @@ final class _CredentialStore implements CredentialStore {
     SourceCredentialId id,
     SourceAccessToken token,
   ) async {}
+}
+
+final class _MissingSizeClient extends http.BaseClient {
+  http.BaseRequest? rawRequest;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    if (request.url.path.contains('/raw/')) {
+      rawRequest = request;
+      return http.StreamedResponse(
+        Stream<List<int>>.value(const <int>[0]),
+        206,
+        contentLength: 1,
+        headers: const <String, String>{'content-range': 'bytes 0-0/16992'},
+        request: request,
+      );
+    }
+    return http.StreamedResponse(
+      Stream<List<int>>.value(
+        utf8.encode(
+          jsonEncode(<Object?>[
+            <String, Object?>{
+              'type': 'file',
+              'name': '0123456789abcdef0123456789abcdef.sbox',
+              'sha': 'revision',
+              'size': null,
+            },
+          ]),
+        ),
+      ),
+      200,
+      request: request,
+    );
+  }
 }
 
 final class _RecordingClient extends http.BaseClient {

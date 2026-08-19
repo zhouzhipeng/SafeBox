@@ -9,6 +9,7 @@ final class AppSettingsStore {
 
   static const _clearOnExitKey = 'sbox.v3.clear_plaintext_on_exit';
   static const _legacyClearOnExitKey = 'sbox.v2.clear_plaintext_on_exit';
+  static const _lightThemeKey = 'sbox.v3.light_theme';
   static const _targetNominalShardPlaintextSizeKey =
       'sbox.v3.target_nominal_shard_plaintext_size';
   final SharedPreferences? _providedPreferences;
@@ -23,6 +24,20 @@ final class AppSettingsStore {
     final preferences =
         _providedPreferences ?? await SharedPreferences.getInstance();
     if (!await preferences.setBool(_clearOnExitKey, value)) {
+      throw StateError('Application setting was not persisted');
+    }
+  }
+
+  Future<bool> loadLightTheme() async {
+    final preferences =
+        _providedPreferences ?? await SharedPreferences.getInstance();
+    return preferences.getBool(_lightThemeKey) ?? false;
+  }
+
+  Future<void> saveLightTheme(bool value) async {
+    final preferences =
+        _providedPreferences ?? await SharedPreferences.getInstance();
+    if (!await preferences.setBool(_lightThemeKey, value)) {
       throw StateError('Application setting was not persisted');
     }
   }
@@ -52,6 +67,7 @@ final class AppSettingsStore {
         _providedPreferences ?? await SharedPreferences.getInstance();
     await preferences.remove(_clearOnExitKey);
     await preferences.remove(_legacyClearOnExitKey);
+    await preferences.remove(_lightThemeKey);
     await preferences.remove(_targetNominalShardPlaintextSizeKey);
   }
 

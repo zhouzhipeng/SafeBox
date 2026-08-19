@@ -19,18 +19,18 @@ class SboxLogo extends StatelessWidget {
             width: iconSize,
             height: iconSize,
             decoration: BoxDecoration(
-              color: SboxColors.accent.withValues(alpha: 0.13),
+              color: context.sboxColors.accent.withValues(alpha: 0.13),
               borderRadius: BorderRadius.circular(compact ? 11 : 14),
               boxShadow: <BoxShadow>[
                 BoxShadow(
-                  color: SboxColors.accent.withValues(alpha: 0.1),
+                  color: context.sboxColors.accent.withValues(alpha: 0.1),
                   blurRadius: 20,
                 ),
               ],
             ),
             child: Icon(
               Icons.shield_outlined,
-              color: SboxColors.accent,
+              color: context.sboxColors.accent,
               size: compact ? 27 : 32,
             ),
           ),
@@ -38,7 +38,7 @@ class SboxLogo extends StatelessWidget {
           Text(
             'SafeBox',
             style: TextStyle(
-              color: SboxColors.text,
+              color: context.sboxColors.text,
               fontSize: compact ? 22 : 26,
               fontWeight: FontWeight.w700,
               letterSpacing: -0.5,
@@ -74,18 +74,20 @@ class SboxTopBar extends StatelessWidget {
       height: mobile ? 122 : 72,
       padding: EdgeInsets.symmetric(horizontal: mobile ? 34 : 32),
       decoration: BoxDecoration(
-        color: SboxColors.backgroundDeep.withValues(alpha: 0.92),
-        border: const Border(bottom: BorderSide(color: SboxColors.borderSoft)),
+        color: context.sboxColors.backgroundDeep.withValues(alpha: 0.92),
+        border: Border(
+          bottom: BorderSide(color: context.sboxColors.borderSoft),
+        ),
       ),
       child: Row(
         children: <Widget>[
           SboxLogo(compact: mobile),
           const Spacer(),
           if (firstUse)
-            const Text(
+            Text(
               '首次使用',
               style: TextStyle(
-                color: SboxColors.accent,
+                color: context.sboxColors.accent,
                 fontSize: 16,
                 fontWeight: FontWeight.w700,
               ),
@@ -96,17 +98,21 @@ class SboxTopBar extends StatelessWidget {
                 onPressed: onFilesTap,
                 tooltip: '文件',
                 icon: const Icon(Icons.folder_outlined),
-                color: filesSelected ? SboxColors.accent : SboxColors.textMuted,
+                color: filesSelected
+                    ? context.sboxColors.accent
+                    : context.sboxColors.textMuted,
                 iconSize: 28,
                 padding: const EdgeInsets.all(10),
                 constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
                 style: IconButton.styleFrom(
                   backgroundColor: filesSelected
-                      ? SboxColors.accent.withValues(alpha: 0.14)
+                      ? context.sboxColors.accent.withValues(alpha: 0.14)
                       : Colors.transparent,
                   side: filesSelected
                       ? BorderSide(
-                          color: SboxColors.accent.withValues(alpha: 0.42),
+                          color: context.sboxColors.accent.withValues(
+                            alpha: 0.42,
+                          ),
                         )
                       : BorderSide.none,
                   shape: RoundedRectangleBorder(
@@ -122,18 +128,20 @@ class SboxTopBar extends StatelessWidget {
                 tooltip: '设置',
                 icon: const Icon(Icons.settings_outlined),
                 color: settingsSelected
-                    ? SboxColors.accent
-                    : SboxColors.textMuted,
+                    ? context.sboxColors.accent
+                    : context.sboxColors.textMuted,
                 iconSize: 28,
                 padding: const EdgeInsets.all(10),
                 constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
                 style: IconButton.styleFrom(
                   backgroundColor: settingsSelected
-                      ? SboxColors.accent.withValues(alpha: 0.14)
+                      ? context.sboxColors.accent.withValues(alpha: 0.14)
                       : Colors.transparent,
                   side: settingsSelected
                       ? BorderSide(
-                          color: SboxColors.accent.withValues(alpha: 0.42),
+                          color: context.sboxColors.accent.withValues(
+                            alpha: 0.42,
+                          ),
                         )
                       : BorderSide.none,
                   shape: RoundedRectangleBorder(
@@ -187,9 +195,11 @@ class SboxTabBar extends StatelessWidget {
 
     return Container(
       height: mobile ? 98 : 64,
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         color: Color(0xCC0A1A2B),
-        border: Border(bottom: BorderSide(color: SboxColors.borderSoft)),
+        border: Border(
+          bottom: BorderSide(color: context.sboxColors.borderSoft),
+        ),
       ),
       child: Center(
         child: SizedBox(
@@ -238,10 +248,10 @@ final class _SboxTab extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final color = disabled
-        ? SboxColors.textDim
+        ? context.sboxColors.textDim
         : selected
-        ? SboxColors.accent
-        : SboxColors.textMuted;
+        ? context.sboxColors.accent
+        : context.sboxColors.textMuted;
     return Semantics(
       button: true,
       selected: selected,
@@ -277,7 +287,7 @@ final class _SboxTab extends StatelessWidget {
                 child: Container(
                   height: mobile ? 5 : 4,
                   decoration: BoxDecoration(
-                    color: SboxColors.accent,
+                    color: context.sboxColors.accent,
                     borderRadius: BorderRadius.circular(999),
                   ),
                 ),
@@ -310,9 +320,9 @@ class SboxCard extends StatelessWidget {
     return Container(
       padding: padding,
       decoration: BoxDecoration(
-        color: color ?? SboxColors.panelSoft,
+        color: color ?? context.sboxColors.panelSoft,
         borderRadius: BorderRadius.circular(radius),
-        border: Border.all(color: borderColor ?? SboxColors.borderSoft),
+        border: Border.all(color: borderColor ?? context.sboxColors.borderSoft),
         boxShadow: <BoxShadow>[
           BoxShadow(
             color: Colors.black.withValues(alpha: 0.16),
@@ -351,7 +361,7 @@ class PageHeading extends StatelessWidget {
         final subtitleText = Text(
           subtitle,
           style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-            color: SboxColors.textMuted,
+            color: context.sboxColors.textMuted,
             fontSize: compact ? 15 : 16,
           ),
         );
@@ -400,17 +410,18 @@ class StatusPill extends StatelessWidget {
     super.key,
     required this.label,
     this.icon = Icons.check_circle_outline,
-    this.tone = SboxColors.success,
+    this.tone,
     this.compact = false,
   });
 
   final String label;
   final IconData icon;
-  final Color tone;
+  final Color? tone;
   final bool compact;
 
   @override
   Widget build(BuildContext context) {
+    final color = tone ?? context.sboxColors.success;
     return Container(
       constraints: BoxConstraints(minHeight: compact ? 30 : 36),
       padding: EdgeInsets.symmetric(
@@ -418,20 +429,20 @@ class StatusPill extends StatelessWidget {
         vertical: compact ? 5 : 7,
       ),
       decoration: BoxDecoration(
-        color: tone.withValues(alpha: 0.08),
-        border: Border.all(color: tone.withValues(alpha: 0.3)),
+        color: color.withValues(alpha: 0.08),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
         borderRadius: BorderRadius.circular(999),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
-          Icon(icon, size: compact ? 16 : 19, color: tone),
+          Icon(icon, size: compact ? 16 : 19, color: color),
           const SizedBox(width: 7),
           Text(
             label,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
-              color: tone,
+              color: color,
               fontSize: compact ? 12 : 14,
               fontWeight: FontWeight.w600,
             ),
@@ -495,7 +506,9 @@ class SecurityNotice extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = warning ? SboxColors.warning : SboxColors.accent;
+    final color = warning
+        ? context.sboxColors.warning
+        : context.sboxColors.accent;
     return Container(
       padding: EdgeInsets.all(compact ? 12 : 15),
       decoration: BoxDecoration(
@@ -529,7 +542,7 @@ class SecurityNotice extends StatelessWidget {
                 Text(
                   message,
                   style: Theme.of(context).textTheme.bodyMedium
-                      ?.copyWith(color: SboxColors.textMuted),
+                      ?.copyWith(color: context.sboxColors.textMuted),
                 ),
               ],
             ),
@@ -550,12 +563,12 @@ class SboxLockHint extends StatelessWidget {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: <Widget>[
-        const Icon(Icons.lock_outline, color: SboxColors.textMuted, size: 20),
+        Icon(Icons.lock_outline, color: context.sboxColors.textMuted, size: 20),
         const SizedBox(width: 8),
         Text(
           text,
           style: Theme.of(context).textTheme.bodyLarge
-              ?.copyWith(color: SboxColors.textMuted),
+              ?.copyWith(color: context.sboxColors.textMuted),
         ),
       ],
     );
@@ -575,7 +588,7 @@ class MonospaceValue extends StatelessWidget {
       value,
       maxLines: maxLines,
       style: TextStyle(
-        color: color ?? SboxColors.text,
+        color: color ?? context.sboxColors.text,
         fontSize: 12,
         height: 1.5,
         fontFamily: 'RobotoMono',
@@ -606,7 +619,7 @@ class EmptyState extends StatelessWidget {
         padding: const EdgeInsets.symmetric(vertical: 34, horizontal: 16),
         child: Column(
           children: <Widget>[
-            Icon(icon, size: 42, color: SboxColors.accent),
+            Icon(icon, size: 42, color: context.sboxColors.accent),
             const SizedBox(height: 18),
             Text(
               title,
@@ -657,7 +670,7 @@ class SboxProgressCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SboxCard(
-      borderColor: SboxColors.accent.withValues(alpha: 0.3),
+      borderColor: context.sboxColors.accent.withValues(alpha: 0.3),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
@@ -684,22 +697,25 @@ class SboxProgressCard extends StatelessWidget {
             value: value,
             minHeight: 6,
             borderRadius: BorderRadius.circular(999),
-            backgroundColor: SboxColors.borderSoft,
-            color: SboxColors.accent,
+            backgroundColor: context.sboxColors.borderSoft,
+            color: context.sboxColors.accent,
           ),
           const SizedBox(height: 10),
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
               Expanded(
-                child: Text(detail, style: Theme.of(context).textTheme.bodyMedium),
+                child: Text(
+                  detail,
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
               ),
               if (progressLabel != null) ...<Widget>[
                 const SizedBox(width: 12),
                 Text(
                   progressLabel!,
                   style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                    color: SboxColors.accent,
+                    color: context.sboxColors.accent,
                     fontWeight: FontWeight.w700,
                   ),
                 ),
@@ -724,18 +740,20 @@ class SboxShieldMark extends StatelessWidget {
       width: size,
       height: size,
       decoration: BoxDecoration(
-        color: filled ? SboxColors.accent.withValues(alpha: 0.12) : null,
+        color: filled
+            ? context.sboxColors.accent.withValues(alpha: 0.12)
+            : null,
         borderRadius: BorderRadius.circular(size * 0.24),
         boxShadow: <BoxShadow>[
           BoxShadow(
-            color: SboxColors.accent.withValues(alpha: 0.18),
+            color: context.sboxColors.accent.withValues(alpha: 0.18),
             blurRadius: size * 0.32,
           ),
         ],
       ),
       child: Icon(
         Icons.verified_user_outlined,
-        color: SboxColors.accent,
+        color: context.sboxColors.accent,
         size: size * 0.78,
       ),
     );

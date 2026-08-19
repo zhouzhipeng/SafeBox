@@ -65,6 +65,7 @@ final class AppController extends ChangeNotifier {
   String? get statusMessage => _statusMessage;
   String? get errorMessage => _errorMessage;
   AppLogger get logger => _logger;
+  AppSettingsStore get appSettingsStore => _appSettingsStore;
   int get targetNominalShardPlaintextSize => _targetNominalShardPlaintextSize;
   String get shortFingerprint {
     final record = _identity;

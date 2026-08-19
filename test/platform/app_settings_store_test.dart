@@ -36,9 +36,22 @@ void main() {
     );
   });
 
+  test('light theme defaults to dark and persists', () async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final preferences = await SharedPreferences.getInstance();
+    final store = AppSettingsStore(preferences: preferences);
+
+    expect(await store.loadLightTheme(), isFalse);
+
+    await store.saveLightTheme(true);
+
+    expect(await store.loadLightTheme(), isTrue);
+  });
+
   test('clear removes the stored shard size', () async {
     SharedPreferences.setMockInitialValues(<String, Object>{
       'sbox.v3.target_nominal_shard_plaintext_size': 8 * 1024 * 1024,
+      'sbox.v3.light_theme': true,
     });
     final preferences = await SharedPreferences.getInstance();
     final store = AppSettingsStore(preferences: preferences);
@@ -49,5 +62,6 @@ void main() {
       await store.loadTargetNominalShardPlaintextSize(),
       SboxProtocol.defaultNominalShardPlaintextSize,
     );
+    expect(await store.loadLightTheme(), isFalse);
   });
 }
