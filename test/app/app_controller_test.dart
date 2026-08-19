@@ -13,6 +13,30 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('initialize restores and updates the preview-details setting', () async {
+    SharedPreferences.setMockInitialValues(<String, Object>{
+      'sbox.v3.show_preview_and_details': true,
+    });
+    final preferences = await SharedPreferences.getInstance();
+    final controller = AppController(
+      identityStore: PublicIdentityStore(preferences: preferences),
+      appSettingsStore: AppSettingsStore(preferences: preferences),
+      logger: AppLogger(preferences: preferences),
+    );
+    try {
+      await controller.initialize();
+
+      expect(controller.showPreviewAndDetails, isTrue);
+
+      await controller.saveShowPreviewAndDetails(false);
+
+      expect(controller.showPreviewAndDetails, isFalse);
+      expect(preferences.getBool('sbox.v3.show_preview_and_details'), isFalse);
+    } finally {
+      controller.dispose();
+    }
+  });
+
   test(
     'removeIdentity clears local identity data and plaintext cache',
     () async {
@@ -21,6 +45,7 @@ void main() {
         'sbox.v2.cloud_backup_configuration': 'legacy-repository-address',
         'sbox.v2.source_configurations': 'legacy-source-config',
         'sbox.v2.clear_plaintext_on_exit': true,
+        'sbox.v3.show_preview_and_details': true,
       });
       final preferences = await SharedPreferences.getInstance();
       final cloudStore = CloudBackupConfigurationStore(
@@ -96,6 +121,7 @@ void main() {
           expect(preferences.getString(key), isNull, reason: key);
         }
         expect(preferences.getBool('sbox.v3.clear_plaintext_on_exit'), isNull);
+        expect(preferences.getBool('sbox.v3.show_preview_and_details'), isNull);
         expect(await root.exists(), isFalse);
       } finally {
         if (await root.exists()) await root.delete(recursive: true);

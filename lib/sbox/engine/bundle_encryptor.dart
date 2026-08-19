@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
@@ -33,6 +34,8 @@ abstract interface class BundleInput {
 final class MemoryBundleInput implements BundleInput {
   MemoryBundleInput(List<int> bytes) : _bytes = Uint8List.fromList(bytes);
 
+  MemoryBundleInput._owned(this._bytes);
+
   final Uint8List _bytes;
 
   /// Returns a copy that can be handed to a background isolate.
@@ -59,6 +62,17 @@ final class MemoryBundleInput implements BundleInput {
         ),
     ]);
   }
+
+  /// Returns an owned copy of a range that can be transferred to a worker
+  /// isolate without exposing the complete in-memory input.
+  Uint8List copyRange(int start, int length) {
+    if (start < 0 || length < 0 || start > _bytes.length - length) {
+      throw ArgumentError('Invalid input range');
+    }
+    return Uint8List.fromList(_bytes.sublist(start, start + length));
+  }
+
+  void dispose() => _bytes.fillRange(0, _bytes.length, 0);
 }
 
 final class FileBundleInput implements BundleInput {
@@ -252,9 +266,11 @@ final class EncryptedBundle {
 /// One unified v3 writer for empty, small and multipart Bundles.
 final class BundleEncryptor {
   BundleEncryptor({BundleRecordCodec? records})
-    : _records = records ?? BundleRecordCodec();
+    : _records = records ?? BundleRecordCodec(),
+      _canUseShardIsolates = records == null;
 
   final BundleRecordCodec _records;
+  final bool _canUseShardIsolates;
 
   Future<EncryptedBundle> encryptBytes({
     required List<int> plaintext,
@@ -303,7 +319,10 @@ final class BundleEncryptor {
       validateUtf8: options.contentKind == SboxContentKind.text,
     );
     if (firstPass.length != declaredLength) {
-      throw const SboxException(SboxErrorCode.inputChanged, '输入长度与声明不一致');
+      throw const SboxException(
+        SboxErrorCode.inputChanged,
+        'Input length does not match its declaration',
+      );
     }
 
     final prepared = await _prepare(
@@ -311,49 +330,65 @@ final class BundleEncryptor {
       plan: plan,
       firstPass: firstPass,
     );
-    final secondAccumulator = HashDigestSink();
-    final secondHashSink = crypto.sha256.startChunkedConversion(
-      secondAccumulator,
-    );
-    var secondLength = 0;
-    final objects = <EncryptedBundleObject>[];
     try {
-      for (final shard in plan.shards) {
-        final result = await _encryptShard(
+      // The validation pass runs while independent shard workers are
+      // encrypting. SHA-256 cannot be combined from per-shard digests, so the
+      // ordered input pass remains the Bundle-level integrity check.
+      late final List<dynamic> values;
+      if (_canUseShardIsolates && _supportsParallelInput(input)) {
+        values = await Future.wait<dynamic>(<Future<dynamic>>[
+          _hashRange(input, 0, declaredLength),
+          _encryptShards(
+            input: input,
+            shards: plan.shards,
+            prepared: prepared,
+          ),
+        ], eagerError: false);
+      } else {
+        final results = await _encryptShards(
           input: input,
-          shard: shard,
+          shards: plan.shards,
           prepared: prepared,
-          overallHashSink: secondHashSink,
         );
-        secondLength += result.plaintextLength;
+        values = <dynamic>[
+          await _hashRange(input, 0, declaredLength),
+          results,
+        ];
+      }
+      final secondPass = values[0] as _HashedRange;
+      final results = values[1] as List<_ShardEncryptionResult>;
+      try {
+        if (secondPass.length != declaredLength ||
+            !constantTimeBytesEqual(secondPass.sha256, firstPass.sha256) ||
+            await input.length() != declaredLength) {
+          throw const SboxException(
+            SboxErrorCode.inputChanged,
+            'Input changed during encryption',
+          );
+        }
+      } finally {
+        secondPass.sha256.fillRange(0, secondPass.sha256.length, 0);
+        secondPass.md5.fillRange(0, secondPass.md5.length, 0);
+      }
+      final objects = <EncryptedBundleObject>[];
+      for (final result in results) {
+        final bytes = result.bytes!;
         if (options.maxObjectBytes != null &&
-            result.bytes.length > options.maxObjectBytes!) {
-          throw const SboxException(SboxErrorCode.sourceLimit, '对象超过数据源上限');
+            bytes.length > options.maxObjectBytes!) {
+          throw const SboxException(
+            SboxErrorCode.sourceLimit,
+            'Encrypted object exceeds the source limit',
+          );
         }
         objects.add(
           EncryptedBundleObject(
             basename: result.header.canonicalBasename,
             header: result.header,
-            bytes: result.bytes,
-            sha256: sha256Bytes(result.bytes),
+            bytes: bytes,
+            sha256: result.ciphertextSha256,
           ),
         );
       }
-      secondHashSink.close();
-      final secondDigest = Uint8List.fromList(secondAccumulator.value.bytes);
-      try {
-        if (secondLength != declaredLength ||
-            !constantTimeBytesEqual(secondDigest, firstPass.sha256) ||
-            await input.length() != declaredLength) {
-          throw const SboxException(SboxErrorCode.inputChanged, '输入在加密期间发生变化');
-        }
-      } finally {
-        secondDigest.fillRange(0, secondDigest.length, 0);
-      }
-      objects.sort(
-        (left, right) =>
-            left.header.shardIndex.compareTo(right.header.shardIndex),
-      );
       return EncryptedBundle(
         manifest: prepared.manifest,
         objects: List<EncryptedBundleObject>.unmodifiable(objects),
@@ -410,121 +445,51 @@ final class BundleEncryptor {
       plan: plan,
       firstPass: firstPass,
     );
+    final stageJobs = <_ShardFileJob>[];
     final staged = <_StagedShard>[];
-    final secondAccumulator = HashDigestSink();
-    final secondHashSink = crypto.sha256.startChunkedConversion(
-      secondAccumulator,
-    );
-    var secondLength = 0;
     try {
       for (final shard in plan.shards) {
-        _emitProgress(
-          onProgress,
-          BundleEncryptionProgress(
-            stage: BundleEncryptionStage.splitting,
-            processedBytes: shard.offset,
-            totalBytes: declaredLength,
-            completedShards: shard.index,
-            totalShards: plan.shardCount,
-            currentShardIndex: shard.index,
-            currentShardLength: shard.length,
+        final header = prepared.headerFor(shard.index, shard.length);
+        stageJobs.add(
+          _ShardFileJob(
+            shard: shard,
+            header: header,
+            stage: File(
+              '${canonicalRoot.path}${Platform.pathSeparator}.${header.canonicalBasename}.${hexLower(secureRandomBytes(8))}.part',
+            ),
           ),
         );
-        final header = prepared.headerFor(shard.index, shard.length);
-        final stage = File(
-          '${canonicalRoot.path}${Platform.pathSeparator}.${header.canonicalBasename}.${hexLower(secureRandomBytes(8))}.part',
-        );
-        IOSink? output;
-        var stagedSuccessfully = false;
-        try {
-          output = stage.openWrite();
-          final headerBytes = header.encode();
-          output.add(headerBytes);
-          await output.flush();
-          final headerHash = sha256Bytes(headerBytes);
-          final shardKey = ShardKdf.derive(
-            bundleDek: prepared.randomness.bundleDek,
-            bundleId: header.bundleId,
-            recipientKeyId: header.recipientKeyId,
-            shardIndex: header.shardIndex,
-          );
-          try {
-            final shardResult = await _writeShardRecords(
-              input: input,
-              shard: shard,
-              header: header,
-              headerHash: headerHash,
-              shardKey: shardKey,
-              output: output,
-              overallHashSink: secondHashSink,
-              onChunkEncrypted: (bytes) {
-                _emitProgress(
-                  onProgress,
-                  BundleEncryptionProgress(
-                    stage: BundleEncryptionStage.encrypting,
-                    processedBytes: shard.offset + bytes,
-                    totalBytes: declaredLength,
-                    completedShards: shard.index,
-                    totalShards: plan.shardCount,
-                    currentShardIndex: shard.index,
-                    currentShardBytes: bytes,
-                    currentShardLength: shard.length,
-                  ),
-                );
-              },
-            );
-            secondLength += shardResult;
-            _emitProgress(
-              onProgress,
-              BundleEncryptionProgress(
-                stage: BundleEncryptionStage.encrypting,
-                processedBytes: shard.offset + shardResult,
-                totalBytes: declaredLength,
-                completedShards: shard.index + 1,
-                totalShards: plan.shardCount,
-                currentShardIndex: shard.index,
-                currentShardBytes: shardResult,
-                currentShardLength: shard.length,
-              ),
-            );
-          } finally {
-            shardKey.fillRange(0, shardKey.length, 0);
-            headerHash.fillRange(0, headerHash.length, 0);
-            headerBytes.fillRange(0, headerBytes.length, 0);
-          }
-          await output.flush();
-          await output.close();
-          output = null;
-          final length = await stage.length();
-          if (options.maxObjectBytes != null &&
-              length > options.maxObjectBytes!) {
-            throw const SboxException(
-              SboxErrorCode.sourceLimit,
-              'Encrypted object exceeds the source limit',
-            );
-          }
-          staged.add(
-            _StagedShard(
-              basename: header.canonicalBasename,
-              stage: stage,
-              isRoot: header.isRoot,
-              sha256: await sha256File(stage),
-              shardIndex: header.shardIndex,
-            ),
-          );
-          stagedSuccessfully = true;
-        } finally {
-          await output?.close();
-          if (!stagedSuccessfully && await stage.exists()) {
-            await stage.delete();
-          }
-        }
       }
-      secondHashSink.close();
-      final secondDigest = Uint8List.fromList(secondAccumulator.value.bytes);
+      late final List<dynamic> values;
+      if (_canUseShardIsolates && _supportsParallelInput(input)) {
+        values = await Future.wait<dynamic>(<Future<dynamic>>[
+          _hashRange(input, 0, declaredLength),
+          _encryptShardFiles(
+            input: input,
+            jobs: stageJobs,
+            prepared: prepared,
+            totalBytes: declaredLength,
+            onProgress: onProgress,
+          ),
+        ], eagerError: false);
+      } else {
+        final results = await _encryptShardFiles(
+          input: input,
+          jobs: stageJobs,
+          prepared: prepared,
+          totalBytes: declaredLength,
+          onProgress: onProgress,
+        );
+        values = <dynamic>[
+          await _hashRange(input, 0, declaredLength),
+          results,
+        ];
+      }
+      final secondPass = values[0] as _HashedRange;
+      final results = values[1] as List<_ShardEncryptionResult>;
       try {
-        if (secondLength != declaredLength ||
-            !constantTimeBytesEqual(secondDigest, firstPass.sha256) ||
+        if (secondPass.length != declaredLength ||
+            !constantTimeBytesEqual(secondPass.sha256, firstPass.sha256) ||
             await input.length() != declaredLength) {
           throw const SboxException(
             SboxErrorCode.inputChanged,
@@ -532,9 +497,29 @@ final class BundleEncryptor {
           );
         }
       } finally {
-        secondDigest.fillRange(0, secondDigest.length, 0);
+        secondPass.sha256.fillRange(0, secondPass.sha256.length, 0);
+        secondPass.md5.fillRange(0, secondPass.md5.length, 0);
       }
-
+      for (var index = 0; index < results.length; index++) {
+        final result = results[index];
+        final job = stageJobs[index];
+        if (options.maxObjectBytes != null &&
+            result.ciphertextLength > options.maxObjectBytes!) {
+          throw const SboxException(
+            SboxErrorCode.sourceLimit,
+            'Encrypted object exceeds the source limit',
+          );
+        }
+        staged.add(
+          _StagedShard(
+            basename: job.header.canonicalBasename,
+            stage: job.stage,
+            isRoot: job.header.isRoot,
+            sha256: result.ciphertextSha256,
+            shardIndex: job.shard.index,
+          ),
+        );
+      }
       _emitProgress(
         onProgress,
         BundleEncryptionProgress(
@@ -545,9 +530,10 @@ final class BundleEncryptor {
           totalShards: plan.shardCount,
         ),
       );
-
+      final ordered = List<_StagedShard>.of(staged)
+        ..sort((left, right) => left.shardIndex.compareTo(right.shardIndex));
       final committed = <String>[];
-      for (final shard in staged.where((item) => !item.isRoot)) {
+      for (final shard in ordered.where((item) => !item.isRoot)) {
         await _commitImmutable(
           shard.stage,
           File(
@@ -557,7 +543,7 @@ final class BundleEncryptor {
         );
         committed.add(shard.basename);
       }
-      final rootObject = staged.singleWhere((item) => item.isRoot);
+      final rootObject = ordered.singleWhere((item) => item.isRoot);
       await _commitImmutable(
         rootObject.stage,
         File(
@@ -569,8 +555,8 @@ final class BundleEncryptor {
       return List<String>.unmodifiable(committed);
     } finally {
       prepared.dispose();
-      for (final shard in staged) {
-        if (await shard.stage.exists()) await shard.stage.delete();
+      for (final job in stageJobs) {
+        if (await job.stage.exists()) await job.stage.delete();
       }
     }
   }
@@ -749,17 +735,298 @@ final class BundleEncryptor {
     }
   }
 
-  Future<_EncryptedShard> _encryptShard({
+  /// Encrypts independent shards in a bounded isolate pool. The result list
+  /// stays in plan order even when workers finish out of order.
+  Future<List<_ShardEncryptionResult>> _encryptShards({
+    required BundleInput input,
+    required List<BundleShardPlan> shards,
+    required _PreparedBundle prepared,
+    void Function(BundleEncryptionProgress progress)? onProgress,
+  }) async {
+    if (shards.isEmpty) return <_ShardEncryptionResult>[];
+    final results = List<_ShardEncryptionResult?>.filled(shards.length, null);
+    final useIsolates =
+        _canUseShardIsolates && _supportsParallelInput(input);
+    final workerCount = useIsolates ? _shardWorkerCount(shards.length) : 1;
+    var nextIndex = 0;
+    var completedShards = 0;
+    var processedBytes = 0;
+    final totalBytes = shards.fold<int>(
+      0,
+      (total, value) => total + value.length,
+    );
+
+    Future<void> worker() async {
+      while (true) {
+        if (nextIndex >= shards.length) return;
+        final position = nextIndex++;
+        final shard = shards[position];
+        final header = prepared.headerFor(shard.index, shard.length);
+        final result = useIsolates
+            ? await _encryptShardInIsolate(
+                input: input,
+                shard: shard,
+                header: header,
+                bundleDek: prepared.randomness.bundleDek,
+              )
+            : await _encryptShard(
+                input: input,
+                shard: shard,
+                header: header,
+                bundleDek: prepared.randomness.bundleDek,
+              );
+        results[position] = result;
+        completedShards++;
+        processedBytes += result.plaintextLength;
+        _emitProgress(
+          onProgress,
+          BundleEncryptionProgress(
+            stage: BundleEncryptionStage.encrypting,
+            processedBytes: processedBytes,
+            totalBytes: totalBytes,
+            completedShards: completedShards,
+            totalShards: shards.length,
+            currentShardIndex: shard.index,
+            currentShardBytes: result.plaintextLength,
+            currentShardLength: shard.length,
+          ),
+        );
+      }
+    }
+
+    try {
+      await Future.wait<void>(
+        <Future<void>>[
+          for (var index = 0; index < workerCount; index++) worker(),
+        ],
+        eagerError: false,
+      );
+      return <_ShardEncryptionResult>[for (final result in results) result!];
+    } catch (_) {
+      for (final result in results) {
+        result?.dispose();
+      }
+      rethrow;
+    }
+  }
+
+  Future<List<_ShardEncryptionResult>> _encryptShardFiles({
+    required BundleInput input,
+    required List<_ShardFileJob> jobs,
+    required _PreparedBundle prepared,
+    required int totalBytes,
+    void Function(BundleEncryptionProgress progress)? onProgress,
+  }) async {
+    if (jobs.isEmpty) return <_ShardEncryptionResult>[];
+    final results = List<_ShardEncryptionResult?>.filled(jobs.length, null);
+    final useIsolates = _canUseShardIsolates && _supportsParallelInput(input);
+    final workerCount = useIsolates ? _shardWorkerCount(jobs.length) : 1;
+    var nextIndex = 0;
+    var completedShards = 0;
+    var processedBytes = 0;
+
+    Future<void> worker() async {
+      while (true) {
+        if (nextIndex >= jobs.length) return;
+        final position = nextIndex++;
+        final job = jobs[position];
+        final result = useIsolates
+            ? await _encryptShardInIsolate(
+                input: input,
+                shard: job.shard,
+                header: job.header,
+                bundleDek: prepared.randomness.bundleDek,
+                stagePath: job.stage.path,
+              )
+            : await _encryptShardToFile(
+                input: input,
+                shard: job.shard,
+                header: job.header,
+                bundleDek: prepared.randomness.bundleDek,
+                stage: job.stage,
+              );
+        results[position] = result;
+        completedShards++;
+        processedBytes += result.plaintextLength;
+        _emitProgress(
+          onProgress,
+          BundleEncryptionProgress(
+            stage: BundleEncryptionStage.encrypting,
+            processedBytes: processedBytes,
+            totalBytes: totalBytes,
+            completedShards: completedShards,
+            totalShards: jobs.length,
+            currentShardIndex: job.shard.index,
+            currentShardBytes: result.plaintextLength,
+            currentShardLength: job.shard.length,
+          ),
+        );
+      }
+    }
+
+    try {
+      await Future.wait<void>(
+        <Future<void>>[
+          for (var index = 0; index < workerCount; index++) worker(),
+        ],
+        eagerError: false,
+      );
+      return <_ShardEncryptionResult>[for (final result in results) result!];
+    } catch (_) {
+      for (final result in results) {
+        result?.dispose();
+      }
+      rethrow;
+    }
+  }
+
+  Future<_ShardEncryptionResult> _encryptShardInIsolate({
     required BundleInput input,
     required BundleShardPlan shard,
-    required _PreparedBundle prepared,
-    required ByteConversionSink overallHashSink,
+    required BundleHeader header,
+    required List<int> bundleDek,
+    String? stagePath,
   }) async {
-    final header = prepared.headerFor(shard.index, shard.length);
+    final inputRequest = _ShardInputRequest.fromInput(input, shard);
+    if (inputRequest == null) {
+      throw UnsupportedError('Input cannot be sent to a shard isolate');
+    }
+    final request = _ShardEncryptionRequest(
+      input: inputRequest,
+      shardIndex: shard.index,
+      shardOffset: inputRequest.memory == null ? shard.offset : 0,
+      shardLength: shard.length,
+      headerBytes: header.encode(),
+      bundleDek: Uint8List.fromList(bundleDek),
+      stagePath: stagePath,
+    );
+    try {
+      final response = await Isolate.run<_TransferredShardEncryption>(
+        () => _encryptShardWorker(request),
+        debugName: 'safebox-encrypt-shard-${shard.index}',
+      );
+      if (response.plaintextLength != shard.length ||
+          response.ciphertextSha256.length != 32) {
+        if (response.bytes != null) {
+          final invalid = response.bytes!.materialize().asUint8List();
+          invalid.fillRange(0, invalid.length, 0);
+        }
+        throw const SboxException(
+          SboxErrorCode.integrity,
+          'Encrypted shard worker returned invalid metadata',
+        );
+      }
+      Uint8List? bytes;
+      if (stagePath == null) {
+        final transferred = response.bytes;
+        if (transferred == null) {
+          throw const SboxException(
+            SboxErrorCode.integrity,
+            'Encrypted shard worker returned no bytes',
+          );
+        }
+        bytes = transferred.materialize().asUint8List();
+        if (bytes.length != response.ciphertextLength) {
+          bytes.fillRange(0, bytes.length, 0);
+          throw const SboxException(
+            SboxErrorCode.integrity,
+            'Encrypted shard length is invalid',
+          );
+        }
+      } else if (response.bytes != null) {
+        final unexpected = response.bytes!.materialize().asUint8List();
+        unexpected.fillRange(0, unexpected.length, 0);
+        throw const SboxException(
+          SboxErrorCode.integrity,
+          'File shard worker returned bytes',
+        );
+      }
+      return _ShardEncryptionResult(
+        header: header,
+        bytes: bytes,
+        plaintextLength: response.plaintextLength,
+        ciphertextLength: response.ciphertextLength,
+        ciphertextSha256: response.ciphertextSha256,
+      );
+    } finally {
+      request.bundleDek.fillRange(0, request.bundleDek.length, 0);
+      request.headerBytes.fillRange(0, request.headerBytes.length, 0);
+    }
+  }
+
+  Future<_ShardEncryptionResult> _encryptShardToFile({
+    required BundleInput input,
+    required BundleShardPlan shard,
+    required BundleHeader header,
+    required List<int> bundleDek,
+    required File stage,
+  }) async {
+    IOSink? output;
+    try {
+      final sink = stage.openWrite();
+      output = sink;
+      final headerBytes = header.encode();
+      final headerHash = sha256Bytes(headerBytes);
+      final shardKey = ShardKdf.derive(
+        bundleDek: bundleDek,
+        bundleId: header.bundleId,
+        recipientKeyId: header.recipientKeyId,
+        shardIndex: header.shardIndex,
+      );
+      try {
+        sink.add(headerBytes);
+        await sink.flush();
+        final plaintextLength = await _writeShardRecords(
+          input: input,
+          shard: shard,
+          header: header,
+          headerHash: headerHash,
+          shardKey: shardKey,
+          output: sink,
+        );
+        await sink.flush();
+        await sink.close();
+        output = null;
+        final ciphertextLength = await stage.length();
+        return _ShardEncryptionResult(
+          header: header,
+          plaintextLength: plaintextLength,
+          ciphertextLength: ciphertextLength,
+          ciphertextSha256: await sha256File(stage),
+        );
+      } finally {
+        shardKey.fillRange(0, shardKey.length, 0);
+        headerHash.fillRange(0, headerHash.length, 0);
+        headerBytes.fillRange(0, headerBytes.length, 0);
+      }
+    } finally {
+      await output?.close();
+    }
+  }
+
+  static bool _supportsParallelInput(BundleInput input) =>
+      input is FileBundleInput || input is MemoryBundleInput;
+
+  static int _shardWorkerCount(int shardCount) {
+    final processorCount = Platform.numberOfProcessors;
+    final parallelism = processorCount < 2
+        ? 1
+        : processorCount > 4
+        ? 4
+        : processorCount;
+    return parallelism > shardCount ? shardCount : parallelism;
+  }
+
+  Future<_ShardEncryptionResult> _encryptShard({
+    required BundleInput input,
+    required BundleShardPlan shard,
+    required BundleHeader header,
+    required List<int> bundleDek,
+  }) async {
     final headerBytes = header.encode();
     final headerHash = sha256Bytes(headerBytes);
     final shardKey = ShardKdf.derive(
-      bundleDek: prepared.randomness.bundleDek,
+      bundleDek: bundleDek,
       bundleId: header.bundleId,
       recipientKeyId: header.recipientKeyId,
       shardIndex: header.shardIndex,
@@ -780,7 +1047,6 @@ final class BundleEncryptor {
       )) {
         try {
           shardHashSink.add(plainChunk);
-          overallHashSink.add(plainChunk);
           final record = await _records.encrypt(
             type: BundleRecordType.data,
             index: BigInt.from(dataCount + 1),
@@ -799,7 +1065,10 @@ final class BundleEncryptor {
       shardHashSink.close();
       if (shardLength != shard.length ||
           (shard.length == 0 && dataCount != 0)) {
-        throw const SboxException(SboxErrorCode.inputChanged, '输入在加密期间发生变化');
+        throw const SboxException(
+          SboxErrorCode.inputChanged,
+          'Input changed during encryption',
+        );
       }
       final shardDigest = Uint8List.fromList(shardAccumulator.value.bytes);
       final finalPlaintext = BundleFinalRecord(
@@ -821,10 +1090,13 @@ final class BundleEncryptor {
         finalPlaintext.fillRange(0, finalPlaintext.length, 0);
         shardDigest.fillRange(0, shardDigest.length, 0);
       }
-      return _EncryptedShard(
+      final bytes = output.takeBytes();
+      return _ShardEncryptionResult(
         header: header,
-        bytes: output.takeBytes(),
+        bytes: bytes,
         plaintextLength: shardLength,
+        ciphertextLength: bytes.length,
+        ciphertextSha256: sha256Bytes(bytes),
       );
     } finally {
       shardKey.fillRange(0, shardKey.length, 0);
@@ -839,8 +1111,6 @@ final class BundleEncryptor {
     required List<int> headerHash,
     required List<int> shardKey,
     required IOSink output,
-    required ByteConversionSink overallHashSink,
-    void Function(int bytes)? onChunkEncrypted,
   }) async {
     final shardAccumulator = HashDigestSink();
     final shardHashSink = crypto.sha256.startChunkedConversion(
@@ -856,7 +1126,6 @@ final class BundleEncryptor {
     )) {
       try {
         shardHashSink.add(plainChunk);
-        overallHashSink.add(plainChunk);
         final record = await _records.encrypt(
           type: BundleRecordType.data,
           index: BigInt.from(dataCount + 1),
@@ -870,13 +1139,13 @@ final class BundleEncryptor {
         record.fillRange(0, record.length, 0);
         shardLength += plainChunk.length;
         dataCount++;
-        onChunkEncrypted?.call(shardLength);
       } finally {
         plainChunk.fillRange(0, plainChunk.length, 0);
       }
     }
     shardHashSink.close();
-    if (shardLength != shard.length || (shard.length == 0 && dataCount != 0)) {
+    if (shardLength != shard.length ||
+        (shard.length == 0 && dataCount != 0)) {
       throw const SboxException(
         SboxErrorCode.inputChanged,
         'Input changed during encryption',
@@ -1109,16 +1378,150 @@ final class _PreparedBundle {
   }
 }
 
-final class _EncryptedShard {
-  const _EncryptedShard({
+final class _ShardFileJob {
+  const _ShardFileJob({
+    required this.shard,
     required this.header,
-    required this.bytes,
-    required this.plaintextLength,
+    required this.stage,
   });
 
+  final BundleShardPlan shard;
   final BundleHeader header;
-  final Uint8List bytes;
+  final File stage;
+}
+
+final class _ShardEncryptionResult {
+  _ShardEncryptionResult({
+    required this.header,
+    required this.plaintextLength,
+    required this.ciphertextLength,
+    required List<int> ciphertextSha256,
+    this.bytes,
+  }) : ciphertextSha256 = Uint8List.fromList(ciphertextSha256);
+
+  final BundleHeader header;
+  final Uint8List? bytes;
   final int plaintextLength;
+  final int ciphertextLength;
+  final Uint8List ciphertextSha256;
+
+  void dispose() {
+    final value = bytes;
+    if (value != null) value.fillRange(0, value.length, 0);
+    ciphertextSha256.fillRange(0, ciphertextSha256.length, 0);
+  }
+}
+
+final class _ShardInputRequest {
+  _ShardInputRequest.file(this.filePath) : memory = null;
+
+  _ShardInputRequest.memory(Uint8List bytes)
+    : filePath = null,
+      memory = TransferableTypedData.fromList(<TypedData>[bytes]);
+
+  final String? filePath;
+  final TransferableTypedData? memory;
+
+  static _ShardInputRequest? fromInput(
+    BundleInput input,
+    BundleShardPlan shard,
+  ) {
+    if (input is FileBundleInput) {
+      return _ShardInputRequest.file(input.file.path);
+    }
+    if (input is MemoryBundleInput) {
+      return _ShardInputRequest.memory(
+        input.copyRange(shard.offset, shard.length),
+      );
+    }
+    return null;
+  }
+
+  BundleInput open() {
+    final path = filePath;
+    if (path != null) return FileBundleInput(File(path));
+    return MemoryBundleInput._owned(memory!.materialize().asUint8List());
+  }
+}
+
+final class _ShardEncryptionRequest {
+  _ShardEncryptionRequest({
+    required this.input,
+    required this.shardIndex,
+    required this.shardOffset,
+    required this.shardLength,
+    required this.headerBytes,
+    required this.bundleDek,
+    required this.stagePath,
+  });
+
+  final _ShardInputRequest input;
+  final int shardIndex;
+  final int shardOffset;
+  final int shardLength;
+  final Uint8List headerBytes;
+  final Uint8List bundleDek;
+  final String? stagePath;
+}
+
+final class _TransferredShardEncryption {
+  const _TransferredShardEncryption({
+    required this.bytes,
+    required this.plaintextLength,
+    required this.ciphertextLength,
+    required this.ciphertextSha256,
+  });
+
+  final TransferableTypedData? bytes;
+  final int plaintextLength;
+  final int ciphertextLength;
+  final Uint8List ciphertextSha256;
+}
+
+Future<_TransferredShardEncryption> _encryptShardWorker(
+  _ShardEncryptionRequest request,
+) async {
+  BundleInput? openedInput;
+  try {
+    final input = request.input.open();
+    openedInput = input;
+    final shard = BundleShardPlan(
+      index: request.shardIndex,
+      offset: request.shardOffset,
+      length: request.shardLength,
+    );
+    final header = BundleHeader.parse(request.headerBytes);
+    final encryptor = BundleEncryptor();
+    final result = request.stagePath == null
+        ? await encryptor._encryptShard(
+            input: input,
+            shard: shard,
+            header: header,
+            bundleDek: request.bundleDek,
+          )
+        : await encryptor._encryptShardToFile(
+            input: input,
+            shard: shard,
+            header: header,
+            bundleDek: request.bundleDek,
+            stage: File(request.stagePath!),
+          );
+    final transferred = result.bytes == null
+        ? null
+        : TransferableTypedData.fromList(<TypedData>[result.bytes!]);
+    final response = _TransferredShardEncryption(
+      bytes: transferred,
+      plaintextLength: result.plaintextLength,
+      ciphertextLength: result.ciphertextLength,
+      ciphertextSha256: Uint8List.fromList(result.ciphertextSha256),
+    );
+    result.dispose();
+    return response;
+  } finally {
+    if (openedInput is MemoryBundleInput) openedInput.dispose();
+    request.bundleDek.fillRange(0, request.bundleDek.length, 0);
+    request.headerBytes.fillRange(0, request.headerBytes.length, 0);
+  }
 }
 
 final class _HashedRange {

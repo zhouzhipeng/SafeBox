@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
@@ -11,7 +10,6 @@ import '../format/bundle_path.dart';
 import '../format/bundle_manifest.dart';
 import '../format/bundle_preview.dart';
 import '../identity/rsa_models.dart';
-import '../storage/io_hash.dart';
 
 final class BundleCandidate {
   BundleCandidate({
@@ -19,19 +17,16 @@ final class BundleCandidate {
     required this.file,
     required this.header,
     required this.ciphertextSize,
-    required List<int> sha256,
     this.manifest,
     this.preview,
     bool? hasPreview,
     this.status = BundleTrustStatus.headerOnly,
-  }) : sha256 = Uint8List.fromList(sha256),
-       hasPreview = hasPreview ?? preview != null;
+  }) : hasPreview = hasPreview ?? preview != null;
 
   final String basename;
   final File file;
   final BundleHeader header;
   final int ciphertextSize;
-  final Uint8List sha256;
   final BundleManifest? manifest;
   final BundlePreview? preview;
   final bool hasPreview;
@@ -131,7 +126,6 @@ abstract final class LocalBundleScanner {
           file: file,
           header: header,
           ciphertextSize: length,
-          sha256: await sha256File(file),
           manifest: manifest,
           preview: preview,
           status: status,
@@ -151,7 +145,6 @@ abstract final class LocalBundleScanner {
               file: candidate.file,
               header: candidate.header,
               ciphertextSize: candidate.ciphertextSize,
-              sha256: candidate.sha256,
               manifest: candidate.manifest,
               hasPreview: true,
               status: candidate.status,
@@ -164,9 +157,7 @@ abstract final class LocalBundleScanner {
         // A disappearing file is ignored; a later listing can observe it.
       }
     }
-    candidates.sort(
-      (left, right) => left.basename.compareTo(right.basename),
-    );
+    candidates.sort((left, right) => left.basename.compareTo(right.basename));
     return BundleScanResult(
       roots: List<BundleCandidate>.unmodifiable(candidates),
       scannedFileCount: count,

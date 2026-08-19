@@ -1,12 +1,10 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:crypto/crypto.dart' as crypto;
 import 'package:path/path.dart' as p;
 
 import '../bytes.dart';
 import '../errors.dart';
-import '../storage/io_hash.dart';
 import 'data_source.dart';
 import 'source_path.dart';
 
@@ -66,7 +64,8 @@ final class LocalDirectoryDataSource
   @override
   Future<SourceRead> get(SourcePath path, {RevisionToken? ifNoneMatch}) async {
     final file = await _resolve(path, mustExist: true);
-    final revision = RevisionToken(await sha256File(file));
+    final stat = await file.stat();
+    final revision = _statRevision(stat);
     if (ifNoneMatch != null && revision.matches(ifNoneMatch)) {
       return SourceRead(
         body: const Stream<List<int>>.empty(),
@@ -77,7 +76,7 @@ final class LocalDirectoryDataSource
     }
     return SourceRead(
       body: file.openRead(),
-      length: await file.length(),
+      length: stat.size,
       revision: revision,
     );
   }
@@ -93,14 +92,15 @@ final class LocalDirectoryDataSource
       throw const SboxException(SboxErrorCode.invalidHeader, '范围读取边界无效');
     }
     final file = await _resolve(path, mustExist: true);
-    final length = await file.length();
+    final stat = await file.stat();
+    final length = stat.size;
     if (endExclusive > length) {
       throw const SboxException(SboxErrorCode.truncated, '范围读取超过对象长度');
     }
     return SourceRead(
       body: file.openRead(start, endExclusive),
       length: endExclusive - start,
-      revision: RevisionToken(await sha256File(file)),
+      revision: objectInfo?.revision ?? _statRevision(stat),
     );
   }
 
@@ -137,11 +137,12 @@ final class LocalDirectoryDataSource
     final objects = <SourceObjectInfo>[];
     for (final file in page) {
       final path = SourcePath(p.basename(file.path));
+      final stat = await file.stat();
       objects.add(
         SourceObjectInfo(
           path: path,
-          length: await file.length(),
-          revision: RevisionToken(await sha256File(file)),
+          length: stat.size,
+          revision: _statRevision(stat),
         ),
       );
     }
@@ -162,14 +163,14 @@ final class LocalDirectoryDataSource
     required Uint8List sha256,
   }) async {
     _requireWrite();
-    if (length < 0 || sha256.length != 32) {
+    if (length < 0) {
       throw ArgumentError('Invalid object dimensions');
     }
     final target = await _resolve(path, mustExist: false);
     if (await target.exists()) {
-      final existingHash = await sha256File(target);
-      if (constantTimeBytesEqual(existingHash, sha256)) {
-        return RevisionToken(existingHash);
+      final existing = await target.stat();
+      if (existing.size == length) {
+        return _statRevision(existing);
       }
       throw const SboxException(
         SboxErrorCode.immutableConflict,
@@ -184,8 +185,6 @@ final class LocalDirectoryDataSource
     );
     final output = stage.openWrite();
     var count = 0;
-    final accumulator = HashDigestSink();
-    final hashSink = crypto.sha256.startChunkedConversion(accumulator);
     try {
       await for (final chunk in body) {
         count += chunk.length;
@@ -193,12 +192,9 @@ final class LocalDirectoryDataSource
           throw const SboxException(SboxErrorCode.integrity, '对象超过声明长度');
         }
         output.add(chunk);
-        hashSink.add(chunk);
       }
-      hashSink.close();
-      if (count != length ||
-          !constantTimeBytesEqual(accumulator.value.bytes, sha256)) {
-        throw const SboxException(SboxErrorCode.integrity, '对象摘要或长度不匹配');
+      if (count != length) {
+        throw const SboxException(SboxErrorCode.integrity, '对象长度不匹配');
       }
       await output.flush();
       await output.close();
@@ -206,7 +202,7 @@ final class LocalDirectoryDataSource
         throw const SboxException(SboxErrorCode.immutableConflict, '规范对象已存在');
       }
       await stage.rename(target.path);
-      return RevisionToken(sha256);
+      return _statRevision(await target.stat());
     } finally {
       await output.close();
       if (await stage.exists()) await stage.delete();
@@ -217,10 +213,19 @@ final class LocalDirectoryDataSource
   Future<void> deleteIfMatch(SourcePath path, RevisionToken expected) async {
     _requireWrite();
     final target = await _resolve(path, mustExist: true);
-    if (!constantTimeBytesEqual(await sha256File(target), expected.bytes)) {
+    final statRevision = _statRevision(await target.stat());
+    if (!statRevision.matches(expected)) {
       throw const SboxException(SboxErrorCode.shardConflict, '对象在删除前发生变化');
     }
     await target.delete();
+  }
+
+  static RevisionToken _statRevision(FileStat stat) {
+    final bytes = ByteData(24);
+    bytes.setInt64(0, stat.size, Endian.big);
+    bytes.setInt64(8, stat.modified.microsecondsSinceEpoch, Endian.big);
+    bytes.setInt64(16, stat.changed.microsecondsSinceEpoch, Endian.big);
+    return RevisionToken(bytes.buffer.asUint8List());
   }
 
   Future<File> _resolve(SourcePath path, {required bool mustExist}) async {

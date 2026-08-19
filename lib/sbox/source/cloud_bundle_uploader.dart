@@ -162,9 +162,7 @@ final class CloudBundleUploadProgress {
   String get overallLabel {
     if (stage == CloudBundleUploadStage.splitting ||
         stage == CloudBundleUploadStage.encrypting) {
-      final action = stage == CloudBundleUploadStage.splitting
-          ? '切分文件'
-          : '加密文件';
+      const action = '切分&加密文件';
       final shardLabel = processingTotalShards > 0
           ? ' · $processedShards/$processingTotalShards 个分片'
           : '';
@@ -183,9 +181,7 @@ final class CloudBundleUploadProgress {
   String get detailLabel {
     if (stage == CloudBundleUploadStage.splitting ||
         stage == CloudBundleUploadStage.encrypting) {
-      final action = stage == CloudBundleUploadStage.splitting
-          ? '正在切分文件'
-          : '正在加密文件';
+      const action = '正在切分&加密文件';
       final bytes = totalBytes <= 0
           ? null
           : '$action ${_formatBytes(processedBytes)} / ${_formatBytes(totalBytes)}';
@@ -240,10 +236,10 @@ final class CloudBundleUploadResult {
 /// Hashes, de-duplicates, encrypts and publishes one file through both
 /// repository APIs. CPU-heavy work is delegated to background isolates.
 ///
-/// Each repository's Contents API advances one Git branch head per write, so
-/// shard publication must be serial within a source. GitHub explicitly
-/// rejects concurrent contents writes with a branch-level conflict even when
-/// the shard paths are different.
+/// Release assets are published with bounded per-provider parallelism. Bundle
+/// continuation assets are independent; the root asset remains the final
+/// publication marker so a resumed upload never exposes a new Bundle before
+/// all of its continuation assets are available.
 final class CloudBundleUploader {
   CloudBundleUploader({
     required this._credentialStore,
@@ -500,19 +496,13 @@ final class CloudBundleUploader {
       }
       await Future.wait(uploadTasks);
 
+      // _publishDirectory already performs a post-upload directory check for
+      // every source it changed. Sources that were already complete were
+      // checked by the initial listing. Running _verifyPublishedObjects here
+      // repeated the same directory scan and, for Gitee, could trigger a
+      // size lookup for every shard a second time while the UI stayed at
+      // 100% with a "verifying" label.
       progress.emit(stage: CloudBundleUploadStage.verifying);
-      await Future.wait<void>([
-        for (final configured in sources)
-          _verifyPublishedObjects(
-            source: configured.source,
-            root: root,
-            objectNames: objectNames,
-            expected: expected,
-            sourceName: configured.name,
-            progress: progress,
-            cancellation: signal,
-          ),
-      ]);
       final previewOutcome = await _readPreviewOutcome(
         root: root,
         rootObjectName: objectNames.firstWhere(
@@ -553,31 +543,42 @@ final class CloudBundleUploader {
     Iterable<String> names, {
     required CloudBundleUploadCancellation cancellation,
   }) async {
-    for (final name in names) {
-      cancellation.throwIfCancelled();
-      final leftRead = await left.get(SourcePath(name));
-      final rightRead = await right.get(SourcePath(name));
-      final leftHash = await _hashSourceRead(
-        leftRead,
-        cancellation: cancellation,
-      );
-      final rightHash = await _hashSourceRead(
-        rightRead,
-        cancellation: cancellation,
-      );
-      try {
-        if (leftRead.length != rightRead.length ||
-            !constantTimeBytesEqual(leftHash, rightHash)) {
-          throw const SboxException(
-            SboxErrorCode.immutableConflict,
-            '双云存在相同路径但字节不同的不可变对象',
-          );
+    final maxParallel =
+        left.capabilities.maxParallelTransfers <
+            right.capabilities.maxParallelTransfers
+        ? left.capabilities.maxParallelTransfers
+        : right.capabilities.maxParallelTransfers;
+    await _parallelForEach(
+      names,
+      maxParallel: maxParallel,
+      action: (name) async {
+        cancellation.throwIfCancelled();
+        final reads = await Future.wait<SourceRead>(<Future<SourceRead>>[
+          left.get(SourcePath(name)),
+          right.get(SourcePath(name)),
+        ]);
+        final leftRead = reads[0];
+        final rightRead = reads[1];
+        final hashes = await Future.wait<Uint8List>(<Future<Uint8List>>[
+          _hashSourceRead(leftRead, cancellation: cancellation),
+          _hashSourceRead(rightRead, cancellation: cancellation),
+        ]);
+        final leftHash = hashes[0];
+        final rightHash = hashes[1];
+        try {
+          if (leftRead.length != rightRead.length ||
+              !constantTimeBytesEqual(leftHash, rightHash)) {
+            throw const SboxException(
+              SboxErrorCode.immutableConflict,
+              '双云存在相同路径但字节不同的不可变对象',
+            );
+          }
+        } finally {
+          leftHash.fillRange(0, leftHash.length, 0);
+          rightHash.fillRange(0, rightHash.length, 0);
         }
-      } finally {
-        leftHash.fillRange(0, leftHash.length, 0);
-        rightHash.fillRange(0, rightHash.length, 0);
-      }
-    }
+      },
+    );
   }
 
   Future<void> _assertRemoteMatchesLocal({
@@ -586,34 +587,38 @@ final class CloudBundleUploader {
     required Iterable<String> names,
     required CloudBundleUploadCancellation cancellation,
   }) async {
-    for (final name in names) {
-      cancellation.throwIfCancelled();
-      final local = File(p.join(root.path, name));
-      if (await FileSystemEntity.type(local.path, followLinks: false) !=
-          FileSystemEntityType.file) {
-        continue;
-      }
-      final remote = await source.get(SourcePath(name));
-      final localLength = await local.length();
-      final localHash = await BackgroundBundleCrypto.sha256File(local);
-      cancellation.throwIfCancelled();
-      final remoteHash = await _hashSourceRead(
-        remote,
-        cancellation: cancellation,
-      );
-      try {
-        if (localLength != remote.length ||
-            !constantTimeBytesEqual(localHash, remoteHash)) {
-          throw const SboxException(
-            SboxErrorCode.immutableConflict,
-            '本地与远端存在相同路径但字节不同的不可变对象',
-          );
+    await _parallelForEach(
+      names,
+      maxParallel: source.capabilities.maxParallelTransfers,
+      action: (name) async {
+        cancellation.throwIfCancelled();
+        final local = File(p.join(root.path, name));
+        if (await FileSystemEntity.type(local.path, followLinks: false) !=
+            FileSystemEntityType.file) {
+          return;
         }
-      } finally {
-        localHash.fillRange(0, localHash.length, 0);
-        remoteHash.fillRange(0, remoteHash.length, 0);
-      }
-    }
+        final remote = await source.get(SourcePath(name));
+        final localLength = await local.length();
+        final localHash = await BackgroundBundleCrypto.sha256File(local);
+        cancellation.throwIfCancelled();
+        final remoteHash = await _hashSourceRead(
+          remote,
+          cancellation: cancellation,
+        );
+        try {
+          if (localLength != remote.length ||
+              !constantTimeBytesEqual(localHash, remoteHash)) {
+            throw const SboxException(
+              SboxErrorCode.immutableConflict,
+              '本地与远端存在相同路径但字节不同的不可变对象',
+            );
+          }
+        } finally {
+          localHash.fillRange(0, localHash.length, 0);
+          remoteHash.fillRange(0, remoteHash.length, 0);
+        }
+      },
+    );
   }
 
   Future<Uint8List> _hashSourceRead(
@@ -724,9 +729,10 @@ final class CloudBundleUploader {
         for (var retry = 0; ; retry++) {
           late Object error;
           try {
-            page = await source
-                .listObjects(cursor: cursor)
-                .timeout(_remoteListingTimeout);
+            page = await _listObjectsForUpload(
+              source,
+              cursor: cursor,
+            ).timeout(_remoteListingTimeout);
             cancellation.throwIfCancelled();
             break;
           } on SboxException catch (caught) {
@@ -921,21 +927,21 @@ final class CloudBundleUploader {
             .where((name) => name != rootName)
             .toList(growable: false);
 
-        // Continuations are independent immutable objects at the path level,
-        // but each Contents API write also advances the same repository
-        // branch. Publish them serially, then publish the root as the final
-        // Bundle commit marker.
-        for (final name in continuations) {
-          cancellation.throwIfCancelled();
-          await _publishObject(
+        // Continuations are independent immutable assets. Publish them with
+        // the provider's bounded transfer parallelism, then publish the root
+        // as the final Bundle commit marker.
+        await _parallelForEach(
+          continuations,
+          maxParallel: source.capabilities.maxParallelTransfers,
+          action: (name) => _publishObject(
             source: source,
             root: root,
             name: name,
             sourceName: sourceName,
             progress: progress,
             cancellation: cancellation,
-          );
-        }
+          ),
+        );
         if (rootName != null) {
           cancellation.throwIfCancelled();
           await _publishObject(
@@ -1217,7 +1223,7 @@ final class CloudBundleUploader {
     if (error is! SboxException) return true;
     // HTTP 422 is a provider validation response, not a transient network
     // failure. putNew has already confirmed whether the object was committed;
-    // repeating the same Contents API PUT only creates more false failures.
+    // repeating the same Release asset upload only creates more false failures.
     if (error.httpStatus == 422) return false;
     switch (error.code) {
       case SboxErrorCode.sourceNetwork:
@@ -1247,34 +1253,13 @@ final class CloudBundleUploader {
     );
   }
 
-  Future<void> _verifyPublishedObjects({
-    required EnumerableDataSource source,
-    required Directory root,
-    required List<String> objectNames,
-    required Set<String> expected,
-    required String sourceName,
-    required _UploadProgressReporter progress,
-    required CloudBundleUploadCancellation cancellation,
-  }) async {
-    cancellation.throwIfCancelled();
-    final observed = await _remoteObjects(
-      source,
-      expected,
-      sourceName: sourceName,
-      cancellation: cancellation,
-    );
-    progress.setCompleted(sourceName, observed.length);
-    if (observed.length != expected.length) {
-      await _publishDirectory(
-        source: source,
-        root: root,
-        objectNames: objectNames,
-        existing: observed,
-        sourceName: sourceName,
-        progress: progress,
-        cancellation: cancellation,
-      );
-    }
+  Future<SourceListPage> _listObjectsForUpload(
+    EnumerableDataSource source, {
+    String? cursor,
+  }) {
+    // Release asset metadata already includes the object size, so upload
+    // verification can use the same listing path as the library.
+    return source.listObjects(cursor: cursor);
   }
 }
 

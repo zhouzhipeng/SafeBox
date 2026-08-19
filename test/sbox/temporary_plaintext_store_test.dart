@@ -7,7 +7,7 @@ import 'package:safebox/sbox/storage/temporary_plaintext_store.dart';
 import 'package:test/test.dart';
 
 void main() {
-  test('managed plaintext cache validates content and clears only Bundle dirs', () async {
+  test('managed plaintext cache checks availability and clears only Bundle dirs', () async {
     final root = await Directory.systemTemp.createTemp('sbox-v3-plaintext-');
     final outside = File(
       '${root.parent.path}${Platform.pathSeparator}sbox-v3-keep.txt',
@@ -34,10 +34,13 @@ void main() {
       final store = TemporaryPlaintextStore(root: root);
       final file = await store.fileFor(manifest);
       await file.writeAsBytes(plaintext, flush: true);
-      expect(await store.matches(file, manifest), isTrue);
+      expect(await store.isAvailable(file, manifest), isTrue);
+
+      await file.writeAsBytes(<int>[9, 9, 9, 9], flush: true);
+      expect(await store.isAvailable(file, manifest), isTrue);
 
       await file.writeAsBytes(<int>[9], flush: true);
-      expect(await store.matches(file, manifest), isFalse);
+      expect(await store.isAvailable(file, manifest), isFalse);
       await file.writeAsBytes(plaintext, flush: true);
 
       final report = await store.clearAll();
@@ -72,7 +75,7 @@ void main() {
       );
       final store = TemporaryPlaintextStore(root: root);
       await expectLater(
-        store.matches(
+        store.isAvailable(
           File('${root.path}${Platform.pathSeparator}outside.txt'),
           manifest,
         ),

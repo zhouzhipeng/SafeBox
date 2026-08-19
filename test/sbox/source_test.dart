@@ -108,7 +108,8 @@ void main() {
       );
       expect(await prefix.body.toList(), [rootBytes.sublist(0, 12)]);
 
-      final changed = Uint8List.fromList(rootBytes)..[511] ^= 1;
+      final changed = Uint8List(rootBytes.length + 1)
+        ..setRange(0, rootBytes.length, rootBytes);
       await expectLater(
         source.putNew(
           rootPath,

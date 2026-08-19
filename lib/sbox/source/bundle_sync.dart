@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import '../bytes.dart';
 import '../errors.dart';
 import '../engine/background_bundle_crypto.dart';
 import '../engine/bundle_decryptor.dart';
@@ -12,6 +14,58 @@ import 'data_source.dart';
 import 'source_path.dart';
 
 enum BundleDownloadStage { preparing, downloading, decrypting, merging }
+
+/// Signals that a download should stop at the next safe boundary.
+///
+/// The caller can register cleanup hooks such as closing the HTTP client used
+/// by the current download. The stream reader also observes this signal so a
+/// cancellation interrupts an in-flight object response instead of waiting
+/// for the whole shard to arrive.
+final class BundleDownloadCancellation {
+  bool _cancelled = false;
+  final Completer<void> _cancelledCompleter = Completer<void>();
+  final Set<void Function()> _listeners = <void Function()>{};
+
+  bool get isCancelled => _cancelled;
+
+  Future<void> get whenCancelled => _cancelledCompleter.future;
+
+  void cancel() {
+    if (_cancelled) return;
+    _cancelled = true;
+    if (!_cancelledCompleter.isCompleted) _cancelledCompleter.complete();
+    final listeners = List<void Function()>.of(_listeners);
+    _listeners.clear();
+    for (final listener in listeners) {
+      try {
+        listener();
+      } on Object {
+        // A cancellation listener must not prevent the other cleanup hooks.
+      }
+    }
+  }
+
+  /// Registers a cleanup hook and returns a function that removes it.
+  void Function() registerOnCancel(void Function() listener) {
+    if (_cancelled) {
+      listener();
+      return () {};
+    }
+    _listeners.add(listener);
+    var registered = true;
+    return () {
+      if (!registered) return;
+      registered = false;
+      _listeners.remove(listener);
+    };
+  }
+
+  void throwIfCancelled() {
+    if (_cancelled) {
+      throw const SboxException(SboxErrorCode.cancelled, '下载已取消');
+    }
+  }
+}
 
 final class BundleDownloadProgress {
   const BundleDownloadProgress({
@@ -117,24 +171,77 @@ final class BundleDownloadProgress {
 }
 
 abstract final class BundleSync {
+  /// Downloads and stores a complete encrypted Bundle without deriving an
+  /// identity or decrypting any plaintext.
+  ///
+  /// Objects are written to [destination] in continuation-first order and
+  /// the root object last, so a local data source never exposes a complete
+  /// Bundle marker before all continuation shards have been stored.
+  static Future<void> downloadTo({
+    required DataSource source,
+    required SourcePath rootPath,
+    required DataSource destination,
+    void Function(BundleDownloadProgress progress)? onProgress,
+    BundleDownloadCancellation? cancellation,
+  }) async {
+    final signal = cancellation ?? BundleDownloadCancellation();
+    if (!destination.capabilities.canWrite) {
+      throw const SboxException(
+        SboxErrorCode.sourceAuthentication,
+        'The destination data source is not writable',
+      );
+    }
+    final objects = await _downloadObjects(
+      source: source,
+      rootPath: rootPath,
+      onProgress: onProgress,
+      cancellation: signal,
+      emitDecrypting: false,
+    );
+    for (final name in _publicationOrder(objects.objects.keys)) {
+      signal.throwIfCancelled();
+      final bytes = objects.objects[name]!;
+      await destination.putNew(
+        SourcePath(name),
+        Stream<List<int>>.value(bytes),
+        length: bytes.length,
+        sha256: sha256Bytes(bytes),
+      );
+    }
+    signal.throwIfCancelled();
+  }
+
   static Future<DecryptedBundle> fetchAndDecrypt({
     required DataSource source,
     required SourcePath rootPath,
     required String mnemonic,
     PublicIdentity? expectedIdentity,
     void Function(BundleDownloadProgress progress)? onProgress,
+    BundleDownloadCancellation? cancellation,
   }) async {
+    final signal = cancellation ?? BundleDownloadCancellation();
     final objects = await _downloadObjects(
       source: source,
       rootPath: rootPath,
       onProgress: onProgress,
+      cancellation: signal,
+      emitDecrypting: true,
     );
-    return BackgroundBundleCrypto.decrypt(
+    signal.throwIfCancelled();
+    final decrypted = await BackgroundBundleCrypto.decrypt(
       objects: objects.objects,
       mnemonic: mnemonic,
       expectedIdentity: expectedIdentity,
       onProgress: objects.reporter.updateDecryption,
     );
+    try {
+      signal.throwIfCancelled();
+      return decrypted;
+    } catch (_) {
+      decrypted.plaintext.fillRange(0, decrypted.plaintext.length, 0);
+      decrypted.preview?.dispose();
+      rethrow;
+    }
   }
 
   static Future<void> fetchAndDecryptToFile({
@@ -144,6 +251,7 @@ abstract final class BundleSync {
     required File destination,
     PublicIdentity? expectedIdentity,
     void Function(BundleDownloadProgress progress)? onProgress,
+    BundleDownloadCancellation? cancellation,
   }) => fetchAndDecryptToFileStreaming(
     source: source,
     rootPath: rootPath,
@@ -151,6 +259,7 @@ abstract final class BundleSync {
     destination: destination,
     expectedIdentity: expectedIdentity,
     onProgress: onProgress,
+    cancellation: cancellation,
   );
 
   /// Downloads ciphertext shards concurrently and performs authentication,
@@ -163,12 +272,17 @@ abstract final class BundleSync {
     required File destination,
     PublicIdentity? expectedIdentity,
     void Function(BundleDownloadProgress progress)? onProgress,
+    BundleDownloadCancellation? cancellation,
   }) async {
+    final signal = cancellation ?? BundleDownloadCancellation();
     final objects = await _downloadObjects(
       source: source,
       rootPath: rootPath,
       onProgress: onProgress,
+      cancellation: signal,
+      emitDecrypting: true,
     );
+    signal.throwIfCancelled();
     await BackgroundBundleCrypto.decryptToFile(
       objects: objects.objects,
       mnemonic: mnemonic,
@@ -176,13 +290,17 @@ abstract final class BundleSync {
       expectedIdentity: expectedIdentity,
       onProgress: objects.reporter.updateDecryption,
     );
+    signal.throwIfCancelled();
   }
 
   static Future<_DownloadedObjects> _downloadObjects({
     required DataSource source,
     required SourcePath rootPath,
     void Function(BundleDownloadProgress progress)? onProgress,
+    required BundleDownloadCancellation cancellation,
+    required bool emitDecrypting,
   }) async {
+    cancellation.throwIfCancelled();
     if (!source.capabilities.canRead) {
       throw const SboxException(
         SboxErrorCode.sourceAuthentication,
@@ -191,12 +309,15 @@ abstract final class BundleSync {
     }
     final reporter = _DownloadProgressReporter(onProgress);
     final rootRead = await source.get(rootPath);
+    cancellation.throwIfCancelled();
     reporter.startObject(shardIndex: 0, length: rootRead.length);
     final rootBytes = await _readObject(
       source,
       rootRead,
+      cancellation: cancellation,
       onBytesRead: (count) => reporter.updateObject(0, count),
     );
+    cancellation.throwIfCancelled();
     reporter.completeObject(0);
     final rootHeader = BundleHeader.parse(rootBytes);
     validateBundlePathAgainstHeader(rootPath.value, rootHeader);
@@ -227,7 +348,9 @@ abstract final class BundleSync {
       maxParallel: source.capabilities.maxParallelTransfers,
       action: (item) async {
         try {
+          cancellation.throwIfCancelled();
           final read = await source.get(item.path);
+          cancellation.throwIfCancelled();
           reporter.startObject(
             shardIndex: item.shardIndex,
             length: read.length,
@@ -235,9 +358,11 @@ abstract final class BundleSync {
           objects[item.path.value] = await _readObject(
             source,
             read,
+            cancellation: cancellation,
             onBytesRead: (count) =>
                 reporter.updateObject(item.shardIndex, count),
           );
+          cancellation.throwIfCancelled();
           reporter.completeObject(item.shardIndex);
         } on SboxException catch (error) {
           if (error.code == SboxErrorCode.sourceNotFound) {
@@ -250,7 +375,8 @@ abstract final class BundleSync {
         }
       },
     );
-    reporter.emitDecrypting();
+    cancellation.throwIfCancelled();
+    if (emitDecrypting) reporter.emitDecrypting();
     return _DownloadedObjects(objects: objects, reporter: reporter);
   }
 
@@ -321,8 +447,10 @@ abstract final class BundleSync {
   static Future<Uint8List> _readObject(
     DataSource source,
     SourceRead read, {
+    required BundleDownloadCancellation cancellation,
     void Function(int bytesRead)? onBytesRead,
   }) async {
+    cancellation.throwIfCancelled();
     if (read.notModified ||
         read.length < 0 ||
         (source.capabilities.maxObjectBytes != null &&
@@ -334,7 +462,7 @@ abstract final class BundleSync {
     }
     final output = BytesBuilder(copy: false);
     var count = 0;
-    await for (final chunk in read.body) {
+    await for (final chunk in _cancelOnSignal(read.body, cancellation)) {
       count += chunk.length;
       if (count > read.length) {
         throw const SboxException(
@@ -345,6 +473,7 @@ abstract final class BundleSync {
       output.add(chunk);
       onBytesRead?.call(count);
     }
+    cancellation.throwIfCancelled();
     if (count != read.length) {
       throw const SboxException(
         SboxErrorCode.remoteChanged,
@@ -353,6 +482,73 @@ abstract final class BundleSync {
     }
     return output.takeBytes();
   }
+}
+
+List<String> _publicationOrder(Iterable<String> names) {
+  final parsed = names.map((name) {
+    final info = parseCanonicalBundleBasename(name);
+    return (name: name, root: info.shardIndex == 0, index: info.shardIndex);
+  }).toList();
+  parsed.sort((left, right) {
+    if (left.root != right.root) return left.root ? 1 : -1;
+    return left.index.compareTo(right.index);
+  });
+  return List<String>.unmodifiable(parsed.map((item) => item.name));
+}
+
+Stream<List<int>> _cancelOnSignal(
+  Stream<List<int>> source,
+  BundleDownloadCancellation cancellation,
+) {
+  late final StreamController<List<int>> controller;
+  StreamSubscription<List<int>>? subscription;
+  var stopped = false;
+  void Function() unregister = () {};
+
+  void stop({Object? error, StackTrace? stackTrace}) {
+    if (stopped) return;
+    stopped = true;
+    unregister();
+    final current = subscription;
+    if (current != null) unawaited(current.cancel());
+    if (error != null) controller.addError(error, stackTrace);
+    unawaited(controller.close());
+  }
+
+  controller = StreamController<List<int>>(
+    sync: true,
+    onListen: () {
+      if (stopped) return;
+      if (cancellation.isCancelled) {
+        stop(error: const SboxException(SboxErrorCode.cancelled, '下载已取消'));
+        return;
+      }
+      subscription = source.listen(
+        controller.add,
+        onError: (Object error, StackTrace stackTrace) {
+          if (stopped) return;
+          stopped = true;
+          unregister();
+          final current = subscription;
+          if (current != null) unawaited(current.cancel());
+          controller.addError(error, stackTrace);
+          unawaited(controller.close());
+        },
+        onDone: () => stop(),
+        cancelOnError: false,
+      );
+    },
+    onCancel: () async {
+      if (stopped) return;
+      stopped = true;
+      unregister();
+      await subscription?.cancel();
+    },
+  );
+  unregister = cancellation.registerOnCancel(() {
+    stop(error: const SboxException(SboxErrorCode.cancelled, '下载已取消'));
+  });
+  return controller.stream;
 }
 
 final class _DownloadProgressReporter {

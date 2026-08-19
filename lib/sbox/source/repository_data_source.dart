@@ -15,6 +15,45 @@ import 'source_path.dart';
 
 enum RepositoryCredentialPlacement { authorizationHeader, jsonBody, formBody }
 
+/// The release used as SafeBox's repository-backed object store.
+///
+/// A dedicated tag keeps SafeBox assets isolated from unrelated releases in a
+/// repository. The release is created lazily on the first writable operation.
+const String safeBoxReleaseTag = 'latest';
+
+final class RepositoryReleaseMetadata {
+  const RepositoryReleaseMetadata({required this.id, required this.tagName});
+
+  final int id;
+  final String tagName;
+}
+
+/// Metadata for one release asset, represented in the generic DataSource
+/// protocol as a repository object.
+final class RepositoryObjectMetadata {
+  const RepositoryObjectMetadata({
+    required this.revision,
+    required this.size,
+    required this.downloadUri,
+    this.releaseId = 0,
+    this.assetId = 0,
+    this.assetName = '',
+  });
+
+  final String revision;
+  final int size;
+  final Uri downloadUri;
+  final int releaseId;
+  final int assetId;
+  final String assetName;
+}
+
+/// Shared Release/asset implementation for GitHub and Gitee.
+///
+/// The provider subclasses only describe their endpoint shapes and request
+/// encodings. All object semantics live here: lazy creation of the dedicated
+/// latest release, asset pagination, immutable uploads, range reads, and
+/// revision-checked deletion.
 abstract base class RepositoryDataSource
     implements EnumerableDataSource, RangeReadableDataSource {
   RepositoryDataSource({
@@ -23,7 +62,7 @@ abstract base class RepositoryDataSource
     required this.credentialStore,
     required this.credentialId,
     this.logger,
-    this.sourceName = '云端仓库',
+    this.sourceName = 'Repository',
   }) : httpTransport = RemoteHttp(
          client,
          logger: logger,
@@ -35,55 +74,56 @@ abstract base class RepositoryDataSource
   final SourceCredentialId? credentialId;
   final SboxLogger? logger;
   final RemoteHttp httpTransport;
-
   final String sourceName;
 
-  String get createMethod;
-  String get deleteMethod => 'DELETE';
-  String get apiAcceptHeader;
+  /// Provider-specific release and asset endpoints.
+  Uri latestReleaseUri();
+
+  Uri createReleaseUri();
+
+  Uri assetListUri({
+    required int releaseId,
+    required int page,
+    required int perPage,
+  });
+
+  Uri assetDownloadUri({required int releaseId, required int assetId});
+
+  Uri assetDeleteUri({required int releaseId, required int assetId});
+
+  Uri repositoryProbeUri();
+
+  Map<String, String> publicHeaders({required bool raw});
+
+  /// Builds the provider-specific request for creating the SafeBox release.
+  Future<http.BaseRequest> createLatestReleaseRequest(String token);
+
+  /// Builds the provider-specific raw or multipart upload request.
+  Future<http.BaseRequest> uploadAssetRequest({
+    required RepositoryReleaseMetadata release,
+    required String token,
+    required String assetName,
+    required Uint8List bytes,
+  });
+
+  /// Builds the provider-specific asset deletion request.
+  http.BaseRequest deleteAssetRequest({
+    required RepositoryObjectMetadata metadata,
+    required String token,
+  });
+
   RepositoryCredentialPlacement get credentialPlacement =>
       RepositoryCredentialPlacement.authorizationHeader;
 
-  /// Some repository APIs return an empty JSON array instead of HTTP 404 for
-  /// a missing file. Providers opt in because an empty array is invalid
-  /// metadata for the default repository response contract.
-  bool get emptyMetadataListMeansNotFound => false;
-
-  Uri metadataUri(SourcePath path);
-  Uri listUri({String? cursor, int pageSize = 1000});
-  Uri writeUri(SourcePath path);
-  Uri rawUri(SourcePath path, RepositoryObjectMetadata metadata);
-
-  /// Providers may expose a raw endpoint whose response headers contain all
-  /// information needed for a read. This avoids metadata endpoints that
-  /// inline the entire file as Base64 content.
-  Uri? rawUriWithoutMetadata(SourcePath path) => null;
-
-  Uri repositoryProbeUri();
-  Map<String, String> publicHeaders({required bool raw});
+  String get readAuthorizationScheme =>
+      credentialPlacement == RepositoryCredentialPlacement.formBody
+      ? 'token'
+      : 'Bearer';
 
   int get providerPageSize => 100;
 
-  /// Whether [listUri] supports the page/per-page cursor contract used by
-  /// [listObjects]. Some provider directory endpoints return the complete
-  /// directory in one response and ignore those query parameters.
-  bool get supportsListPagination => true;
-
-  /// Repository reads and probes intentionally use only public headers. A
-  /// credential is loaded only by write operations below, so public
-  /// repositories remain usable even when no token is configured.
-  Future<void> verifyRepository() async {
-    logger?.info('$sourceName：开始测试 API 连接');
-    final response = await httpTransport.get(
-      repositoryProbeUri(),
-      headers: await _requestHeaders(raw: false),
-    );
-    if (response.statusCode != 200) {
-      await httpTransport.throwForStatus(response, RemoteFailureContext.read);
-    }
-    await httpTransport.discard(response.stream);
-    logger?.info('$sourceName：API 连接正常');
-  }
+  Future<RepositoryReleaseMetadata>? _releaseCreation;
+  RepositoryReleaseMetadata? _cachedRelease;
 
   @override
   SourceCapabilities get capabilities => SourceCapabilities(
@@ -96,54 +136,22 @@ abstract base class RepositoryDataSource
     maxParallelTransfers: 4,
   );
 
+  /// Repository verification deliberately probes the repository itself. An
+  /// empty repository has no Release yet, but it is still a valid target and
+  /// must pass the settings-page connectivity check.
+  Future<void> verifyRepository() async {
+    final response = await httpTransport.get(
+      repositoryProbeUri(),
+      headers: await _requestHeaders(raw: false),
+    );
+    if (response.statusCode != 200) {
+      await httpTransport.throwForStatus(response, RemoteFailureContext.read);
+    }
+    await httpTransport.discard(response.stream);
+  }
+
   @override
   Future<SourceRead> get(SourcePath path, {RevisionToken? ifNoneMatch}) async {
-    final directUri = rawUriWithoutMetadata(path);
-    if (directUri != null) {
-      final headers = await _requestHeaders(raw: true);
-      if (ifNoneMatch != null) {
-        headers['If-None-Match'] = _revisionString(ifNoneMatch);
-      }
-      final response = await httpTransport.get(directUri, headers: headers);
-      if (response.statusCode == 304 && ifNoneMatch != null) {
-        await httpTransport.discard(response.stream);
-        return SourceRead(
-          body: const Stream<List<int>>.empty(),
-          length: 0,
-          revision: ifNoneMatch,
-          notModified: true,
-        );
-      }
-      if (response.statusCode != 200) {
-        await httpTransport.throwForStatus(response, RemoteFailureContext.read);
-      }
-      final size = _responseSize(response);
-      final revision = _responseRevision(response);
-      if (size != null &&
-          (size < 0 ||
-              capabilities.maxObjectBytes != null &&
-                  size > capabilities.maxObjectBytes!)) {
-        await httpTransport.discard(response.stream);
-        throw const SboxException(SboxErrorCode.sourceLimit, '对象超过数据源上限');
-      }
-      if (size == null || revision == null) {
-        // Raw repository endpoints are not required to return both
-        // Content-Length and ETag. This is common for large Gitee objects.
-        // Buffer only this bounded fallback response so callers still get a
-        // verified length and a stable revision token without accepting an
-        // unbounded stream.
-        return _bufferRawResponse(
-          response,
-          expectedLength: size,
-          revision: revision,
-        );
-      }
-      return SourceRead(
-        body: _verifiedStream(response.stream, size),
-        length: size,
-        revision: revision,
-      );
-    }
     final metadata = await _readMetadata(path);
     final revision = RevisionToken(ascii.encode(metadata.revision));
     if (ifNoneMatch != null && revision.matches(ifNoneMatch)) {
@@ -154,16 +162,48 @@ abstract base class RepositoryDataSource
         notModified: true,
       );
     }
+
     final response = await httpTransport.get(
-      rawUri(path, metadata),
+      metadata.downloadUri,
       headers: await _requestHeaders(raw: true),
     );
     if (response.statusCode != 200) {
       await httpTransport.throwForStatus(response, RemoteFailureContext.read);
     }
+    final responseSize = _responseSize(response);
+    if (metadata.size < 0 ||
+        capabilities.maxObjectBytes != null &&
+            metadata.size > capabilities.maxObjectBytes!) {
+      await httpTransport.discard(response.stream);
+      throw const SboxException(
+        SboxErrorCode.sourceLimit,
+        'Remote object exceeds the source limit',
+      );
+    }
+    if (responseSize != null && responseSize == metadata.size) {
+      return SourceRead(
+        body: _verifiedStream(response.stream, metadata.size),
+        length: metadata.size,
+        revision: revision,
+      );
+    }
+
+    // Download redirects and Gitee attachment responses may omit a reliable
+    // Content-Length. Buffer only this bounded fallback so the DataSource
+    // contract still exposes an exact length and catches truncated downloads.
+    final bytes = await httpTransport.readBounded(
+      response.stream,
+      maximumBytes: capabilities.maxObjectBytes ?? 100 * 1024 * 1024,
+    );
+    if (bytes.length != metadata.size) {
+      throw const SboxException(
+        SboxErrorCode.remoteChanged,
+        'Remote asset length changed',
+      );
+    }
     return SourceRead(
-      body: _verifiedStream(response.stream, metadata.size),
-      length: metadata.size,
+      body: Stream<List<int>>.value(bytes),
+      length: bytes.length,
       revision: revision,
     );
   }
@@ -176,39 +216,37 @@ abstract base class RepositoryDataSource
     SourceObjectInfo? objectInfo,
   }) async {
     if (start < 0 || endExclusive < start) {
-      throw const SboxException(SboxErrorCode.invalidHeader, '范围读取边界无效');
+      throw const SboxException(
+        SboxErrorCode.invalidHeader,
+        'Invalid remote object range',
+      );
     }
-    logger?.info('$sourceName：读取对象范围', detail: '读取公共头范围');
-    final directUri = rawUriWithoutMetadata(path);
-    late final Uri requestUri;
-    late final RevisionToken? knownRevision;
-    int? knownSize;
-    if (directUri != null) {
-      requestUri = directUri;
-      knownRevision = objectInfo?.revision;
-      if (objectInfo != null && objectInfo.length > 0) {
-        knownSize = objectInfo.length;
-      }
-    } else {
-      final metadata =
-          objectInfo == null ||
-              objectInfo.length == 0 ||
-              objectInfo.downloadUri == null
-          ? await _readMetadata(path)
-          : RepositoryObjectMetadata(
-              revision: _revisionString(objectInfo.revision),
-              size: objectInfo.length,
-              downloadUri: objectInfo.downloadUri,
-            );
-      requestUri = rawUri(path, metadata);
-      knownRevision = RevisionToken(ascii.encode(metadata.revision));
-      knownSize = metadata.size;
-    }
+    final requestedLength = endExclusive - start;
+    final metadata = objectInfo?.downloadUri == null
+        ? await _readMetadata(path)
+        : RepositoryObjectMetadata(
+            revision: _revisionString(objectInfo!.revision),
+            size: objectInfo.length,
+            downloadUri: objectInfo.downloadUri!,
+          );
+    final knownSize = metadata.size > 0 ? metadata.size : null;
     if (knownSize != null && endExclusive > knownSize) {
-      throw const SboxException(SboxErrorCode.truncated, '范围读取超过对象长度');
+      throw const SboxException(
+        SboxErrorCode.truncated,
+        'Requested range exceeds remote asset length',
+      );
     }
+    final revision = RevisionToken(ascii.encode(metadata.revision));
+    if (requestedLength == 0) {
+      return SourceRead(
+        body: const Stream<List<int>>.empty(),
+        length: 0,
+        revision: revision,
+      );
+    }
+
     final response = await httpTransport.get(
-      requestUri,
+      metadata.downloadUri,
       headers: <String, String>{
         ...await _requestHeaders(raw: true),
         'Range': 'bytes=$start-${endExclusive - 1}',
@@ -217,169 +255,71 @@ abstract base class RepositoryDataSource
     if (response.statusCode != 200 && response.statusCode != 206) {
       await httpTransport.throwForStatus(response, RemoteFailureContext.read);
     }
-    final requestedLength = endExclusive - start;
-    final revision = knownRevision ?? _responseRevision(response);
-    if (revision == null) {
-      final body = response.statusCode == 200
-          ? _sliceStream(response.stream, start: start, length: requestedLength)
-          : _verifiedStream(response.stream, requestedLength);
-      final bytes = await httpTransport.readBounded(
-        body,
-        maximumBytes: requestedLength,
-      );
-      if (bytes.length != requestedLength) {
-        throw const SboxException(SboxErrorCode.remoteChanged, '范围读取响应长度不一致');
-      }
-      return SourceRead(
-        body: Stream<List<int>>.value(bytes),
-        length: requestedLength,
-        revision: _fallbackRevision(bytes),
-      );
-    }
     final body = response.statusCode == 200
         ? _sliceStream(response.stream, start: start, length: requestedLength)
         : _verifiedStream(response.stream, requestedLength);
     return SourceRead(body: body, length: requestedLength, revision: revision);
   }
 
-  Future<SourceRead> _bufferRawResponse(
-    http.StreamedResponse response, {
-    required int? expectedLength,
-    required RevisionToken? revision,
-  }) async {
-    final maximumBytes =
-        expectedLength ?? capabilities.maxObjectBytes ?? 100 * 1024 * 1024;
-    final bytes = await httpTransport.readBounded(
-      response.stream,
-      maximumBytes: maximumBytes,
-    );
-    if (expectedLength != null && bytes.length != expectedLength) {
-      throw const SboxException(SboxErrorCode.remoteChanged, '远端对象长度不一致');
-    }
-    return SourceRead(
-      body: Stream<List<int>>.value(bytes),
-      length: bytes.length,
-      revision: revision ?? _fallbackRevision(bytes),
-    );
-  }
-
-  static RevisionToken _fallbackRevision(List<int> bytes) {
-    final digest = sha256Bytes(bytes);
-    try {
-      return RevisionToken(ascii.encode('raw-sha256:${hexLower(digest)}'));
-    } finally {
-      digest.fillRange(0, digest.length, 0);
-    }
-  }
-
   @override
   Future<SourceListPage> listObjects({
     String? cursor,
     int pageSize = 1000,
+    bool? resolveObjectSizes,
   }) async {
     if (pageSize < 1 || pageSize > 1000) {
-      throw const SboxException(SboxErrorCode.sourceLimit, '列举分页大小无效');
+      throw const SboxException(
+        SboxErrorCode.sourceLimit,
+        'Invalid remote listing page size',
+      );
     }
-    logger?.info('$sourceName：开始列举云端对象', detail: '分页 ${cursor ?? '1'}');
+
+    // A configured writable source creates its dedicated release lazily even
+    // when the first operation is a listing. Read-only public sources simply
+    // observe an empty store until a release exists.
+    final release = capabilities.canWrite
+        ? await _ensureLatestRelease()
+        : await _findLatestRelease();
+    if (release == null) {
+      return const SourceListPage(
+        objects: <SourceObjectInfo>[],
+        nextCursor: null,
+      );
+    }
+
+    final page = _pageNumber(cursor);
+    final perPage = pageSize < providerPageSize ? pageSize : providerPageSize;
     final response = await httpTransport.get(
-      listUri(cursor: cursor, pageSize: pageSize),
+      assetListUri(releaseId: release.id, page: page, perPage: perPage),
       headers: await _requestHeaders(raw: false),
     );
     if (response.statusCode != 200) {
       await httpTransport.throwForStatus(response, RemoteFailureContext.read);
     }
-    final values = await httpTransport.readJsonList(response);
+    final values = await _readAssetValues(response);
     final objects = <SourceObjectInfo>[];
     for (final value in values) {
-      if (value is! Map<String, Object?> || value['type'] != 'file') continue;
-      final name = value['name'];
-      final revision = value['sha'];
-      final size = value['size'];
-      final downloadUri = _parseDownloadUri(value['download_url']);
-      if (name is! String ||
-          revision is! String ||
-          (size is! int && size != null) ||
-          size is int && size < 0) {
-        continue;
-      }
-      try {
-        final path = SourcePath(name);
-        if (!name.endsWith('.sbox')) continue;
-        var resolvedSize = size is int ? size : null;
-        if (resolvedSize == null || resolvedSize == 0) {
-          try {
-            resolvedSize = await _resolveListedObjectSize(path);
-          } on Object catch (error) {
-            // Directory listings are still useful when a provider cannot
-            // expose a size. Keep the existing unknown-size sentinel and let
-            // range/full reads validate the object when it is used.
-            logger?.warning('$sourceName：无法读取对象大小', detail: '$name · $error');
-          }
-        }
-        objects.add(
-          SourceObjectInfo(
-            path: path,
-            // Some provider directory responses omit size even for files.
-            // Providers with a direct raw endpoint can read without it;
-            // other providers retrieve metadata on demand.
-            length: resolvedSize ?? 0,
-            revision: RevisionToken(ascii.encode(revision)),
-            downloadUri: downloadUri,
-          ),
-        );
-      } on Object {
-        continue;
-      }
-      if (objects.length > 100000) {
-        throw const SboxException(SboxErrorCode.sourceLimit, '数据源对象数量超过上限');
-      }
+      final metadata = _parseAsset(value, release.id);
+      if (metadata == null) continue;
+      final path = _pathForAssetName(metadata.assetName);
+      if (path == null) continue;
+      objects.add(
+        SourceObjectInfo(
+          path: path,
+          length: metadata.size,
+          revision: RevisionToken(ascii.encode(metadata.revision)),
+          downloadUri: metadata.downloadUri,
+        ),
+      );
     }
     objects.sort((left, right) => left.path.value.compareTo(right.path.value));
-    final pageNumber = int.tryParse(cursor ?? '1') ?? 1;
-    final nextCursor =
-        supportsListPagination && values.length >= providerPageSize
-        ? (pageNumber + 1).toString()
+    final nextCursor = _hasNextPage(response, values, perPage)
+        ? (page + 1).toString()
         : null;
-    logger?.info(
-      '$sourceName：云端对象列举完成',
-      detail: '本页识别 ${objects.length} 个 SBOX 对象',
-    );
     return SourceListPage(
       objects: List.unmodifiable(objects),
       nextCursor: nextCursor,
     );
-  }
-
-  Future<int?> _resolveListedObjectSize(SourcePath path) async {
-    final directUri = rawUriWithoutMetadata(path);
-    if (directUri != null) {
-      final response = await httpTransport.get(
-        directUri,
-        headers: <String, String>{
-          ...await _requestHeaders(raw: true),
-          'Range': 'bytes=0-0',
-        },
-      );
-      if (response.statusCode != 200 && response.statusCode != 206) {
-        await httpTransport.throwForStatus(response, RemoteFailureContext.read);
-      }
-      final size =
-          _responseTotalSize(response) ??
-          (response.statusCode == 200 ? _responseSize(response) : null);
-      await httpTransport.discard(response.stream);
-      if (size != null && size > 0) return size;
-
-      // Some raw endpoints omit both Content-Length and Content-Range. The
-      // existing bounded raw-read fallback can still determine the exact
-      // length without allowing an unbounded response.
-      final read = await get(path);
-      try {
-        return read.length;
-      } finally {
-        await httpTransport.discard(read.body);
-      }
-    }
-    return (await _readMetadata(path)).size;
   }
 
   @override
@@ -395,75 +335,324 @@ abstract base class RepositoryDataSource
     }
     final bytes = await _readBody(body, length, sha256);
     try {
-      final remote = await get(path);
-      final remoteBytes = await httpTransport.readBounded(
-        remote.body,
-        maximumBytes: length,
-      );
-      if (constantTimeBytesEqual(sha256Bytes(remoteBytes), sha256)) {
-        return remote.revision;
+      try {
+        final existing = await _readMetadata(path);
+        final remote = await get(path);
+        if (remote.length != length) {
+          await httpTransport.discard(remote.body);
+          throw const SboxException(
+            SboxErrorCode.immutableConflict,
+            'A remote asset already exists with different content',
+          );
+        }
+        final remoteBytes = await httpTransport.readBounded(
+          remote.body,
+          maximumBytes: length,
+        );
+        final remoteHash = sha256Bytes(remoteBytes);
+        try {
+          if (constantTimeBytesEqual(remoteHash, sha256)) {
+            return RevisionToken(ascii.encode(existing.revision));
+          }
+        } finally {
+          remoteHash.fillRange(0, remoteHash.length, 0);
+        }
+        throw const SboxException(
+          SboxErrorCode.immutableConflict,
+          'A remote asset already exists with different content',
+        );
+      } on SboxException catch (error) {
+        if (error.code != SboxErrorCode.sourceNotFound) rethrow;
       }
-      throw const SboxException(
-        SboxErrorCode.immutableConflict,
-        '远端对象路径已存在但内容不同',
-      );
-    } on SboxException catch (error) {
-      if (error.code != SboxErrorCode.sourceNotFound) rethrow;
+
+      final release = await _ensureLatestRelease();
+      final assetName = _assetNameForPath(path);
+      try {
+        final response = await _withCredential((token) async {
+          final request = await uploadAssetRequest(
+            release: release,
+            token: token,
+            assetName: assetName,
+            bytes: bytes,
+          );
+          return httpTransport.send(request);
+        });
+        if (response.statusCode != 200 && response.statusCode != 201) {
+          if (response.statusCode == 422) {
+            await httpTransport.discard(response.stream);
+            throw const SboxException(
+              SboxErrorCode.immutableConflict,
+              'A release asset with this name already exists',
+              httpStatus: 422,
+            );
+          }
+          await httpTransport.throwForStatus(
+            response,
+            RemoteFailureContext.immutableCreate,
+          );
+        }
+        final value = await httpTransport.readJsonObject(response);
+        final uploaded = _parseAsset(value, release.id);
+        if (uploaded == null || uploaded.assetName != assetName) {
+          throw const SboxException(
+            SboxErrorCode.sourceNetwork,
+            'Release upload returned invalid asset metadata',
+          );
+        }
+        return RevisionToken(ascii.encode(uploaded.revision));
+      } on SboxException catch (error) {
+        // Upload requests can commit the asset before the client receives the
+        // response. Confirm the immutable bytes before surfacing a retryable
+        // failure or duplicate-name response.
+        if (error.code == SboxErrorCode.immutableConflict ||
+            error.code == SboxErrorCode.sourceNetwork) {
+          final existingRevision = await _existingRevisionIfSame(
+            path,
+            length: length,
+            expectedHash: sha256,
+          );
+          if (existingRevision != null) return existingRevision;
+        }
+        rethrow;
+      }
+    } finally {
+      bytes.fillRange(0, bytes.length, 0);
     }
-    try {
-      final response = await _withCredential((token) async {
-        final request = http.Request(createMethod, writeUri(path))
-          ..headers.addAll(publicHeaders(raw: false));
-        final fields = <String, String>{
-          'message': 'sbox: add immutable object',
-          'content': base64Encode(bytes),
-          if (credentialPlacement == RepositoryCredentialPlacement.jsonBody ||
-              credentialPlacement == RepositoryCredentialPlacement.formBody)
-            'access_token': token,
-        };
-        if (credentialPlacement == RepositoryCredentialPlacement.formBody) {
-          request.bodyFields = fields;
-        } else {
-          request
-            ..headers['Content-Type'] = 'application/json; charset=utf-8'
-            ..bodyBytes = utf8.encode(jsonEncode(fields));
-        }
-        if (credentialPlacement ==
-            RepositoryCredentialPlacement.authorizationHeader) {
-          request.headers['Authorization'] = 'Bearer $token';
-        }
-        return httpTransport.send(request);
-      });
-      if (response.statusCode != 200 && response.statusCode != 201) {
+  }
+
+  @override
+  Future<void> deleteIfMatch(SourcePath path, RevisionToken expected) async {
+    _requireDelete();
+    final metadata = await _readMetadata(path);
+    final actual = RevisionToken(ascii.encode(metadata.revision));
+    if (!actual.matches(expected)) {
+      throw const SboxException(
+        SboxErrorCode.shardConflict,
+        'The remote asset revision no longer matches',
+      );
+    }
+    await _withCredential((token) async {
+      final response = await httpTransport.send(
+        deleteAssetRequest(metadata: metadata, token: token),
+      );
+      if (response.statusCode != 200 && response.statusCode != 204) {
         await httpTransport.throwForStatus(
           response,
-          RemoteFailureContext.immutableCreate,
+          RemoteFailureContext.delete,
         );
       }
-      final value = await httpTransport.readJsonObject(response);
-      final content = value['content'];
-      final providerRevision =
-          content is Map<String, Object?> && content['sha'] is String
-          ? content['sha']! as String
-          : hexLower(sha256);
-      return RevisionToken(ascii.encode(providerRevision));
-    } on SboxException catch (error) {
-      // A PUT can have an ambiguous outcome: the provider may commit the
-      // object and then lose or reject the response. Confirm the immutable
-      // bytes before allowing the caller to retry the write. This covers the
-      // GitHub Contents API's HTTP 422 response after a path becomes visible,
-      // as well as transport failures after the request was submitted.
-      if (error.code == SboxErrorCode.immutableConflict ||
-          error.code == SboxErrorCode.sourceNetwork) {
-        final existingRevision = await _existingRevisionIfSame(
-          path,
-          length: length,
-          expectedHash: sha256,
-        );
-        if (existingRevision != null) return existingRevision;
-      }
-      rethrow;
+      await httpTransport.discard(response.stream);
+    });
+  }
+
+  Future<RepositoryObjectMetadata> _readMetadata(SourcePath path) async {
+    final release = await _findLatestRelease();
+    if (release == null) {
+      throw const SboxException(
+        SboxErrorCode.sourceNotFound,
+        'The SafeBox latest release does not exist',
+      );
     }
+    final metadata = await _findAsset(release, path);
+    if (metadata == null) {
+      throw const SboxException(
+        SboxErrorCode.sourceNotFound,
+        'The remote asset does not exist',
+      );
+    }
+    return metadata;
+  }
+
+  Future<RepositoryObjectMetadata?> _findAsset(
+    RepositoryReleaseMetadata release,
+    SourcePath path,
+  ) async {
+    final expectedAssetName = _assetNameForPath(path);
+    for (var page = 1; page <= 1000; page++) {
+      final values = await _fetchAssetPage(
+        release,
+        page: page,
+        perPage: providerPageSize,
+      );
+      for (final value in values) {
+        final metadata = _parseAsset(value, release.id);
+        if (metadata != null && metadata.assetName == expectedAssetName) {
+          return metadata;
+        }
+      }
+      if (values.length < providerPageSize) return null;
+    }
+    throw const SboxException(
+      SboxErrorCode.sourceLimit,
+      'The release contains too many assets',
+    );
+  }
+
+  Future<List<Object?>> _fetchAssetPage(
+    RepositoryReleaseMetadata release, {
+    required int page,
+    required int perPage,
+  }) async {
+    final response = await httpTransport.get(
+      assetListUri(releaseId: release.id, page: page, perPage: perPage),
+      headers: await _requestHeaders(raw: false),
+    );
+    if (response.statusCode != 200) {
+      await httpTransport.throwForStatus(response, RemoteFailureContext.read);
+    }
+    return _readAssetValues(response);
+  }
+
+  Future<List<Object?>> _readAssetValues(http.StreamedResponse response) async {
+    final value = await httpTransport.readJsonValue(response);
+    if (value is List) return value.cast<Object?>();
+    if (value is Map<String, Object?>) {
+      final assets = value['assets'];
+      if (assets is List) return assets.cast<Object?>();
+    }
+    throw const SboxException(
+      SboxErrorCode.sourceNetwork,
+      'The release asset response is not a JSON list',
+    );
+  }
+
+  static bool _hasNextPage(
+    http.StreamedResponse response,
+    List<Object?> values,
+    int perPage,
+  ) {
+    final link = response.headers['link'];
+    if (link != null) {
+      return RegExp(
+        r'''rel\s*=\s*["']next["']''',
+        caseSensitive: false,
+      ).hasMatch(link);
+    }
+    return values.length >= perPage;
+  }
+
+  RepositoryObjectMetadata? _parseAsset(Object? raw, int releaseId) {
+    if (raw is! Map<String, Object?>) return null;
+    final assetId = _integer(raw['id']);
+    final assetName = raw['name'];
+    final rawSize = raw['size'];
+    if (assetId == null || assetId <= 0 || assetName is! String) return null;
+    final size = rawSize == null ? 0 : _integer(rawSize);
+    if (size == null || size < 0) return null;
+    final path = _pathForAssetName(assetName);
+    if (path == null || !path.value.endsWith('.sbox')) return null;
+    return RepositoryObjectMetadata(
+      revision: _assetRevision(releaseId, assetId),
+      size: size,
+      downloadUri: assetDownloadUri(releaseId: releaseId, assetId: assetId),
+      releaseId: releaseId,
+      assetId: assetId,
+      assetName: assetName,
+    );
+  }
+
+  String _assetRevision(int releaseId, int assetId) =>
+      'release-asset:$releaseId:$assetId';
+
+  String _assetNameForPath(SourcePath path) {
+    if (config.pathPrefix.isEmpty) return path.value;
+    final namespace = base64UrlEncode(utf8.encode(config.pathPrefix));
+    return 'safebox-$namespace--${path.value}';
+  }
+
+  SourcePath? _pathForAssetName(String assetName) {
+    final expectedPrefix = config.pathPrefix.isEmpty
+        ? null
+        : 'safebox-${base64UrlEncode(utf8.encode(config.pathPrefix))}--';
+    final value = expectedPrefix == null
+        ? assetName
+        : assetName.startsWith(expectedPrefix)
+        ? assetName.substring(expectedPrefix.length)
+        : null;
+    if (value == null) return null;
+    try {
+      return SourcePath(value);
+    } on Object {
+      return null;
+    }
+  }
+
+  Future<RepositoryReleaseMetadata?> _findLatestRelease({
+    bool refresh = false,
+  }) async {
+    if (!refresh && _cachedRelease != null) return _cachedRelease;
+    final response = await httpTransport.get(
+      latestReleaseUri(),
+      headers: await _requestHeaders(raw: false),
+    );
+    if (response.statusCode == 404) {
+      await httpTransport.discard(response.stream);
+      return null;
+    }
+    if (response.statusCode != 200) {
+      await httpTransport.throwForStatus(response, RemoteFailureContext.read);
+    }
+    final value = await httpTransport.readJsonValue(response);
+    if (value == null) return null;
+    if (value is! Map<String, Object?>) {
+      throw const SboxException(
+        SboxErrorCode.sourceNetwork,
+        'The latest release response is invalid',
+      );
+    }
+    final release = _parseRelease(value);
+    _cachedRelease = release;
+    return release;
+  }
+
+  RepositoryReleaseMetadata _parseRelease(Map<String, Object?> value) {
+    final id = _integer(value['id']);
+    final tagName = value['tag_name'];
+    if (id == null || id <= 0 || tagName is! String || tagName.isEmpty) {
+      throw const SboxException(
+        SboxErrorCode.sourceNetwork,
+        'The latest release response is invalid',
+      );
+    }
+    return RepositoryReleaseMetadata(id: id, tagName: tagName);
+  }
+
+  Future<RepositoryReleaseMetadata> _ensureLatestRelease() async {
+    final existing = await _findLatestRelease();
+    if (existing != null) return existing;
+    _requireWrite();
+    final pending = _releaseCreation;
+    if (pending != null) return pending;
+    final creation = _createLatestRelease();
+    _releaseCreation = creation;
+    try {
+      return await creation;
+    } finally {
+      if (identical(_releaseCreation, creation)) _releaseCreation = null;
+    }
+  }
+
+  Future<RepositoryReleaseMetadata> _createLatestRelease() async {
+    final response = await _withCredential((token) async {
+      final request = await createLatestReleaseRequest(token);
+      return httpTransport.send(request);
+    });
+    if (response.statusCode != 200 && response.statusCode != 201) {
+      if (response.statusCode == 422) {
+        await httpTransport.discard(response.stream);
+        final raced = await _findLatestRelease(refresh: true);
+        if (raced != null) return raced;
+        throw const SboxException(
+          SboxErrorCode.sourceNetwork,
+          'Unable to create the SafeBox latest release',
+          httpStatus: 422,
+        );
+      }
+      await httpTransport.throwForStatus(response, RemoteFailureContext.read);
+    }
+    final release = _parseRelease(await httpTransport.readJsonObject(response));
+    _cachedRelease = release;
+    return release;
   }
 
   Future<RevisionToken?> _existingRevisionIfSame(
@@ -471,9 +660,6 @@ abstract base class RepositoryDataSource
     required int length,
     required Uint8List expectedHash,
   }) async {
-    // Directory and object metadata endpoints can briefly disagree after a
-    // successful commit. A short bounded confirmation window prevents a
-    // successful immutable upload from being reported as a failure.
     const maxAttempts = 4;
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
       try {
@@ -486,9 +672,15 @@ abstract base class RepositoryDataSource
           remote.body,
           maximumBytes: length,
         );
-        return constantTimeBytesEqual(sha256Bytes(remoteBytes), expectedHash)
-            ? remote.revision
-            : null;
+        final remoteHash = sha256Bytes(remoteBytes);
+        try {
+          if (constantTimeBytesEqual(remoteHash, expectedHash)) {
+            return remote.revision;
+          }
+        } finally {
+          remoteHash.fillRange(0, remoteHash.length, 0);
+        }
+        return null;
       } on SboxException catch (error) {
         if (error.code == SboxErrorCode.cancelled) rethrow;
         if (error.code != SboxErrorCode.sourceNotFound &&
@@ -507,102 +699,9 @@ abstract base class RepositoryDataSource
     return null;
   }
 
-  @override
-  Future<void> deleteIfMatch(SourcePath path, RevisionToken expected) async {
-    if (!capabilities.canDelete) {
-      throw const SboxException(
-        SboxErrorCode.sourceAuthentication,
-        '当前数据源不允许删除',
-      );
-    }
-    final revision = _revisionString(expected);
-    await _withCredential((token) async {
-      final request = http.Request(deleteMethod, writeUri(path))
-        ..headers.addAll(publicHeaders(raw: false))
-        ..headers['Content-Type'] =
-            credentialPlacement == RepositoryCredentialPlacement.formBody
-            ? 'application/x-www-form-urlencoded'
-            : 'application/json; charset=utf-8';
-      final fields = <String, String>{
-        'message': 'sbox: delete immutable object',
-        'sha': revision,
-        if (credentialPlacement == RepositoryCredentialPlacement.jsonBody ||
-            credentialPlacement == RepositoryCredentialPlacement.formBody)
-          'access_token': token,
-      };
-      if (credentialPlacement == RepositoryCredentialPlacement.formBody) {
-        request.bodyFields = fields;
-      } else {
-        request.body = jsonEncode(fields);
-      }
-      if (credentialPlacement ==
-          RepositoryCredentialPlacement.authorizationHeader) {
-        request.headers['Authorization'] = 'Bearer $token';
-      }
-      final response = await httpTransport.send(request);
-      if (response.statusCode != 200 && response.statusCode != 204) {
-        await httpTransport.throwForStatus(
-          response,
-          RemoteFailureContext.delete,
-        );
-      }
-      await httpTransport.discard(response.stream);
-    });
-  }
-
-  Future<RepositoryObjectMetadata> _readMetadata(SourcePath path) async {
-    final response = await httpTransport.get(
-      metadataUri(path),
-      headers: await _requestHeaders(raw: false),
-    );
-    if (response.statusCode != 200) {
-      await httpTransport.throwForStatus(response, RemoteFailureContext.read);
-    }
-    final value = await httpTransport.readJsonValue(response);
-    if (emptyMetadataListMeansNotFound &&
-        value is List<Object?> &&
-        value.isEmpty) {
-      throw const SboxException(SboxErrorCode.sourceNotFound, '数据源对象不存在');
-    }
-    if (value is! Map<String, Object?>) {
-      logger?.warning('$sourceName：对象元数据格式错误');
-      throw const SboxException(SboxErrorCode.sourceNetwork, '数据源返回了无效对象响应');
-    }
-    final type = value['type'];
-    final revision = value['sha'];
-    final size = value['size'];
-    final downloadUri = _parseDownloadUri(value['download_url']);
-    if (type != 'file' ||
-        revision is! String ||
-        revision.isEmpty ||
-        size is! int ||
-        size < 0 ||
-        (capabilities.maxObjectBytes != null &&
-            size > capabilities.maxObjectBytes!)) {
-      logger?.warning('$sourceName：对象元数据字段无效');
-      throw const SboxException(SboxErrorCode.sourceNetwork, '数据源返回了无效对象元数据');
-    }
-    return RepositoryObjectMetadata(
-      revision: revision,
-      size: size,
-      downloadUri: downloadUri,
-    );
-  }
-
-  Uri? _parseDownloadUri(Object? value) {
-    if (value is! String || value.isEmpty) return null;
-    final uri = Uri.tryParse(value);
-    if (uri == null || uri.scheme != 'https' || uri.host.isEmpty) return null;
-    return uri;
-  }
-
-  Uri resolvedDownloadUri(RepositoryObjectMetadata metadata) {
-    final uri = metadata.downloadUri;
-    if (uri == null) {
-      throw const SboxException(SboxErrorCode.sourceNetwork, '远端文件响应缺少下载地址');
-    }
-    return uri;
-  }
+  Future<Map<String, String>> authenticatedRequestHeaders({
+    required bool raw,
+  }) => _requestHeaders(raw: raw);
 
   Future<Map<String, String>> _requestHeaders({required bool raw}) async {
     final headers = publicHeaders(raw: raw);
@@ -612,26 +711,17 @@ abstract base class RepositoryDataSource
     final token = await store.getAccessToken(id);
     if (token == null) return headers;
     try {
-      final authenticated = token.useAuthorizationValue(
+      return await token.useAuthorizationValue(
         readAuthorizationScheme,
         (authorization) => <String, String>{
           ...headers,
           'Authorization': authorization,
         },
       );
-      return authenticated;
     } finally {
       token.dispose();
     }
   }
-
-  /// Gitee's v5 API expects the legacy `token` authorization scheme, while
-  /// GitHub accepts `Bearer`. Writes keep their provider-specific body format;
-  /// this scheme applies to read and probe requests.
-  String get readAuthorizationScheme =>
-      credentialPlacement == RepositoryCredentialPlacement.formBody
-      ? 'token'
-      : 'Bearer';
 
   Future<T> _withCredential<T>(Future<T> Function(String value) action) async {
     final store = credentialStore;
@@ -639,14 +729,14 @@ abstract base class RepositoryDataSource
     if (store == null || id == null) {
       throw const SboxException(
         SboxErrorCode.sourceAuthentication,
-        '数据源未配置写入凭据',
+        'Write credentials are not configured',
       );
     }
     final token = await store.getAccessToken(id);
     if (token == null) {
       throw const SboxException(
         SboxErrorCode.sourceAuthentication,
-        '数据源写入凭据不存在',
+        'Write credentials are missing',
       );
     }
     try {
@@ -662,9 +752,31 @@ abstract base class RepositoryDataSource
     if (!capabilities.canWrite) {
       throw const SboxException(
         SboxErrorCode.sourceAuthentication,
-        '当前数据源不允许写入',
+        'Write credentials are not configured',
       );
     }
+  }
+
+  void _requireDelete() {
+    if (!capabilities.canDelete) {
+      throw const SboxException(
+        SboxErrorCode.sourceAuthentication,
+        'Delete credentials are not configured',
+      );
+    }
+  }
+
+  static int _pageNumber(String? cursor) {
+    final page = int.tryParse(cursor ?? '1') ?? 1;
+    return page < 1 ? 1 : page;
+  }
+
+  static int? _integer(Object? value) {
+    if (value is int) return value;
+    if (value is num && value.isFinite && value == value.truncate()) {
+      return value.toInt();
+    }
+    return null;
   }
 
   static Future<Uint8List> _readBody(
@@ -672,14 +784,19 @@ abstract base class RepositoryDataSource
     int length,
     Uint8List expectedHash,
   ) async {
-    final builder = BytesBuilder(copy: false);
+    // Do not retain caller-owned stream chunks. putNew clears its private
+    // upload buffer after the request completes.
+    final builder = BytesBuilder(copy: true);
     final accumulator = HashDigestSink();
     final sink = crypto.sha256.startChunkedConversion(accumulator);
     var count = 0;
     await for (final chunk in body) {
       count += chunk.length;
       if (count > length) {
-        throw const SboxException(SboxErrorCode.integrity, '上传对象超过声明长度');
+        throw const SboxException(
+          SboxErrorCode.integrity,
+          'Upload body exceeds the declared length',
+        );
       }
       builder.add(chunk);
       sink.add(chunk);
@@ -687,7 +804,10 @@ abstract base class RepositoryDataSource
     sink.close();
     if (count != length ||
         !constantTimeBytesEqual(accumulator.value.bytes, expectedHash)) {
-      throw const SboxException(SboxErrorCode.integrity, '上传对象摘要不匹配');
+      throw const SboxException(
+        SboxErrorCode.integrity,
+        'Upload body digest does not match',
+      );
     }
     return builder.takeBytes();
   }
@@ -700,23 +820,26 @@ abstract base class RepositoryDataSource
     await for (final chunk in source) {
       count += chunk.length;
       if (count > expectedLength) {
-        throw const SboxException(SboxErrorCode.remoteChanged, '远端对象超过声明长度');
+        throw const SboxException(
+          SboxErrorCode.remoteChanged,
+          'Remote asset is longer than declared',
+        );
       }
       yield chunk;
     }
     if (count != expectedLength) {
-      throw const SboxException(SboxErrorCode.remoteChanged, '远端对象长度不一致');
+      throw const SboxException(
+        SboxErrorCode.remoteChanged,
+        'Remote asset is shorter than declared',
+      );
     }
   }
 
-  /// Some raw repository endpoints ignore Range and return HTTP 200 with the
-  /// complete object. Expose only the requested window in that case.
   static Stream<List<int>> _sliceStream(
     Stream<List<int>> source, {
     required int start,
     required int length,
   }) async* {
-    if (length == 0) return;
     var skipped = 0;
     var emitted = 0;
     await for (final chunk in source) {
@@ -739,7 +862,10 @@ abstract base class RepositoryDataSource
       }
       if (emitted == length) return;
     }
-    throw const SboxException(SboxErrorCode.remoteChanged, '远端对象长度不一致');
+    throw const SboxException(
+      SboxErrorCode.remoteChanged,
+      'Remote asset is shorter than the requested range',
+    );
   }
 
   static String _revisionString(RevisionToken token) {
@@ -748,17 +874,10 @@ abstract base class RepositoryDataSource
       if (value.isEmpty || value.length > 4096) throw const FormatException();
       return value;
     } on FormatException {
-      throw const SboxException(SboxErrorCode.shardConflict, '数据源修订令牌无效');
-    }
-  }
-
-  static RevisionToken? _responseRevision(http.StreamedResponse response) {
-    final etag = response.headers['etag'];
-    if (etag == null || etag.isEmpty) return null;
-    try {
-      return RevisionToken(ascii.encode(etag));
-    } on FormatException {
-      return null;
+      throw const SboxException(
+        SboxErrorCode.shardConflict,
+        'Invalid remote asset revision',
+      );
     }
   }
 
@@ -769,25 +888,4 @@ abstract base class RepositoryDataSource
     final parsed = header == null ? null : int.tryParse(header);
     return parsed != null && parsed >= 0 ? parsed : null;
   }
-
-  static int? _responseTotalSize(http.StreamedResponse response) {
-    final header = response.headers['content-range'];
-    if (header == null) return null;
-    final separator = header.lastIndexOf('/');
-    if (separator < 0 || separator == header.length - 1) return null;
-    final parsed = int.tryParse(header.substring(separator + 1).trim());
-    return parsed != null && parsed >= 0 ? parsed : null;
-  }
-}
-
-final class RepositoryObjectMetadata {
-  const RepositoryObjectMetadata({
-    required this.revision,
-    required this.size,
-    this.downloadUri,
-  });
-
-  final String revision;
-  final int size;
-  final Uri? downloadUri;
 }

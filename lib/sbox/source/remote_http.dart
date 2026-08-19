@@ -24,6 +24,7 @@ final class RemoteHttp {
   static const int maximumHeaderBytes = 64 * 1024;
   static const int maximumErrorBodyBytes = 64 * 1024;
   static const int maximumMetadataBytes = 1024 * 1024;
+  static const int minimumJsonBytesForIsolate = 256 * 1024;
 
   final http.Client client;
   final Duration requestTimeout;
@@ -177,7 +178,12 @@ final class RemoteHttp {
       maximumBytes: maximumBytes,
     );
     try {
-      final value = parseInBackground
+      // Spawning an isolate costs more than parsing the small directory
+      // responses used by the home page. Keep large/untrusted lists off the
+      // Flutter isolate, but avoid paying an isolate startup for normal
+      // repositories with only a few hundred entries.
+      final value =
+          parseInBackground && bytes.length >= minimumJsonBytesForIsolate
           ? await Isolate.run<Object?>(
               () => _parseJsonWorker(bytes, maximumBytes),
               debugName: 'safebox-parse-file-list',

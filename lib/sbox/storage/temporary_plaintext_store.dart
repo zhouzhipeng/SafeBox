@@ -2,10 +2,8 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
-import '../bytes.dart';
 import '../errors.dart';
 import '../format/bundle_manifest.dart';
-import 'io_hash.dart';
 
 /// The application-owned directory for plaintext that has passed a complete
 /// Bundle verification. It deliberately lives below the operating system
@@ -72,9 +70,11 @@ final class TemporaryPlaintextStore {
     return file;
   }
 
-  /// Returns true only when [file] is a regular file in this store and still
-  /// matches the authenticated Manifest length and SHA-256.
-  Future<bool> matches(File file, BundleManifest manifest) async {
+  /// Returns whether [file] is an available managed plaintext cache entry.
+  ///
+  /// This deliberately checks only the managed path, file type and expected
+  /// length. Cached plaintext is never hashed during startup or before open.
+  Future<bool> isAvailable(File file, BundleManifest manifest) async {
     final canonicalRoot = await _ensureReady();
     _validateManagedFilePath(file.path, canonicalRoot);
     if (await FileSystemEntity.type(file.path, followLinks: false) !=
@@ -85,12 +85,7 @@ final class TemporaryPlaintextStore {
       if (BigInt.from(await file.length()) != manifest.logicalPlaintextSize) {
         return false;
       }
-      final digest = await sha256File(file);
-      try {
-        return constantTimeBytesEqual(digest, manifest.logicalPlaintextSha256);
-      } finally {
-        digest.fillRange(0, digest.length, 0);
-      }
+      return true;
     } on FileSystemException {
       return false;
     }

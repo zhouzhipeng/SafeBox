@@ -155,7 +155,7 @@ final class _EncryptPageState extends State<EncryptPage> {
                   onChanged: _busy ? null : _setGeneratePreview,
                   contentPadding: EdgeInsets.zero,
                   secondary: const Icon(Icons.image_outlined),
-                  subtitle: const Text('仅上传图片或视频时生效；持有完整公钥的人可以读取缩略图，完整文件仍需验证。'),
+                  subtitle: const Text('图片/视频专用；持完整公钥可读缩略图。'),
                 ),
                 _buildVideoPreviewPicker(context),
               ] else ...<Widget>[
@@ -974,8 +974,8 @@ final class _EncryptPageState extends State<EncryptPage> {
   static String _uploadStageTitle(CloudBundleUploadProgress progress) {
     return switch (progress.stage) {
       CloudBundleUploadStage.preparing => '正在准备上传',
-      CloudBundleUploadStage.splitting => '正在切分文件',
-      CloudBundleUploadStage.encrypting => '正在加密文件',
+      CloudBundleUploadStage.splitting => '正在切分&加密文件',
+      CloudBundleUploadStage.encrypting => '正在切分&加密文件',
       CloudBundleUploadStage.uploading => '正在上传加密分片',
       CloudBundleUploadStage.verifying => '正在核对云端分片',
       CloudBundleUploadStage.completed => '上传完成，正在收尾',

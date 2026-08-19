@@ -55,6 +55,8 @@ final class AppController extends ChangeNotifier {
   PublicIdentityRecord? _identity;
   int _targetNominalShardPlaintextSize =
       SboxProtocol.defaultNominalShardPlaintextSize;
+  bool _showPreviewAndDetails = false;
+  Future<void> _showPreviewSaveTail = Future<void>.value();
   bool _initialized = false;
   String? _statusMessage;
   String? _errorMessage;
@@ -67,6 +69,7 @@ final class AppController extends ChangeNotifier {
   AppLogger get logger => _logger;
   AppSettingsStore get appSettingsStore => _appSettingsStore;
   int get targetNominalShardPlaintextSize => _targetNominalShardPlaintextSize;
+  bool get showPreviewAndDetails => _showPreviewAndDetails;
   String get shortFingerprint {
     final record = _identity;
     if (record == null) return '未配置公开身份';
@@ -80,6 +83,8 @@ final class AppController extends ChangeNotifier {
     _identity = await _identityStore.load();
     _targetNominalShardPlaintextSize = await _appSettingsStore
         .loadTargetNominalShardPlaintextSize();
+    _showPreviewAndDetails = await _appSettingsStore
+        .loadShowPreviewAndDetails();
     _initialized = true;
     _statusMessage = _identity == null ? '请创建或恢复 RSA 公开身份' : '已加载 RSA 公开身份';
     notifyListeners();
@@ -89,6 +94,19 @@ final class AppController extends ChangeNotifier {
     await _appSettingsStore.saveTargetNominalShardPlaintextSize(value);
     _targetNominalShardPlaintextSize = value;
     notifyListeners();
+  }
+
+  Future<void> saveShowPreviewAndDetails(bool value) async {
+    final operation = _showPreviewSaveTail.then((_) async {
+      await _appSettingsStore.saveShowPreviewAndDetails(value);
+      _showPreviewAndDetails = value;
+      notifyListeners();
+    });
+    _showPreviewSaveTail = operation.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    await operation;
   }
 
   Future<String> createIdentity() async {
@@ -170,6 +188,7 @@ final class AppController extends ChangeNotifier {
     await attempt(_identityStore.clear);
     await attempt(_cloudBackupConfigurationStore.clear);
     await attempt(_sourceConfigurationStore.clear);
+    await _showPreviewSaveTail;
     await attempt(_appSettingsStore.clear);
     await attempt(() async {
       final root = Directory(_temporaryPlaintextStore.path);
@@ -187,6 +206,7 @@ final class AppController extends ChangeNotifier {
     _identity = null;
     _targetNominalShardPlaintextSize =
         SboxProtocol.defaultNominalShardPlaintextSize;
+    _showPreviewAndDetails = false;
     _statusMessage = '请创建或恢复 RSA 公开身份';
     _errorMessage = null;
     notifyListeners();

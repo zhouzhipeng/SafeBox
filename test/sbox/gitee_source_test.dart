@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 import 'package:safebox/sbox/bytes.dart';
+import 'package:safebox/sbox/errors.dart';
 import 'package:safebox/sbox/source/credential.dart';
 import 'package:safebox/sbox/source/data_source.dart';
 import 'package:safebox/sbox/source/gitee_source.dart';
@@ -11,211 +12,138 @@ import 'package:safebox/sbox/source/source_path.dart';
 import 'package:test/test.dart';
 
 void main() {
-  test('Gitee read requests use the configured token', () async {
-    final client = _RecordingClient();
-    final source = GiteeDataSource(
-      config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
-      client: client,
-      credentialStore: _CredentialStore(),
-      credentialId: SourceCredentialId('gitee-test-token'),
-    );
-
-    await source.listObjects();
-
-    expect(client.readRequest?.headers['authorization'], 'token test-token');
-    expect(client.readRequest?.url.queryParameters, isEmpty);
+  test('Gitee release assets expose bounded parallel transfers', () {
+    expect(_source(_GiteeReleaseClient()).capabilities.maxParallelTransfers, 2);
   });
 
   test(
-    'Gitee directory listings do not request a synthetic next page',
+    'Gitee returns an empty read-only store without creating a release',
     () async {
-      final client = _RecordingClient(
-        directoryEntries: List<Object?>.generate(
-          100,
-          (index) => <String, Object?>{
-            'type': 'file',
-            'name': '${index.toRadixString(16).padLeft(32, '0')}.sbox',
-            'sha': 'revision-$index',
-            'size': 16992,
-          },
-        ),
-      );
+      final client = _GiteeReleaseClient();
       final source = GiteeDataSource(
-        config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
+        config: RepositorySourceConfig(owner: 'zzp', repository: 'repo'),
         client: client,
       );
 
       final page = await source.listObjects();
 
-      expect(page.objects, hasLength(100));
-      expect(page.nextCursor, isNull);
-      expect(client.readRequest?.url.queryParameters, isEmpty);
+      expect(page.objects, isEmpty);
+      expect(client.releaseCreateRequests, 0);
     },
   );
 
   test(
-    'Gitee directory listings resolve omitted sizes from raw range headers',
+    'Gitee creates latest release with the repository default branch',
     () async {
-      final client = _MissingSizeClient();
-      final source = GiteeDataSource(
-        config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
-        client: client,
-      );
+      final client = _GiteeReleaseClient();
+      final source = _source(client);
 
       final page = await source.listObjects();
 
-      expect(page.objects, hasLength(1));
-      expect(page.objects.single.length, 16992);
-      expect(client.rawRequest?.headers['range'], 'bytes=0-0');
+      expect(page.objects, isEmpty);
+      expect(client.releaseCreateRequests, 1);
+      expect(client.releaseId, 11);
+      final create = client.requests.singleWhere(
+        (request) =>
+            request.method == 'POST' && request.url.path.endsWith('/releases'),
+      ) as http.Request;
+      expect(create.bodyFields['access_token'], 'test-token');
+      expect(create.bodyFields['tag_name'], 'latest');
+      expect(create.bodyFields['target_commitish'], 'master');
     },
   );
 
-  test('Gitee creates files with form-encoded API parameters', () async {
-    final client = _RecordingClient();
-    final source = GiteeDataSource(
-      config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
-      client: client,
-      credentialStore: _CredentialStore(),
-      credentialId: SourceCredentialId('gitee-test-token'),
-    );
-    final bytes = Uint8List.fromList(<int>[1, 2, 3, 4]);
+  test(
+    'Gitee uploads multipart binary assets and supports read/range/delete',
+    () async {
+      final client = _GiteeReleaseClient();
+      final source = _source(client);
+      final path = SourcePath('0123456789abcdef0123456789abcdef.sbox');
+      final bytes = Uint8List.fromList(<int>[0, 1, 2, 127, 128, 255]);
 
-    await source.putNew(
-      SourcePath('0123456789abcdef0123456789abcdef-0-of-1.sbox'),
+      final revision = await source.putNew(
+        path,
+        Stream<List<int>>.value(bytes),
+        length: bytes.length,
+        sha256: sha256Bytes(bytes),
+      );
+
+      expect(client.uploadRequests, 1);
+      final upload = client.requests.singleWhere(
+        (request) => request.url.path.endsWith('/attach_files'),
+      ) as http.MultipartRequest;
+      expect(upload.fields['access_token'], 'test-token');
+      expect(upload.fields.containsKey('content'), isFalse);
+      expect(upload.files.single.filename, path.value);
+      expect(client.uploadedBytes, bytes);
+      expect(ascii.decode(revision.bytes), 'release-asset:11:1');
+
+      final read = await source.get(path);
+      expect(await read.body.expand((chunk) => chunk).toList(), bytes);
+
+      final range = await source.getRange(path, start: 2, endExclusive: 5);
+      expect(await range.body.expand((chunk) => chunk).toList(), <int>[
+        2,
+        127,
+        128,
+      ]);
+
+      await source.deleteIfMatch(path, revision);
+      expect(client.assets, isEmpty);
+      expect(client.deleteRequests, 1);
+    },
+  );
+
+  test('Gitee rejects a stale revision before deleting', () async {
+    final client = _GiteeReleaseClient()
+      ..releaseExists = true
+      ..assets.add(
+        _AssetRecord(1, 'object.sbox', Uint8List.fromList(<int>[1])),
+      );
+    final source = _source(client);
+
+    await expectLater(
+      source.deleteIfMatch(
+        SourcePath('object.sbox'),
+        RevisionToken(ascii.encode('release-asset:11:999')),
+      ),
+      throwsA(
+        isA<SboxException>().having(
+          (error) => error.code,
+          'code',
+          SboxErrorCode.shardConflict,
+        ),
+      ),
+    );
+    expect(client.deleteRequests, 0);
+  });
+
+  test('Gitee confirms a committed asset after an upload 422', () async {
+    final client = _GiteeReleaseClient()
+      ..releaseExists = true
+      ..return422AfterCommit = true;
+    final source = _source(client);
+    final path = SourcePath('ambiguous.sbox');
+    final bytes = Uint8List.fromList(<int>[3, 4, 5]);
+
+    final revision = await source.putNew(
+      path,
       Stream<List<int>>.value(bytes),
       length: bytes.length,
       sha256: sha256Bytes(bytes),
     );
 
-    expect(client.readRequest?.headers['authorization'], 'token test-token');
-    final request = client.createRequest;
-    expect(request, isNotNull);
-    expect(request!.method, 'POST');
-    expect(
-      request.headers['content-type'],
-      'application/x-www-form-urlencoded',
-    );
-    expect(request.url.queryParameters, isEmpty);
-    expect(request.bodyFields, <String, String>{
-      'access_token': 'test-token',
-      'content': base64Encode(bytes),
-      'message': 'sbox: add immutable object',
-    });
+    expect(ascii.decode(revision.bytes), 'release-asset:11:1');
+    expect(client.uploadRequests, 1);
   });
-
-  test('Gitee deletes files with form-encoded API parameters', () async {
-    final client = _RecordingClient();
-    final source = GiteeDataSource(
-      config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
-      client: client,
-      credentialStore: _CredentialStore(),
-      credentialId: SourceCredentialId('gitee-test-token'),
-    );
-
-    await source.deleteIfMatch(
-      SourcePath('0123456789abcdef0123456789abcdef-0-of-1.sbox'),
-      RevisionToken(ascii.encode('provider-revision')),
-    );
-
-    final request = client.deleteRequest;
-    expect(request, isNotNull);
-    expect(request!.method, 'DELETE');
-    expect(
-      request.headers['content-type'],
-      'application/x-www-form-urlencoded',
-    );
-    expect(request.headers['authorization'], isNull);
-    expect(request.bodyFields, <String, String>{
-      'access_token': 'test-token',
-      'message': 'sbox: delete immutable object',
-      'sha': 'provider-revision',
-    });
-  });
-
-  test(
-    'Gitee range reads tolerate a raw endpoint returning HTTP 200',
-    () async {
-      final client = _FullObjectRawClient();
-      final source = GiteeDataSource(
-        config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
-        client: client,
-      );
-
-      final read = await source.getRange(
-        SourcePath('0123456789abcdef0123456789abcdef-0-of-1.sbox'),
-        start: 1,
-        endExclusive: 3,
-        objectInfo: SourceObjectInfo(
-          path: SourcePath('0123456789abcdef0123456789abcdef-0-of-1.sbox'),
-          length: 0,
-          revision: RevisionToken(ascii.encode('revision')),
-          downloadUri: Uri.parse(
-            'https://gitee.com/zzp/sbox-files/raw/master/object.sbox',
-          ),
-        ),
-      );
-
-      expect(await read.body.expand((chunk) => chunk).toList(), <int>[2, 3]);
-      expect(client.metadataRequests, 0);
-      expect(
-        client.rawRequest?.url.path,
-        '/api/v5/repos/zzp/sbox-files/raw/0123456789abcdef0123456789abcdef-0-of-1.sbox',
-      );
-      expect(client.rawRequest?.url.queryParameters, isEmpty);
-    },
-  );
-
-  test(
-    'Gitee full reads bypass the large contents metadata response',
-    () async {
-      final client = _FullObjectRawClient();
-      final source = GiteeDataSource(
-        config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
-        client: client,
-      );
-
-      final read = await source.get(
-        SourcePath('0123456789abcdef0123456789abcdef-0-of-1.sbox'),
-      );
-
-      expect(await read.body.expand((chunk) => chunk).toList(), <int>[
-        1,
-        2,
-        3,
-        4,
-      ]);
-      expect(client.metadataRequests, 0);
-      expect(
-        client.rawRequest?.url.path,
-        '/api/v5/repos/zzp/sbox-files/raw/0123456789abcdef0123456789abcdef-0-of-1.sbox',
-      );
-    },
-  );
-
-  test(
-    'Gitee full reads tolerate raw responses without size or ETag headers',
-    () async {
-      final client = _FullObjectRawClient(omitRawHeaders: true);
-      final source = GiteeDataSource(
-        config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
-        client: client,
-      );
-
-      final read = await source.get(
-        SourcePath('0123456789abcdef0123456789abcdef-0-of-1.sbox'),
-      );
-
-      expect(await read.body.expand((chunk) => chunk).toList(), <int>[
-        1,
-        2,
-        3,
-        4,
-      ]);
-      expect(read.length, 4);
-      expect(ascii.decode(read.revision.bytes), startsWith('raw-sha256:'));
-    },
-  );
 }
+
+GiteeDataSource _source(_GiteeReleaseClient client) => GiteeDataSource(
+  config: RepositorySourceConfig(owner: 'zzp', repository: 'repo'),
+  client: client,
+  credentialStore: _CredentialStore(),
+  credentialId: SourceCredentialId('gitee-test-token'),
+);
 
 final class _CredentialStore implements CredentialStore {
   @override
@@ -232,140 +160,125 @@ final class _CredentialStore implements CredentialStore {
   ) async {}
 }
 
-final class _MissingSizeClient extends http.BaseClient {
-  http.BaseRequest? rawRequest;
+final class _AssetRecord {
+  _AssetRecord(this.id, this.name, this.bytes);
 
-  @override
-  Future<http.StreamedResponse> send(http.BaseRequest request) async {
-    if (request.url.path.contains('/raw/')) {
-      rawRequest = request;
-      return http.StreamedResponse(
-        Stream<List<int>>.value(const <int>[0]),
-        206,
-        contentLength: 1,
-        headers: const <String, String>{'content-range': 'bytes 0-0/16992'},
-        request: request,
-      );
-    }
-    return http.StreamedResponse(
-      Stream<List<int>>.value(
-        utf8.encode(
-          jsonEncode(<Object?>[
-            <String, Object?>{
-              'type': 'file',
-              'name': '0123456789abcdef0123456789abcdef.sbox',
-              'sha': 'revision',
-              'size': null,
-            },
-          ]),
-        ),
-      ),
-      200,
-      request: request,
-    );
-  }
+  final int id;
+  final String name;
+  final Uint8List bytes;
 }
 
-final class _RecordingClient extends http.BaseClient {
-  _RecordingClient({this.directoryEntries = const <Object?>[]});
-
-  final List<Object?> directoryEntries;
-  http.Request? createRequest;
-  http.Request? deleteRequest;
-  http.BaseRequest? readRequest;
-
-  @override
-  Future<http.StreamedResponse> send(http.BaseRequest request) async {
-    if (request.method == 'GET') {
-      readRequest = request;
-      if (request.url.path.contains('/raw/')) {
-        return http.StreamedResponse(
-          const Stream<List<int>>.empty(),
-          404,
-          request: request,
-        );
-      }
-      return http.StreamedResponse(
-        Stream<List<int>>.value(utf8.encode(jsonEncode(directoryEntries))),
-        200,
-        request: request,
-      );
-    }
-    if (request.method == 'DELETE') {
-      deleteRequest = request as http.Request;
-      return http.StreamedResponse(
-        const Stream<List<int>>.empty(),
-        204,
-        request: request,
-      );
-    }
-    createRequest = request as http.Request;
-    return http.StreamedResponse(
-      Stream<List<int>>.value(
-        utf8.encode('{"content":{"sha":"provider-revision"}}'),
-      ),
-      201,
-      headers: const <String, String>{'content-type': 'application/json'},
-      request: request,
-    );
-  }
-}
-
-final class _FullObjectRawClient extends http.BaseClient {
-  _FullObjectRawClient({this.omitRawHeaders = false});
-
-  final bool omitRawHeaders;
-  http.BaseRequest? rawRequest;
-  var metadataRequests = 0;
+final class _GiteeReleaseClient extends http.BaseClient {
+  final List<http.BaseRequest> requests = <http.BaseRequest>[];
+  final List<_AssetRecord> assets = <_AssetRecord>[];
+  var releaseExists = false;
+  var releaseCreateRequests = 0;
+  var uploadRequests = 0;
+  var deleteRequests = 0;
+  var return422AfterCommit = false;
+  var nextAssetId = 1;
+  Uint8List uploadedBytes = Uint8List(0);
+  int get releaseId => 11;
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
-    if (request.url.host == 'gitee.com' &&
-        request.url.path.contains('/api/v5/repos/') &&
-        request.url.path.contains('/contents/')) {
-      metadataRequests++;
-      return http.StreamedResponse(
-        Stream<List<int>>.value(
-          utf8.encode(
-            '{"type":"file","size":4,"sha":"revision",'
-            '"download_url":"https://gitee.com/zzp/sbox-files/raw/main/object.sbox"}',
-          ),
-        ),
-        200,
-        request: request,
-      );
+    requests.add(request);
+    final path = request.url.path;
+    if (request.method == 'GET' && path.endsWith('/releases/tags/latest')) {
+      return releaseExists
+          ? _json(request, _releaseJson())
+          : _json(request, null);
     }
-    if (request.url.host == 'gitee.com' && request.url.path.contains('/raw/')) {
-      rawRequest = request;
-      if (omitRawHeaders) {
-        return http.StreamedResponse(
-          Stream<List<int>>.value(Uint8List.fromList(<int>[1, 2, 3, 4])),
-          200,
-          request: request,
-        );
+    if (request.method == 'GET' && path == '/api/v5/repos/zzp/repo') {
+      return _json(request, <String, Object?>{'default_branch': 'master'});
+    }
+    if (request.method == 'POST' && path.endsWith('/releases')) {
+      releaseExists = true;
+      releaseCreateRequests++;
+      return _json(request, _releaseJson(), status: 201);
+    }
+    if (request.method == 'GET' && path.endsWith('/attach_files')) {
+      final page = int.parse(request.url.queryParameters['page'] ?? '1');
+      final perPage = int.parse(
+        request.url.queryParameters['per_page'] ?? '100',
+      );
+      final start = (page - 1) * perPage;
+      final values = start >= assets.length
+          ? <Object?>[]
+          : assets.skip(start).take(perPage).map(_assetJson).toList();
+      return _json(request, values);
+    }
+    if (request.method == 'POST' && path.endsWith('/attach_files')) {
+      uploadRequests++;
+      final multipart = request as http.MultipartRequest;
+      final file = multipart.files.single;
+      final chunks = await file.finalize().toList();
+      uploadedBytes = Uint8List.fromList(
+        chunks.expand((chunk) => chunk).toList(),
+      );
+      final record = _AssetRecord(nextAssetId++, file.filename!, uploadedBytes);
+      assets.removeWhere((asset) => asset.name == record.name);
+      assets.add(record);
+      if (return422AfterCommit) {
+        return _json(request, <String, Object?>{
+          'message': 'already exists',
+        }, status: 422);
       }
+      return _json(request, _assetJson(record), status: 201);
+    }
+    if (path.contains('/attach_files/') && path.endsWith('/download')) {
+      final assetId = int.parse(
+        path.split('/').elementAt(path.split('/').length - 2),
+      );
+      final matching = assets.where((asset) => asset.id == assetId);
+      if (matching.isEmpty) return _response(request, 404, const <int>[]);
+      final asset = matching.first;
       return http.StreamedResponse(
-        Stream<List<int>>.value(Uint8List.fromList(<int>[1, 2, 3, 4])),
+        Stream<List<int>>.value(asset.bytes),
         200,
-        contentLength: 4,
-        headers: const <String, String>{'etag': '"revision"'},
+        contentLength: asset.bytes.length,
         request: request,
       );
     }
-    if (request.url.host == 'gitee.com') {
-      return http.StreamedResponse(
-        const Stream<List<int>>.empty(),
-        302,
-        headers: const <String, String>{
-          'location': 'https://raw.giteeusercontent.com/zzp/sbox-files/raw/main/object.sbox',
-        },
-        request: request,
-      );
+    if (request.method == 'DELETE' && path.contains('/attach_files/')) {
+      deleteRequests++;
+      final assetId = int.parse(path.split('/').last);
+      assets.removeWhere((asset) => asset.id == assetId);
+      return _response(request, 204, const <int>[]);
     }
-    return http.StreamedResponse(
-      Stream<List<int>>.value(Uint8List.fromList(<int>[1, 2, 3, 4])),
-      200,
-      request: request,
-    );
+    return _response(request, 404, const <int>[]);
   }
+
+  Map<String, Object?> _releaseJson() => <String, Object?>{
+    'id': releaseId,
+    'tag_name': 'latest',
+    'name': 'latest',
+  };
+
+  Map<String, Object?> _assetJson(_AssetRecord asset) => <String, Object?>{
+    'id': asset.id,
+    'name': asset.name,
+    'size': asset.bytes.length,
+  };
+
+  http.StreamedResponse _json(
+    http.BaseRequest request,
+    Object? value, {
+    int status = 200,
+  }) => http.StreamedResponse(
+    Stream<List<int>>.value(utf8.encode(jsonEncode(value))),
+    status,
+    headers: const <String, String>{'content-type': 'application/json'},
+    request: request,
+  );
+
+  http.StreamedResponse _response(
+    http.BaseRequest request,
+    int status,
+    List<int> bytes,
+  ) => http.StreamedResponse(
+    Stream<List<int>>.value(bytes),
+    status,
+    request: request,
+  );
 }

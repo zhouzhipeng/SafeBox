@@ -18,6 +18,7 @@ import '../../sbox/source/cloud_backup_config.dart';
 import '../../sbox/source/credential.dart';
 import '../../sbox/source/gitee_source.dart';
 import '../../sbox/source/github_source.dart';
+import '../../sbox/storage/local_bundle_index.dart';
 import '../../sbox/storage/temporary_plaintext_store.dart';
 
 final class SettingsPage extends StatefulWidget {
@@ -578,7 +579,7 @@ final class _SettingsPageState extends State<SettingsPage> {
     return OutlinedButton.icon(
       onPressed: _clearTemporaryPlaintext,
       icon: const Icon(Icons.delete_outline),
-      label: const Text('清理临时文件'),
+      label: const Text('清理缓存'),
     );
   }
 
@@ -828,8 +829,8 @@ final class _SettingsPageState extends State<SettingsPage> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('清理临时文件？'),
-        content: const Text('这会删除已经准备好的临时文件，云端安全文件不会受到影响。'),
+        title: const Text('清理缓存？'),
+        content: const Text('这会删除已经准备好的临时文件、文件信息索引和缩略图缓存，云端安全文件和本地加密备份不会受到影响。'),
         actions: <Widget>[
           TextButton(
             onPressed: () => Navigator.of(context).pop(false),
@@ -843,14 +844,47 @@ final class _SettingsPageState extends State<SettingsPage> {
       ),
     );
     if (confirmed != true || !mounted) return;
+    final failures = <Object>[];
     try {
-      await TemporaryPlaintextPlatform.protectRoot(_temporaryStore.path);
-      await _temporaryStore.clearAll();
-      if (mounted) _showFeedback('临时文件已清理。');
+      try {
+        await TemporaryPlaintextPlatform.protectRoot(_temporaryStore.path);
+        await _temporaryStore.clearAll();
+      } on Object catch (error) {
+        failures.add(error);
+      }
+
+      CloudBackupConfiguration? configuration;
+      try {
+        configuration = await _configurationStore.load();
+      } on Object catch (error) {
+        failures.add(error);
+      }
+      final cacheRoots = <String>{
+        p.join(
+          Directory.systemTemp.path,
+          TemporaryPlaintextStore.defaultDirectoryName,
+          'backup',
+        ),
+        if (configuration != null) configuration.backupDirectory,
+      };
+      for (final root in cacheRoots) {
+        try {
+          await LocalBundleIndexStore.clearAll(Directory(root));
+        } on Object catch (error) {
+          failures.add(error);
+        }
+      }
+      PaintingBinding.instance.imageCache
+        ..clear()
+        ..clearLiveImages();
+      if (failures.isNotEmpty) {
+        throw StateError('One or more cache stores could not be cleared');
+      }
+      if (mounted) _showFeedback('缓存已清理。');
     } catch (error) {
       if (mounted) {
-        widget.controller.setError(error, operation: '清理临时文件失败');
-        _showFeedback('临时文件没有完全清理，请稍后重试。', error: true);
+        widget.controller.setError(error, operation: '清理缓存失败');
+        _showFeedback('缓存没有完全清理，请稍后重试。', error: true);
       }
     }
   }

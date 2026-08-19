@@ -48,10 +48,23 @@ void main() {
     expect(await store.loadLightTheme(), isTrue);
   });
 
+  test('preview details default to hidden and persist', () async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final preferences = await SharedPreferences.getInstance();
+    final store = AppSettingsStore(preferences: preferences);
+
+    expect(await store.loadShowPreviewAndDetails(), isFalse);
+
+    await store.saveShowPreviewAndDetails(true);
+
+    expect(await store.loadShowPreviewAndDetails(), isTrue);
+  });
+
   test('clear removes the stored shard size', () async {
     SharedPreferences.setMockInitialValues(<String, Object>{
       'sbox.v3.target_nominal_shard_plaintext_size': 8 * 1024 * 1024,
       'sbox.v3.light_theme': true,
+      'sbox.v3.show_preview_and_details': true,
     });
     final preferences = await SharedPreferences.getInstance();
     final store = AppSettingsStore(preferences: preferences);
@@ -63,5 +76,6 @@ void main() {
       SboxProtocol.defaultNominalShardPlaintextSize,
     );
     expect(await store.loadLightTheme(), isFalse);
+    expect(await store.loadShowPreviewAndDetails(), isFalse);
   });
 }

@@ -70,7 +70,7 @@ final class _SourcesPageState extends State<SourcesPage> {
       children: <Widget>[
         PageHeading(
           title: '双云 API 设置',
-          subtitle: 'GitHub 和 Gitee 是同一个 SafeBox 备份的两个 API 数据源；上传时逐个创建文件，不需要 pull 整个仓库。',
+          subtitle: 'GitHub 和 Gitee 是同一个 SafeBox 备份的两个 API 数据源；上传时按分片有限并发创建附件，不需要 pull 整个仓库。',
           trailing: ElevatedButton.icon(
             onPressed: _busy ? null : _save,
             icon: const Icon(Icons.save_outlined),
@@ -314,7 +314,7 @@ final class _SourcesPageState extends State<SourcesPage> {
       _githubTokenController.clear();
       _giteeTokenController.clear();
       widget.controller.setStatus(
-        '双云 API 配置已保存。上传时会按 Bundle 分片逐个调用 GitHub、Gitee API。',
+        '双云 API 配置已保存。上传时会按 Bundle 分片有限并发调用 GitHub、Gitee API。',
       );
     } catch (error) {
       if (mounted) widget.controller.setError(error, operation: '保存双云配置失败');

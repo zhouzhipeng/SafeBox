@@ -68,7 +68,8 @@ final class _DecryptPageState extends State<DecryptPage> {
           title: '从公开云下载解密',
           subtitle: '通过 GitHub 和 Gitee API 读取单个 Bundle；校验所有分片后才会写入本地明文目标。',
           trailing: ElevatedButton.icon(
-            onPressed: _busy ||
+            onPressed:
+                _busy ||
                     _loading ||
                     _pair == null ||
                     _pair!.enabledSources.isEmpty
@@ -293,7 +294,7 @@ final class _DecryptPageState extends State<DecryptPage> {
         '当前数据源不支持按 MD5 定位根对象',
       );
     }
-    final roots = await BundleListing.listRoots(source);
+    final roots = await BundleListing.listRoots(source, includePreview: false);
     final wanted = input.toLowerCase();
     final matches = roots
         .where((root) => hexLower(root.header.bundleId) == wanted)

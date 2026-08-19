@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
@@ -65,9 +66,11 @@ final class BundleDecryptionProgress {
 
 final class BundleDecryptor {
   BundleDecryptor({BundleRecordCodec? records})
-    : _records = records ?? BundleRecordCodec();
+    : _records = records ?? BundleRecordCodec(),
+      _canUseShardIsolates = records == null;
 
   final BundleRecordCodec _records;
+  final bool _canUseShardIsolates;
 
   /// Authenticates the root records and the Header Manifest without
   /// downloading or exposing continuation plaintext. This is the explicit
@@ -196,39 +199,21 @@ final class BundleDecryptor {
         overallAccumulator,
       );
       var overallLength = 0;
-      final heldShardPlaintexts = <Uint8List>[];
+      final shardPlaintexts = await _decryptShards(
+        parsed.objects,
+        bundleDek,
+        totalPlaintextBytes: totalPlaintextBytes,
+        onProgress: onProgress,
+      );
+      final heldShardPlaintexts = <Uint8List>[
+        for (final shardPlaintext in shardPlaintexts) shardPlaintext.bytes,
+      ];
       try {
         for (var index = 0; index < root.header.shardCount; index++) {
-          final result = await _decryptShard(
-            parsed.byIndex[index]!,
-            bundleDek,
-            overallHashSink,
-            onChunkDecrypted: (bytes) => _emitProgress(
-              onProgress,
-              BundleDecryptionProgress(
-                stage: BundleDecryptionStage.decrypting,
-                processedBytes: overallLength + bytes,
-                totalBytes: totalPlaintextBytes,
-                completedShards: index,
-                totalShards: root.header.shardCount,
-                currentShardIndex: index,
-              ),
-            ),
-          );
-          heldShardPlaintexts.add(result.bytes);
+          final result = shardPlaintexts[index];
+          overallHashSink.add(result.bytes);
           output.add(result.bytes);
           overallLength += result.length;
-          _emitProgress(
-            onProgress,
-            BundleDecryptionProgress(
-              stage: BundleDecryptionStage.decrypting,
-              processedBytes: overallLength,
-              totalBytes: totalPlaintextBytes,
-              completedShards: index + 1,
-              totalShards: root.header.shardCount,
-              currentShardIndex: index,
-            ),
-          );
         }
       } catch (_) {
         for (final shardPlaintext in heldShardPlaintexts) {
@@ -283,13 +268,18 @@ final class BundleDecryptor {
           totalShards: root.header.shardCount,
         ),
       );
-      return DecryptedBundle(
+      final decrypted = DecryptedBundle(
         manifest: manifest,
         rootHeader: root.header,
         plaintext: plaintext,
         preview: fast.preview,
         status: BundleTrustStatus.complete,
       );
+      plaintext.fillRange(0, plaintext.length, 0);
+      for (final shardPlaintext in heldShardPlaintexts) {
+        shardPlaintext.fillRange(0, shardPlaintext.length, 0);
+      }
+      return decrypted;
     } on SboxException {
       rethrow;
     } catch (_) {
@@ -512,10 +502,7 @@ final class BundleDecryptor {
         identity.disposeControlledSecrets();
         identity = null;
       }
-      final accumulator = HashDigestSink();
-      final sink = crypto.sha256.startChunkedConversion(accumulator);
-      final plaintext = await _decryptShard(root, bundleDek, sink);
-      sink.close();
+      final plaintext = await _decryptShard(root, bundleDek);
       plaintext.bytes.fillRange(0, plaintext.bytes.length, 0);
       return BundleProbeResult(
         basename: fast.basename,
@@ -558,12 +545,95 @@ final class BundleDecryptor {
     }
   }
 
+  /// Decrypts independent shards concurrently, but leaves the overall hash
+  /// and plaintext publication to the caller so they can remain ordered.
+  Future<List<_ShardPlaintext>> _decryptShards(
+    List<_ParsedObject> objects,
+    List<int> bundleDek, {
+    required int totalPlaintextBytes,
+    void Function(BundleDecryptionProgress progress)? onProgress,
+  }) async {
+    if (objects.isEmpty) return <_ShardPlaintext>[];
+    final results = List<_ShardPlaintext?>.filled(objects.length, null);
+    final workerCount = _shardWorkerCount(objects.length);
+    var nextIndex = 0;
+    var completedShards = 0;
+    var processedBytes = 0;
+
+    Future<void> worker() async {
+      while (true) {
+        if (nextIndex >= objects.length) return;
+        final index = nextIndex++;
+        final object = objects[index];
+        final result = _canUseShardIsolates
+            ? await _decryptShardInIsolate(object, bundleDek)
+            : await _decryptShard(object, bundleDek);
+        results[index] = result;
+        completedShards++;
+        processedBytes += result.length;
+        _emitProgress(
+          onProgress,
+          BundleDecryptionProgress(
+            stage: BundleDecryptionStage.decrypting,
+            processedBytes: processedBytes,
+            totalBytes: totalPlaintextBytes,
+            completedShards: completedShards,
+            totalShards: objects.length,
+            currentShardIndex: object.header.shardIndex,
+          ),
+        );
+      }
+    }
+
+    try {
+      await Future.wait(<Future<void>>[
+        for (var index = 0; index < workerCount; index++) worker(),
+      ]);
+      return <_ShardPlaintext>[for (final result in results) result!];
+    } catch (_) {
+      _wipeNullableShardPlaintexts(results);
+      rethrow;
+    }
+  }
+
+  int _shardWorkerCount(int shardCount) {
+    final processorCount = Platform.numberOfProcessors;
+    final parallelism = processorCount < 2
+        ? 1
+        : processorCount > 4
+        ? 4
+        : processorCount;
+    return parallelism > shardCount ? shardCount : parallelism;
+  }
+
+  Future<_ShardPlaintext> _decryptShardInIsolate(
+    _ParsedObject object,
+    List<int> bundleDek,
+  ) async {
+    final request = _ShardDecryptRequest(
+      basename: object.basename,
+      bytes: TransferableTypedData.fromList(<TypedData>[object.bytes]),
+      bundleDek: Uint8List.fromList(bundleDek),
+    );
+    final response = await Isolate.run<_TransferredShardPlaintext>(
+      () => _decryptShardWorker(request),
+      debugName: 'safebox-decrypt-shard-${object.header.shardIndex}',
+    );
+    final bytes = response.bytes.materialize().asUint8List();
+    if (bytes.length != response.length) {
+      bytes.fillRange(0, bytes.length, 0);
+      throw const SboxException(
+        SboxErrorCode.authentication,
+        'Bundle 鍒嗙墖瑙ｅ瘑缁撴灉鏃犳晥',
+      );
+    }
+    return _ShardPlaintext(bytes: bytes, length: response.length);
+  }
+
   Future<_ShardPlaintext> _decryptShard(
     _ParsedObject object,
     List<int> bundleDek,
-    ByteConversionSink overallHashSink, {
-    void Function(int bytes)? onChunkDecrypted,
-  }) async {
+  ) async {
     final header = object.header;
     final headerHash = sha256Bytes(header.rawBytes);
     final shardKey = ShardKdf.derive(
@@ -655,13 +725,11 @@ final class BundleDecryptor {
             );
           }
           shardHashSink.add(plaintext);
-          overallHashSink.add(plaintext);
           final verifiedChunk = Uint8List.fromList(plaintext);
           heldChunks.add(verifiedChunk);
           output.add(verifiedChunk);
           dataLength += plaintext.length;
           dataCount++;
-          onChunkDecrypted?.call(plaintext.length);
           sawShort = plaintext.length < SboxProtocol.chunkSize;
         } finally {
           plaintext.fillRange(0, plaintext.length, 0);
@@ -689,6 +757,59 @@ final class BundleDecryptor {
     } on Object {
       // Progress listeners must never be able to interrupt decryption.
     }
+  }
+}
+
+final class _ShardDecryptRequest {
+  const _ShardDecryptRequest({
+    required this.basename,
+    required this.bytes,
+    required this.bundleDek,
+  });
+
+  final String basename;
+  final TransferableTypedData bytes;
+  final Uint8List bundleDek;
+}
+
+final class _TransferredShardPlaintext {
+  const _TransferredShardPlaintext({required this.bytes, required this.length});
+
+  final TransferableTypedData bytes;
+  final int length;
+}
+
+Future<_TransferredShardPlaintext> _decryptShardWorker(
+  _ShardDecryptRequest request,
+) async {
+  final shardBytes = request.bytes.materialize().asUint8List();
+  try {
+    final header = BundleHeader.parse(shardBytes);
+    final parsed = _ParsedObject(
+      request.basename,
+      shardBytes,
+      header,
+      parseCanonicalBundleBasename(request.basename),
+    );
+    final plaintext = await BundleDecryptor()._decryptShard(
+      parsed,
+      request.bundleDek,
+    );
+    final transferred = TransferableTypedData.fromList(<TypedData>[
+      plaintext.bytes,
+    ]);
+    final length = plaintext.length;
+    plaintext.bytes.fillRange(0, plaintext.bytes.length, 0);
+    return _TransferredShardPlaintext(bytes: transferred, length: length);
+  } finally {
+    shardBytes.fillRange(0, shardBytes.length, 0);
+    request.bundleDek.fillRange(0, request.bundleDek.length, 0);
+  }
+}
+
+void _wipeNullableShardPlaintexts(List<_ShardPlaintext?> values) {
+  for (final value in values) {
+    value?.bytes.fillRange(0, value.bytes.length, 0);
   }
 }
 

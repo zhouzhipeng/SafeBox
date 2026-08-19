@@ -20,6 +20,8 @@ final class SourceCapabilities {
   final bool canListObjects;
   final bool supportsRangeRead;
   final int? maxObjectBytes;
+
+  /// Maximum number of simultaneous reads or writes for this source.
   final int maxParallelTransfers;
 }
 
