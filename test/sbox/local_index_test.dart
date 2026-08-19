@@ -64,6 +64,39 @@ void main() {
           isTrue,
         );
         expect(await store.previewFile(manifest.bundleId).exists(), isTrue);
+        expect(
+          store.previewDirectory.path,
+          p.join(root.path, '.sbox-sync', 'previews'),
+        );
+        final previewEntities = await store.previewDirectory
+            .list(followLinks: false)
+            .toList();
+        expect(previewEntities, hasLength(1));
+        expect(
+          previewEntities.single.path,
+          store.previewFile(manifest.bundleId).path,
+        );
+
+        // Preview storage is shared by source-specific indexes. Saving the
+        // same immutable Bundle through another index must not create a
+        // second directory or a second JPG.
+        final otherStore = LocalBundleIndexStore(
+          root,
+          fileName: 'index-github-v3.json',
+        );
+        await otherStore.save(index);
+        expect(
+          otherStore.previewFile(manifest.bundleId).path,
+          store.previewFile(manifest.bundleId).path,
+        );
+        expect(
+          await store.previewDirectory
+              .list(followLinks: false)
+              .where((entity) => entity is File)
+              .length,
+          1,
+        );
+
         final loaded = await store.load(expectedSourceId: index.sourceId);
         expect(loaded?.entries.single.manifest.originalName, 'sample.bin');
         expect(loaded?.entries.single.hasCachedPreview, isTrue);
@@ -102,6 +135,94 @@ void main() {
         expect(await store.file.exists(), isFalse);
         expect(await store.previewDirectory.exists(), isFalse);
         expect(await encryptedBundle.exists(), isTrue);
+      } finally {
+        loadedPreview?.dispose();
+        preview?.dispose();
+        if (await root.exists()) await root.delete(recursive: true);
+      }
+    },
+  );
+
+  test(
+    'reads a legacy multi-file preview directory and flattens it on save',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'sbox-v3-preview-migration-',
+      );
+      BundlePreview? preview;
+      BundlePreview? loadedPreview;
+      try {
+        final bundleId = '1234567890abcdef1234567890abcdef';
+        final manifest = BundleManifest(
+          bundleId: bundleId,
+          recipientKeyId: '20' * 32,
+          contentKind: SboxContentKind.file,
+          originalName: 'legacy.bin',
+          mediaType: 'application/octet-stream',
+          title: 'legacy.bin',
+          description: '',
+          tags: const <String>[],
+          createdAt: '2026-08-17T00:00:00Z',
+          logicalPlaintextSize: BigInt.zero,
+          logicalPlaintextSha256: List<int>.filled(32, 0),
+          nominalShardPlaintextSize: 16 * 1024 * 1024,
+          shardCount: 1,
+        );
+        final image = img.Image(width: 4, height: 3);
+        preview = BundlePreview(
+          codec: BundlePreviewCodec.baselineJpeg,
+          width: image.width,
+          height: image.height,
+          encodedBytes: img.encodeJpg(image, quality: 80),
+        );
+        final index = LocalBundleIndex(
+          sourceId: 'fedcba9876543210fedcba9876543210',
+          entries: <LocalBundleIndexEntry>[
+            LocalBundleIndexEntry(
+              bundleId: bundleId,
+              rootBasename: '$bundleId.sbox',
+              rootRevisionFingerprint: 'legacy-revision',
+              manifestPrefixSha256: hexLower(List<int>.filled(32, 0x33)),
+              verification: BundleVerification.complete,
+              manifest: manifest,
+              hasPreview: true,
+              preview: preview,
+            ),
+          ],
+        );
+        final store = LocalBundleIndexStore(root);
+        await Directory(p.join(store.previewDirectory.path, bundleId))
+            .create(recursive: true);
+        await File(
+          p.join(store.previewDirectory.path, bundleId, 'candidate-a.jpg'),
+        ).writeAsBytes(<int>[1, 2, 3]);
+        await File(
+          p.join(store.previewDirectory.path, bundleId, 'candidate-b.jpg'),
+        ).writeAsBytes(preview.encodedBytes);
+        await store.file.parent.create(recursive: true);
+        await store.file.writeAsString(index.encode());
+
+        final loaded = await store.load(
+          expectedSourceId: index.sourceId,
+          includePreviews: true,
+        );
+        loadedPreview = loaded?.entries.single.preview;
+        expect(loadedPreview?.encodedBytes, preview.encodedBytes);
+
+        await store.save(loaded!);
+        expect(await store.previewFile(bundleId).exists(), isTrue);
+        expect(
+          await Directory(p.join(store.previewDirectory.path, bundleId))
+              .exists(),
+          isFalse,
+        );
+        expect(
+          await store.previewDirectory
+              .list(followLinks: false)
+              .where((entity) => entity is File)
+              .length,
+          1,
+        );
       } finally {
         loadedPreview?.dispose();
         preview?.dispose();

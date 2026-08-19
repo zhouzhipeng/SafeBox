@@ -305,14 +305,13 @@ final class LocalBundleIndexStore {
   Directory get _syncDirectory =>
       Directory(p.join(cipherRoot.path, '.sbox-sync'));
 
-  Directory get previewDirectory => Directory(
-    p.join(
-      _syncDirectory.path,
-      'previews',
-      hexLower(crypto.sha256.convert(utf8.encode(fileName)).bytes)
-          .substring(0, 32),
-    ),
-  );
+  /// All preview bytes are content-addressed by Bundle ID.
+  ///
+  /// A Bundle ID is immutable, so the same preview is shareable by every
+  /// source index. Keeping one flat directory also prevents each source
+  /// index from creating a second copy of the same preview.
+  Directory get previewDirectory =>
+      Directory(p.join(_syncDirectory.path, 'previews'));
 
   File get file => File(p.join(_syncDirectory.path, fileName));
 
@@ -350,14 +349,20 @@ final class LocalBundleIndexStore {
     SourceIdValidator.validate(index.sourceId);
     final directory = _syncDirectory;
     await directory.create(recursive: true);
-    final expectedPreviewNames = <String>{};
     for (final entry in index.entries) {
       if (!entry.hasCachedPreview) continue;
-      final previewName = '${entry.bundleId}.jpg';
-      expectedPreviewNames.add(previewName);
-      final preview = entry.preview;
+      var preview = entry.preview;
+      var loadedForMigration = false;
+      if (preview == null) {
+        preview = await _loadPreview(entry);
+        loadedForMigration = preview != null;
+      }
       if (preview != null) {
-        await _savePreview(entry.bundleId, preview);
+        try {
+          await _savePreview(entry.bundleId, preview);
+        } finally {
+          if (loadedForMigration) preview.dispose();
+        }
       }
     }
     final stage = File(
@@ -371,7 +376,12 @@ final class LocalBundleIndexStore {
       final target = file;
       if (await target.exists()) await target.delete();
       await stage.rename(target.path);
-      await _deleteStalePreviews(expectedPreviewNames);
+      // Older builds used one directory per index (and an earlier prototype
+      // used one directory per Bundle ID). Both layouts can contain several
+      // copies of an immutable preview. Once the current index has been
+      // published, remove those legacy directories; flat preview files are
+      // shared by all source indexes and must not be pruned by one index.
+      await _deleteLegacyPreviewDirectories();
     } finally {
       if (await stage.exists()) await stage.delete();
     }
@@ -379,7 +389,9 @@ final class LocalBundleIndexStore {
 
   Future<void> clear() async {
     if (await file.exists()) await file.delete();
-    await _deleteEntityNoFollow(previewDirectory);
+    // Flat previews are shared by all source indexes. Removing one index
+    // must not remove a preview that another source still references.
+    await _deleteEntityNoFollow(_legacyPreviewNamespaceDirectory);
   }
 
   /// Removes all metadata JSON and cached JPG files owned by SafeBox below
@@ -428,7 +440,26 @@ final class LocalBundleIndexStore {
 
   Future<BundlePreview?> _loadPreview(LocalBundleIndexEntry entry) async {
     if (!entry.hasCachedPreview) return null;
-    final target = previewFile(entry.bundleId);
+    final flatPreview = await _loadPreviewFile(
+      previewFile(entry.bundleId),
+      entry,
+    );
+    if (flatPreview != null) return flatPreview;
+
+    // Read-only compatibility for caches created before the flat layout.
+    // The index stores the JPEG digest, so among any old video candidates we
+    // can select the one that belongs to this immutable Bundle.
+    for (final legacyFile in await _legacyPreviewFiles(entry.bundleId)) {
+      final preview = await _loadPreviewFile(legacyFile, entry);
+      if (preview != null) return preview;
+    }
+    return null;
+  }
+
+  Future<BundlePreview?> _loadPreviewFile(
+    File target,
+    LocalBundleIndexEntry entry,
+  ) async {
     if (await FileSystemEntity.type(target.path, followLinks: false) !=
         FileSystemEntityType.file) {
       return null;
@@ -459,6 +490,47 @@ final class LocalBundleIndexStore {
     }
   }
 
+  Future<List<File>> _legacyPreviewFiles(String bundleId) async {
+    final files = <File>[];
+
+    // Layout used by the immediately preceding implementation:
+    // previews/<sha256(index file)>/<bundle id>.jpg
+    final namespacedFile = File(
+      p.join(_legacyPreviewNamespaceDirectory.path, '$bundleId.jpg'),
+    );
+    if (await FileSystemEntity.type(namespacedFile.path, followLinks: false) ==
+        FileSystemEntityType.file) {
+      files.add(namespacedFile);
+    }
+
+    // Layout used by the original preview-candidate cache:
+    // previews/<bundle id>/<candidate>.jpg
+    final bundleDirectory = Directory(p.join(previewDirectory.path, bundleId));
+    if (await FileSystemEntity.type(bundleDirectory.path, followLinks: false) ==
+        FileSystemEntityType.directory) {
+      await for (final entity in bundleDirectory.list(followLinks: false)) {
+        if (files.length >= _maxLegacyPreviewCandidates) break;
+        if (p.extension(entity.path).toLowerCase() != '.jpg') continue;
+        if (await FileSystemEntity.type(entity.path, followLinks: false) !=
+            FileSystemEntityType.file) {
+          continue;
+        }
+        files.add(File(entity.path));
+      }
+    }
+    return files;
+  }
+
+  Directory get _legacyPreviewNamespaceDirectory => Directory(
+    p.join(
+      previewDirectory.path,
+      hexLower(crypto.sha256.convert(utf8.encode(fileName)).bytes)
+          .substring(0, 32),
+    ),
+  );
+
+  static const _maxLegacyPreviewCandidates = 256;
+
   Future<void> _savePreview(String bundleId, BundlePreview preview) async {
     final bytes = preview.encodedBytes;
     try {
@@ -467,6 +539,10 @@ final class LocalBundleIndexStore {
         width: preview.width,
         height: preview.height,
       );
+      final target = previewFile(bundleId);
+      // Bundle previews are immutable. Avoid rewriting the same shared file
+      // every time another source index is refreshed.
+      if (await _previewFileMatches(target, bytes)) return;
       await previewDirectory.create(recursive: true);
       final stage = File(
         p.join(
@@ -476,9 +552,30 @@ final class LocalBundleIndexStore {
       );
       try {
         await stage.writeAsBytes(bytes, flush: true);
-        final target = previewFile(bundleId);
-        if (await target.exists()) await target.delete();
-        await stage.rename(target.path);
+        final targetType = await FileSystemEntity.type(
+          target.path,
+          followLinks: false,
+        );
+        if (targetType == FileSystemEntityType.file ||
+            targetType == FileSystemEntityType.link) {
+          await _deleteEntityNoFollow(target);
+        } else if (targetType != FileSystemEntityType.notFound) {
+          throw FileSystemException(
+            'Preview target is not a file',
+            target.path,
+          );
+        }
+        try {
+          await stage.rename(target.path);
+        } on FileSystemException {
+          // Two source indexes can publish the same immutable Bundle at the
+          // same time. If another writer won the rename, keep its one shared
+          // file instead of failing the entire metadata-cache save.
+          if (await FileSystemEntity.type(target.path, followLinks: false) !=
+              FileSystemEntityType.file) {
+            rethrow;
+          }
+        }
       } finally {
         if (await stage.exists()) await stage.delete();
       }
@@ -487,7 +584,28 @@ final class LocalBundleIndexStore {
     }
   }
 
-  Future<void> _deleteStalePreviews(Set<String> expectedNames) async {
+  Future<bool> _previewFileMatches(File target, Uint8List expected) async {
+    if (await FileSystemEntity.type(target.path, followLinks: false) !=
+        FileSystemEntityType.file) {
+      return false;
+    }
+    Uint8List? existing;
+    try {
+      final length = await target.length();
+      if (length != expected.length) return false;
+      existing = await target.readAsBytes();
+      return constantTimeBytesEqual(
+        crypto.sha256.convert(existing).bytes,
+        crypto.sha256.convert(expected).bytes,
+      );
+    } on Object {
+      return false;
+    } finally {
+      existing?.fillRange(0, existing.length, 0);
+    }
+  }
+
+  Future<void> _deleteLegacyPreviewDirectories() async {
     if (await FileSystemEntity.type(
           previewDirectory.path,
           followLinks: false,
@@ -497,11 +615,9 @@ final class LocalBundleIndexStore {
     }
     await for (final entity in previewDirectory.list(followLinks: false)) {
       final type = await FileSystemEntity.type(entity.path, followLinks: false);
-      if (type != FileSystemEntityType.file) continue;
-      final name = p.basename(entity.path);
-      if ((name.endsWith('.jpg') && !expectedNames.contains(name)) ||
-          name.endsWith('.part')) {
-        await File(entity.path).delete();
+      if (type == FileSystemEntityType.directory ||
+          type == FileSystemEntityType.link) {
+        await _deleteEntityNoFollow(entity);
       }
     }
   }

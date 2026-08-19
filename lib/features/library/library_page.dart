@@ -290,12 +290,12 @@ final class _LibraryPageState extends State<LibraryPage> {
                     : _setGeneratePreview,
                 contentPadding: EdgeInsets.zero,
                 secondary: const Icon(Icons.image_outlined),
-                subtitle: const Text('图片/视频专用；持完整公钥可读缩略图。'),
+                title: const Text('嵌入缩略图；图片/视频文件专用'),
               ),
             ),
             _buildVideoPreviewPicker(context),
             const SizedBox(height: 8),
-            _buildShardSizeControl(context, mobile),
+            _buildShardSizeControl(context),
             if (_busy) ...<Widget>[
               const SizedBox(height: 18),
               Text(
@@ -529,11 +529,11 @@ final class _LibraryPageState extends State<LibraryPage> {
     );
   }
 
-  Widget _buildShardSizeControl(BuildContext context, bool mobile) {
+  Widget _buildShardSizeControl(BuildContext context) {
     final megabytes = _targetNominalShardPlaintextSize ~/ _mebibyte;
     final disabled = _busy || _savingShardSize;
     return SizedBox(
-      width: mobile ? 292 : 250,
+      width: double.infinity,
       child: Container(
         padding: const EdgeInsets.fromLTRB(12, 10, 12, 7),
         decoration: BoxDecoration(
@@ -573,18 +573,24 @@ final class _LibraryPageState extends State<LibraryPage> {
               style: Theme.of(context).textTheme.bodySmall
                   ?.copyWith(color: context.sboxColors.textMuted),
             ),
-            Slider(
-              value: megabytes.toDouble(),
-              min: 1,
-              max: 512,
-              divisions: 511,
-              label: '$megabytes MB',
-              onChanged: disabled ? null : _handleShardSizeChanged,
-              onChangeEnd: disabled
-                  ? null
-                  : (value) {
-                      _saveShardSize(value);
-                    },
+            SizedBox(
+              width: double.infinity,
+              child: Slider(
+                // Keep the original 48px vertical layout while removing the
+                // default horizontal inset from the track.
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                value: megabytes.toDouble(),
+                min: 1,
+                max: 512,
+                divisions: 511,
+                label: '$megabytes MB',
+                onChanged: disabled ? null : _handleShardSizeChanged,
+                onChangeEnd: disabled
+                    ? null
+                    : (value) {
+                        _saveShardSize(value);
+                      },
+              ),
             ),
             const Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,

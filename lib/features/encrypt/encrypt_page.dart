@@ -155,7 +155,7 @@ final class _EncryptPageState extends State<EncryptPage> {
                   onChanged: _busy ? null : _setGeneratePreview,
                   contentPadding: EdgeInsets.zero,
                   secondary: const Icon(Icons.image_outlined),
-                  subtitle: const Text('图片/视频专用；持完整公钥可读缩略图。'),
+                  title: const Text('嵌入缩略图；图片/视频文件专用'),
                 ),
                 _buildVideoPreviewPicker(context),
               ] else ...<Widget>[
