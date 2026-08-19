@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui' show PointerDeviceKind;
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
@@ -19,6 +21,7 @@ import '../../platform/preview_generation_result.dart';
 import '../../platform/preview_generator.dart';
 import '../../platform/secure_credential_store.dart';
 import '../../platform/temporary_plaintext_platform.dart';
+import '../../platform/video_poster_decoder.dart';
 import '../../sbox/bytes.dart';
 import '../../sbox/constants.dart';
 import '../../sbox/engine/bundle_probe.dart';
@@ -34,8 +37,10 @@ import '../../sbox/source/bundle_sync.dart';
 import '../../sbox/source/cloud_backup_config.dart';
 import '../../sbox/source/cloud_bundle_uploader.dart';
 import '../../sbox/source/cloud_repository_pair.dart';
+import '../../sbox/source/credential.dart';
 import '../../sbox/source/data_source.dart';
 import '../../sbox/source/local_directory_source.dart';
+import '../../sbox/source/source_path.dart';
 import '../../sbox/storage/temporary_plaintext_store.dart';
 
 final class LibraryPage extends StatefulWidget {
@@ -43,22 +48,27 @@ final class LibraryPage extends StatefulWidget {
     super.key,
     required this.controller,
     this.onOpenCloudSettings,
+    this.videoPosterDecoder = const FlutterVideoPosterDecoder(),
   });
 
   final AppController controller;
   final VoidCallback? onOpenCloudSettings;
+  final VideoPosterDecoder videoPosterDecoder;
 
   @override
   State<LibraryPage> createState() => _LibraryPageState();
 }
 
 final class _LibraryPageState extends State<LibraryPage> {
+  static const _initialListingCount = 5;
+
   final _configurationStore = CloudBackupConfigurationStore();
   final _credentialStore = PlatformCredentialStore();
   final _temporaryStore = TemporaryPlaintextStore();
   final _searchController = TextEditingController();
   final _descriptionController = TextEditingController();
   List<_LibraryBundle> _bundles = const <_LibraryBundle>[];
+  Map<String, int> _encryptedBytesBySource = const <String, int>{};
   http.Client? _client;
   CloudBackupConfiguration? _configuration;
   XFile? _selectedFile;
@@ -66,17 +76,36 @@ final class _LibraryPageState extends State<LibraryPage> {
   bool _credentialsReady = false;
   bool _busy = true;
   bool _loading = true;
+  bool _listingInBackground = false;
+  bool _scanQueued = false;
+  int _scanGeneration = 0;
   bool _dragging = false;
   bool _generatePreview = true;
+  final List<BundlePreview> _videoPreviewCandidates = <BundlePreview>[];
+  int _selectedVideoPreviewIndex = 0;
+  bool _videoFileDetected = false;
+  bool _videoPreviewLoading = false;
+  String? _videoPreviewError;
+  String _videoPreviewMediaType = 'video/mp4';
+  int _videoPreviewRequestId = 0;
+  int _targetNominalShardPlaintextSize =
+      SboxProtocol.defaultNominalShardPlaintextSize;
+  bool _savingShardSize = false;
+  int? _shardSizeBeforeDrag;
   _LibrarySource _selectedSource = _LibrarySource.github;
   String _busyTitle = '正在读取文件';
   String _busyDetail = '正在同步你的安全文件。';
   CloudBundleUploadProgress? _uploadProgress;
+  CloudBundleUploadCancellation? _uploadCancellation;
+  http.Client? _uploadClient;
+  bool _uploadCancelRequested = false;
   BundleDownloadProgress? _downloadProgress;
 
   @override
   void initState() {
     super.initState();
+    _targetNominalShardPlaintextSize =
+        widget.controller.targetNominalShardPlaintextSize;
     PaintingBinding.instance.imageCache.maximumSizeBytes =
         SboxProtocol.maxRetainedPreviewBytes;
     _load();
@@ -84,6 +113,9 @@ final class _LibraryPageState extends State<LibraryPage> {
 
   @override
   void dispose() {
+    _uploadCancellation?.cancel();
+    _uploadClient?.close();
+    _disposeVideoPreviewCandidates();
     _searchController.dispose();
     _descriptionController.clear();
     _descriptionController.dispose();
@@ -152,17 +184,19 @@ final class _LibraryPageState extends State<LibraryPage> {
     return _DashedDropTarget(
       dragging: _dragging,
       onDragEntered: () {
-        if (!_busy && mounted) setState(() => _dragging = true);
+        if (!_busy && !_savingShardSize && mounted) {
+          setState(() => _dragging = true);
+        }
       },
       onDragExited: () {
         if (mounted) setState(() => _dragging = false);
       },
       onDragDone: (files) async {
-        if (_busy) return;
+        if (_busy || _savingShardSize) return;
         if (mounted) setState(() => _dragging = false);
         if (files.isNotEmpty) await _setFile(files.first);
       },
-      onTap: _busy ? null : _pickFile,
+      onTap: _busy || _savingShardSize ? null : _pickFile,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 140),
         constraints: BoxConstraints(minHeight: mobile ? 452 : 454),
@@ -189,7 +223,7 @@ final class _LibraryPageState extends State<LibraryPage> {
             SizedBox(
               width: mobile ? 292 : 250,
               child: ElevatedButton.icon(
-                onPressed: _busy
+                onPressed: _busy || _savingShardSize
                     ? null
                     : (_selectedFile == null ? _pickFile : _upload),
                 icon: Icon(
@@ -206,7 +240,7 @@ final class _LibraryPageState extends State<LibraryPage> {
             const SizedBox(height: 22),
             TextField(
               controller: _descriptionController,
-              enabled: !_busy,
+              enabled: !_busy && !_savingShardSize,
               minLines: 3,
               maxLines: 3,
               keyboardType: TextInputType.multiline,
@@ -219,13 +253,14 @@ final class _LibraryPageState extends State<LibraryPage> {
             const SizedBox(height: 8),
             SwitchListTile(
               value: _generatePreview,
-              onChanged: _busy
-                  ? null
-                  : (value) => setState(() => _generatePreview = value),
+              onChanged: _busy || _savingShardSize ? null : _setGeneratePreview,
               contentPadding: EdgeInsets.zero,
               secondary: const Icon(Icons.image_outlined),
               subtitle: const Text('仅上传图片或视频时生效；持有完整公钥的人可以读取缩略图，完整文件仍需验证。'),
             ),
+            _buildVideoPreviewPicker(context),
+            const SizedBox(height: 8),
+            _buildShardSizeControl(context, mobile),
             if (_busy) ...<Widget>[
               const SizedBox(height: 18),
               Text(
@@ -241,19 +276,14 @@ final class _LibraryPageState extends State<LibraryPage> {
 
   Widget _buildFileSelectionHint(BuildContext context) {
     final file = _selectedFile;
-    final textStyle = Theme.of(context).textTheme.bodyLarge?.copyWith(
-      color: _busy ? SboxColors.textDim : SboxColors.textMuted,
-    );
+    final textStyle = Theme.of(context).textTheme.bodyLarge
+        ?.copyWith(color: _busy ? SboxColors.textDim : SboxColors.textMuted);
     if (file == null) {
-      return Text(
-        '文件会自动安全保存',
-        style: textStyle,
-        textAlign: TextAlign.center,
-      );
+      return Text('文件会自动安全保存', style: textStyle, textAlign: TextAlign.center);
     }
 
     return TextButton(
-      onPressed: _busy ? null : _pickFile,
+      onPressed: _busy || _savingShardSize ? null : _pickFile,
       style: TextButton.styleFrom(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         minimumSize: Size.zero,
@@ -267,8 +297,297 @@ final class _LibraryPageState extends State<LibraryPage> {
     );
   }
 
+  Widget _buildVideoPreviewPicker(BuildContext context) {
+    final selectedFile = _selectedFile;
+    final selectedFileLooksLikeVideo =
+        selectedFile != null &&
+        (_looksLikeVideoFile(selectedFile.name) ||
+            _looksLikeVideoFile(selectedFile.path));
+    if (!_generatePreview ||
+        (!_videoFileDetected && !selectedFileLooksLikeVideo)) {
+      return const SizedBox.shrink();
+    }
+
+    final candidates = _videoPreviewCandidates;
+    final selectedIndex = candidates.isEmpty
+        ? 0
+        : _selectedVideoPreviewIndex.clamp(0, candidates.length - 1).toInt();
+    final detail = _videoPreviewLoading
+        ? '正在随机抽取视频画面，请稍候。'
+        : candidates.isEmpty
+        ? (_videoPreviewError ?? '暂时无法提取候选画面，上传时会继续尝试生成默认缩略图。')
+        : '已随机抽取 ${candidates.length} 个画面，默认使用第 1 个；点击下方画面即可更换。';
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: SizedBox(
+        key: const ValueKey<String>('library-video-preview-picker'),
+        width: double.infinity,
+        child: SboxCard(
+          padding: const EdgeInsets.fromLTRB(14, 13, 14, 14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Row(
+                children: <Widget>[
+                  const Icon(Icons.video_library_outlined, size: 20),
+                  const SizedBox(width: 9),
+                  Expanded(
+                    child: Text(
+                      '选择视频缩略图',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                  ),
+                  if (candidates.isNotEmpty)
+                    Text(
+                      '第 ${selectedIndex + 1} 帧',
+                      style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                        color: SboxColors.accent,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 7),
+              Text(
+                detail,
+                style: Theme.of(context).textTheme.bodyMedium
+                    ?.copyWith(color: SboxColors.textMuted),
+              ),
+              if (_videoPreviewLoading) ...<Widget>[
+                const SizedBox(height: 12),
+                const LinearProgressIndicator(minHeight: 4),
+              ],
+              if (candidates.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 14),
+                SizedBox(
+                  height: 112,
+                  child: ScrollConfiguration(
+                    behavior: ScrollConfiguration.of(context).copyWith(
+                      dragDevices: <PointerDeviceKind>{
+                        ...ScrollConfiguration.of(context).dragDevices,
+                        PointerDeviceKind.mouse,
+                      },
+                    ),
+                    child: ListView.separated(
+                      scrollDirection: Axis.horizontal,
+                      primary: false,
+                      physics: const ClampingScrollPhysics(),
+                      itemCount: candidates.length,
+                      separatorBuilder: (_, index) => const SizedBox(width: 10),
+                      itemBuilder: (context, index) =>
+                          _buildVideoPreviewCandidate(
+                            context,
+                            candidates[index],
+                            index,
+                            selectedIndex == index,
+                          ),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildVideoPreviewCandidate(
+    BuildContext context,
+    BundlePreview preview,
+    int index,
+    bool selected,
+  ) {
+    final accent = SboxColors.accent;
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: '视频缩略图候选 ${index + 1}',
+      child: InkWell(
+        key: ValueKey<String>('library-video-preview-candidate-$index'),
+        onTap: _busy || _savingShardSize
+            ? null
+            : () => setState(() => _selectedVideoPreviewIndex = index),
+        borderRadius: BorderRadius.circular(9),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 140),
+          width: 148,
+          height: 108,
+          padding: EdgeInsets.all(selected ? 2 : 1),
+          decoration: BoxDecoration(
+            color: SboxColors.panelRaised,
+            borderRadius: BorderRadius.circular(9),
+            border: Border.all(
+              color: selected ? accent : SboxColors.border,
+              width: selected ? 2 : 1,
+            ),
+          ),
+          child: Stack(
+            fit: StackFit.expand,
+            children: <Widget>[
+              ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: Image.memory(
+                  preview.encodedBytesView,
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true,
+                  errorBuilder: (context, error, stackTrace) => const Icon(
+                    Icons.broken_image_outlined,
+                    color: SboxColors.textMuted,
+                  ),
+                ),
+              ),
+              Positioned(
+                left: 5,
+                bottom: 5,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.68),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 3,
+                    ),
+                    child: Text(
+                      '候选 ${index + 1}',
+                      style: Theme.of(context).textTheme.labelSmall
+                          ?.copyWith(color: Colors.white),
+                    ),
+                  ),
+                ),
+              ),
+              if (selected)
+                Positioned(
+                  right: 5,
+                  top: 5,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: accent,
+                      shape: BoxShape.circle,
+                      boxShadow: <BoxShadow>[
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.35),
+                          blurRadius: 5,
+                        ),
+                      ],
+                    ),
+                    child: const Padding(
+                      padding: EdgeInsets.all(3),
+                      child: Icon(Icons.check, size: 16, color: Colors.white),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildShardSizeControl(BuildContext context, bool mobile) {
+    final megabytes = _targetNominalShardPlaintextSize ~/ _mebibyte;
+    final disabled = _busy || _savingShardSize;
+    return SizedBox(
+      width: mobile ? 292 : 250,
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 7),
+        decoration: BoxDecoration(
+          color: SboxColors.panelSoft,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: SboxColors.borderSoft),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Row(
+              children: <Widget>[
+                const Icon(
+                  Icons.view_in_ar_outlined,
+                  color: SboxColors.accent,
+                  size: 23,
+                ),
+                const SizedBox(width: 9),
+                Expanded(
+                  child: Text(
+                    '分片大小',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                ),
+                Text(
+                  '$megabytes MB',
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    color: SboxColors.accent,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 2),
+            Text(
+              _savingShardSize ? '正在保存…' : '默认 16 MB，云端限制时自动适配',
+              style: Theme.of(context).textTheme.bodySmall
+                  ?.copyWith(color: SboxColors.textMuted),
+            ),
+            Slider(
+              value: megabytes.toDouble(),
+              min: 1,
+              max: 512,
+              divisions: 511,
+              label: '$megabytes MB',
+              onChanged: disabled ? null : _handleShardSizeChanged,
+              onChangeEnd: disabled
+                  ? null
+                  : (value) {
+                      _saveShardSize(value);
+                    },
+            ),
+            const Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: <Widget>[Text('1 MB'), Text('512 MB')],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _handleShardSizeChanged(double value) {
+    final next = value.round() * _mebibyte;
+    if (next == _targetNominalShardPlaintextSize) return;
+    _shardSizeBeforeDrag ??= _targetNominalShardPlaintextSize;
+    setState(() => _targetNominalShardPlaintextSize = next);
+  }
+
+  Future<void> _saveShardSize(double value) async {
+    final next = value.round() * _mebibyte;
+    final previous = _shardSizeBeforeDrag;
+    _shardSizeBeforeDrag = null;
+    if (previous == null || previous == next) return;
+    setState(() => _savingShardSize = true);
+    try {
+      await widget.controller.saveTargetNominalShardPlaintextSize(next);
+      if (!mounted) return;
+      setState(() => _savingShardSize = false);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _targetNominalShardPlaintextSize = previous;
+        _savingShardSize = false;
+      });
+      widget.controller.setError(error, operation: '保存分片大小失败');
+      _showFeedback('分片大小没有保存成功，请稍后重试。', error: true);
+    }
+  }
+
+  static const _mebibyte = 1024 * 1024;
+
   Widget _buildFilesCard(BuildContext context, bool mobile) {
     final rows = _visibleRows;
+    final totalEncryptedBytes =
+        _encryptedBytesBySource[_selectedSource.label] ?? 0;
     return SboxCard(
       padding: EdgeInsets.fromLTRB(
         mobile ? 16 : 22,
@@ -294,13 +613,6 @@ final class _LibraryPageState extends State<LibraryPage> {
                       ),
                     ),
                     _buildRefreshButton(),
-                    const SizedBox(width: 8),
-                    StatusPill(
-                      label: '${rows.length} 个文件',
-                      icon: Icons.verified_user_outlined,
-                      tone: SboxColors.accent,
-                      compact: true,
-                    ),
                   ],
                 ),
                 const SizedBox(height: 14),
@@ -321,30 +633,36 @@ final class _LibraryPageState extends State<LibraryPage> {
                 _buildRefreshButton(),
                 const SizedBox(width: 12),
                 _buildSourceSwitcher(context),
-                const SizedBox(width: 14),
-                StatusPill(
-                  label: '${rows.length} 个文件 · 已安全保存',
-                  icon: Icons.verified_user_outlined,
-                  tone: SboxColors.accent,
-                  compact: true,
-                ),
               ],
             ),
           SizedBox(height: mobile ? 22 : 20),
-          SizedBox(
-            width: mobile ? double.infinity : 330,
-            child: TextField(
-              controller: _searchController,
-              onChanged: (_) => setState(() {}),
-              decoration: const InputDecoration(
-                hintText: '搜索文件',
-                prefixIcon: Icon(Icons.search, size: 30),
-                contentPadding: EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 12,
+          Row(
+            children: <Widget>[
+              Expanded(
+                child: TextField(
+                  controller: _searchController,
+                  onChanged: (_) => setState(() {}),
+                  decoration: const InputDecoration(
+                    hintText: '搜索文件',
+                    prefixIcon: Icon(Icons.search, size: 30),
+                    contentPadding: EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 12,
+                    ),
+                  ),
                 ),
               ),
-            ),
+              SizedBox(width: mobile ? 10 : 14),
+              StatusPill(
+                label: mobile
+                    ? '${rows.length} 个文件'
+                    : '${rows.length} 个文件 · '
+                          '总加密大小：${_formatBytes(BigInt.from(totalEncryptedBytes))}',
+                icon: Icons.verified_user_outlined,
+                tone: SboxColors.accent,
+                compact: true,
+              ),
+            ],
           ),
           const SizedBox(height: 20),
           if (_busy && !_loading)
@@ -355,6 +673,9 @@ final class _LibraryPageState extends State<LibraryPage> {
               progressLabel:
                   _downloadProgress?.overallLabel ??
                   _uploadProgress?.overallLabel,
+              onCancel: _uploadCancellation == null || _uploadCancelRequested
+                  ? null
+                  : _cancelUpload,
             )
           else if (rows.isEmpty)
             Padding(
@@ -406,7 +727,7 @@ final class _LibraryPageState extends State<LibraryPage> {
         borderRadius: BorderRadius.circular(10),
       ),
       child: IconButton(
-        onPressed: _busy ? null : _scan,
+        onPressed: _busy || _listingInBackground ? null : _scan,
         icon: const Icon(Icons.refresh_rounded),
         tooltip: '刷新',
         color: SboxColors.accent,
@@ -418,7 +739,50 @@ final class _LibraryPageState extends State<LibraryPage> {
     );
   }
 
+  bool _isSourceEnabled(_LibrarySource source) {
+    final configuration = _configuration;
+    if (configuration == null) return true;
+    return source == _LibrarySource.github
+        ? configuration.github.enabled
+        : configuration.gitee.enabled;
+  }
+
   Widget _buildSourceSwitcher(BuildContext context, {bool mobile = false}) {
+    final options = <Widget>[
+      if (_isSourceEnabled(_LibrarySource.github))
+        mobile
+            ? Expanded(
+                child: _buildSourceOption(
+                  context,
+                  source: _LibrarySource.github,
+                  icon: Icons.code_outlined,
+                  mobile: mobile,
+                ),
+              )
+            : _buildSourceOption(
+                context,
+                source: _LibrarySource.github,
+                icon: Icons.code_outlined,
+                mobile: mobile,
+              ),
+      if (_isSourceEnabled(_LibrarySource.gitee))
+        mobile
+            ? Expanded(
+                child: _buildSourceOption(
+                  context,
+                  source: _LibrarySource.gitee,
+                  icon: Icons.cloud_outlined,
+                  mobile: mobile,
+                ),
+              )
+            : _buildSourceOption(
+                context,
+                source: _LibrarySource.gitee,
+                icon: Icons.cloud_outlined,
+                mobile: mobile,
+              ),
+    ];
+    if (options.isEmpty) return const SizedBox.shrink();
     return Semantics(
       label: '选择文件来源',
       child: Container(
@@ -431,40 +795,7 @@ final class _LibraryPageState extends State<LibraryPage> {
         ),
         child: Row(
           mainAxisSize: mobile ? MainAxisSize.max : MainAxisSize.min,
-          children: <Widget>[
-            if (mobile)
-              Expanded(
-                child: _buildSourceOption(
-                  context,
-                  source: _LibrarySource.github,
-                  icon: Icons.code_outlined,
-                  mobile: mobile,
-                ),
-              )
-            else
-              _buildSourceOption(
-                context,
-                source: _LibrarySource.github,
-                icon: Icons.code_outlined,
-                mobile: mobile,
-              ),
-            if (mobile)
-              Expanded(
-                child: _buildSourceOption(
-                  context,
-                  source: _LibrarySource.gitee,
-                  icon: Icons.cloud_outlined,
-                  mobile: mobile,
-                ),
-              )
-            else
-              _buildSourceOption(
-                context,
-                source: _LibrarySource.gitee,
-                icon: Icons.cloud_outlined,
-                mobile: mobile,
-              ),
-          ],
+          children: options,
         ),
       ),
     );
@@ -578,7 +909,7 @@ final class _LibraryPageState extends State<LibraryPage> {
               ),
             ),
           );
-          final actions = _buildRowActions(row, mobile);
+          final actions = _buildRowActions(context, row, mobile);
           if (narrow) {
             return Row(
               crossAxisAlignment: CrossAxisAlignment.center,
@@ -654,7 +985,7 @@ final class _LibraryPageState extends State<LibraryPage> {
     );
   }
 
-  Widget _buildRowActions(_FileRow row, bool mobile) {
+  Widget _buildRowActions(BuildContext context, _FileRow row, bool mobile) {
     final buttonWidth = mobile ? null : 136.0;
     final buttons = switch (row.actionState) {
       _FileActionState.localPlaintext => <Widget>[
@@ -696,12 +1027,36 @@ final class _LibraryPageState extends State<LibraryPage> {
         ),
       ],
     };
+    if (_canDeleteCloudBundle(row)) {
+      final errorColor = Theme.of(context).colorScheme.error;
+      buttons.add(
+        SizedBox(
+          width: buttonWidth,
+          child: OutlinedButton.icon(
+            onPressed: _busy || _listingInBackground
+                ? null
+                : () => _deleteCloudBundle(row),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: errorColor,
+              side: BorderSide(color: errorColor.withValues(alpha: 0.72)),
+            ),
+            icon: Icon(Icons.delete_outline, size: mobile ? 20 : 22),
+            label: const Text('删除云端文件'),
+          ),
+        ),
+      );
+    }
     return Wrap(
       alignment: WrapAlignment.end,
       spacing: 8,
       runSpacing: 8,
       children: buttons,
     );
+  }
+
+  bool _canDeleteCloudBundle(_FileRow row) {
+    final bundle = row.bundle;
+    return bundle != null && bundle.source.capabilities.canDelete;
   }
 
   Widget _buildFooter(BuildContext context) {
@@ -720,6 +1075,7 @@ final class _LibraryPageState extends State<LibraryPage> {
   }
 
   List<_FileRow> get _visibleRows {
+    if (!_isSourceEnabled(_selectedSource)) return const <_FileRow>[];
     final query = _searchController.text.trim().toLowerCase();
     final source =
         _bundles
@@ -787,8 +1143,155 @@ final class _LibraryPageState extends State<LibraryPage> {
     );
   }
 
+  Future<bool> _confirmDeleteCloudBundle(_LibraryBundle bundle) async {
+    final bundleId = hexLower(bundle.root.header.bundleId);
+    final shardCount = bundle.root.header.shardCount;
+    return await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('删除云端文件？'),
+            content: Text(
+              '将从 ${bundle.sourceName} 删除这个加密 Bundle：\n\n'
+              'Bundle ID：$bundleId\n'
+              '对象数：$shardCount 个\n\n'
+              '此操作只删除云端密文，不删除本地缓存，且无法撤销。',
+            ),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop(true),
+                style: FilledButton.styleFrom(
+                  backgroundColor: Theme.of(context).colorScheme.error,
+                  foregroundColor: Theme.of(context).colorScheme.onError,
+                ),
+                child: const Text('确认删除'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
+  Future<void> _deleteCloudBundle(_FileRow row) async {
+    final bundle = row.bundle;
+    if (bundle == null ||
+        !_canDeleteCloudBundle(row) ||
+        _busy ||
+        _listingInBackground) {
+      return;
+    }
+    final confirmed = await _confirmDeleteCloudBundle(bundle);
+    if (!confirmed || !mounted) return;
+
+    setState(() {
+      _busy = true;
+      _busyTitle = '正在删除云端文件';
+      _busyDetail = '正在校验并删除 ${bundle.root.header.shardCount} 个云端对象，请稍候。';
+      _uploadProgress = null;
+      _downloadProgress = null;
+    });
+    try {
+      final objects = await _listBundleObjectsForDeletion(bundle);
+      await BundleSync.delete(bundle.source, objects);
+      if (!mounted) return;
+      _showFeedback('云端文件已删除。');
+      await _scan();
+    } catch (error) {
+      if (!mounted) return;
+      widget.controller.setError(error, operation: '删除云端文件失败');
+      setState(() {
+        _busy = false;
+        _uploadProgress = null;
+        _downloadProgress = null;
+      });
+      final message = error is SboxException ? error.message : '发生未知错误，请稍后重试。';
+      _showFeedback('删除云端文件失败：$message', error: true);
+    }
+  }
+
+  Future<List<({SourcePath path, RevisionToken revision, bool isRoot})>>
+  _listBundleObjectsForDeletion(_LibraryBundle bundle) async {
+    final source = bundle.source;
+    if (source is! EnumerableDataSource ||
+        !source.capabilities.canListObjects) {
+      throw const SboxException(
+        SboxErrorCode.listingUnsupported,
+        '当前数据源不支持删除前的对象校验',
+      );
+    }
+
+    final header = bundle.root.header;
+    final expected = <String, int>{
+      for (var index = 0; index < header.shardCount; index++)
+        canonicalBundleBasename(
+          bundleId: header.bundleId,
+          shardIndex: index,
+          shardCount: header.shardCount,
+        ): index,
+    };
+    final found = <String, SourceObjectInfo>{};
+    final seenPaths = <String>{};
+    final seenCursors = <String>{};
+    String? cursor;
+    do {
+      if (cursor != null && !seenCursors.add(cursor)) {
+        throw const SboxException(
+          SboxErrorCode.shardConflict,
+          '数据源分页游标重复，未执行删除',
+        );
+      }
+      final page = await source.listObjects(cursor: cursor);
+      for (final object in page.objects) {
+        if (!seenPaths.add(object.path.value)) {
+          throw const SboxException(
+            SboxErrorCode.shardConflict,
+            '数据源返回了重复对象，未执行删除',
+          );
+        }
+        if (expected.containsKey(object.path.value)) {
+          found[object.path.value] = object;
+        }
+      }
+      cursor = page.nextCursor;
+    } while (cursor != null);
+
+    if (found.length != expected.length) {
+      throw const SboxException(SboxErrorCode.shardMissing, '云端文件分片不完整，未执行删除');
+    }
+    final rootName = bundle.root.path.value;
+    final rootInfo = found[rootName];
+    if (rootInfo == null) {
+      throw const SboxException(SboxErrorCode.sourceNotFound, '云端根对象不存在，未执行删除');
+    }
+    if (!rootInfo.revision.matches(bundle.root.info.revision)) {
+      throw const SboxException(
+        SboxErrorCode.remoteChanged,
+        '云端根对象已发生变化，未执行删除',
+      );
+    }
+
+    final ordered = found.values.toList()
+      ..sort(
+        (left, right) =>
+            expected[left.path.value]!.compareTo(expected[right.path.value]!),
+      );
+    return List<
+      ({SourcePath path, RevisionToken revision, bool isRoot})
+    >.unmodifiable(
+      ordered.map(
+        (object) => (
+          path: object.path,
+          revision: object.revision,
+          isRoot: expected[object.path.value] == 0,
+        ),
+      ),
+    );
+  }
+
   Future<void> _load() async {
-    await _loadConfiguration();
     await _scan();
   }
 
@@ -797,15 +1300,29 @@ final class _LibraryPageState extends State<LibraryPage> {
       final configuration = await _configurationStore.load();
       var credentialsReady = false;
       if (configuration != null) {
-        final github = await _credentialStore.getAccessToken(
-          configuration.github.credentialId,
+        final endpoints = <CloudRepositoryEndpoint>[
+          if (configuration.github.enabled) configuration.github,
+          if (configuration.gitee.enabled) configuration.gitee,
+        ];
+        final tokens = await Future.wait<SourceAccessToken?>(
+          endpoints.map(
+            (endpoint) =>
+                _credentialStore.getAccessToken(endpoint.credentialId),
+          ),
         );
-        final gitee = await _credentialStore.getAccessToken(
-          configuration.gitee.credentialId,
-        );
-        credentialsReady = github != null && gitee != null;
-        github?.dispose();
-        gitee?.dispose();
+        credentialsReady =
+            endpoints.isNotEmpty && tokens.every((token) => token != null);
+        for (final token in tokens) {
+          token?.dispose();
+        }
+        final selectedEnabled = _selectedSource == _LibrarySource.github
+            ? configuration.github.enabled
+            : configuration.gitee.enabled;
+        if (!selectedEnabled) {
+          _selectedSource = configuration.github.enabled
+              ? _LibrarySource.github
+              : _LibrarySource.gitee;
+        }
       }
       if (!mounted) return;
       setState(() {
@@ -827,23 +1344,115 @@ final class _LibraryPageState extends State<LibraryPage> {
 
   Future<void> _scan() async {
     if (!mounted) return;
+    if (_listingInBackground) {
+      _scanQueued = true;
+      return;
+    }
+
+    _scanQueued = false;
+    final scanGeneration = ++_scanGeneration;
     setState(() {
       _busy = true;
+      _listingInBackground = true;
+      _encryptedBytesBySource = const <String, int>{};
       _busyTitle = '正在读取文件';
       _busyDetail = '正在同步你的安全文件。';
     });
-    final configuration = _configuration ?? await _configurationStore.load();
+    // Reload configuration for explicit scans so a manual refresh can pick
+    // up changes made in Settings without making tab switches scan again.
+    await _loadConfiguration();
+    if (!mounted || scanGeneration != _scanGeneration) return;
+    final configuration = _configuration;
     if (configuration == null) {
-      if (mounted) {
+      if (mounted && scanGeneration == _scanGeneration) {
         setState(() {
           _busy = false;
+          _listingInBackground = false;
         });
       }
       return;
     }
+
     http.Client? nextClient;
+    http.Client? scanClient;
+    var published = false;
+    final stagedBundles = <_LibraryBundle>[];
+    final encryptedBytesBySource = <String, int>{};
+
+    void handleObject(String sourceName, SourceObjectInfo object) {
+      if (!object.path.value.endsWith('.sbox') || object.length <= 0) return;
+      encryptedBytesBySource.update(
+        sourceName,
+        (total) => total + object.length,
+        ifAbsent: () => object.length,
+      );
+    }
+
+    void publishStagedBundles() {
+      if (!mounted ||
+          scanGeneration != _scanGeneration ||
+          scanClient == null ||
+          published) {
+        return;
+      }
+      published = true;
+      final previousBundles = _bundles;
+      final previousClient = _client;
+      _client = scanClient;
+      nextClient = null;
+      previousClient?.close();
+      setState(() {
+        _bundles = List<_LibraryBundle>.unmodifiable(stagedBundles);
+        _encryptedBytesBySource = Map<String, int>.unmodifiable(
+          encryptedBytesBySource,
+        );
+        _busy = false;
+      });
+      _disposeBundlePreviews(previousBundles);
+    }
+
+    void handleRoot(
+      DataSource source,
+      String sourceName,
+      ListedBundleRoot root,
+    ) {
+      if (!mounted || scanGeneration != _scanGeneration) {
+        root.preview?.dispose();
+        return;
+      }
+      final bundle = _LibraryBundle(
+        root: root,
+        source: source,
+        sourceName: sourceName,
+        manifest: root.manifest,
+        preview: root.preview,
+        hasPreview: root.hasPreview,
+        status: root.status,
+      );
+      stagedBundles.add(bundle);
+
+      final selectedSourceCount = stagedBundles
+          .where((candidate) => candidate.sourceName == _selectedSource.label)
+          .length;
+      if (!published && selectedSourceCount >= _initialListingCount) {
+        publishStagedBundles();
+      } else if (published) {
+        setState(() {
+          _bundles = List<_LibraryBundle>.unmodifiable(stagedBundles);
+        });
+      }
+      unawaited(
+        _hydrateListedBundle(
+          bundle,
+          backupDirectory: configuration.backupDirectory,
+          scanGeneration: scanGeneration,
+        ),
+      );
+    }
+
     try {
       final client = http.Client();
+      scanClient = client;
       nextClient = client;
       final pair = CloudRepositoryPair.fromConfiguration(
         configuration: configuration,
@@ -852,55 +1461,36 @@ final class _LibraryPageState extends State<LibraryPage> {
       );
       final listed = await Future.wait<List<ListedBundleRoot>?>(
         <Future<List<ListedBundleRoot>?>>[
-          _listSource(pair.github, 'GitHub'),
-          _listSource(pair.gitee, 'Gitee'),
+          for (final configured in pair.enabledSources)
+            _listSource(
+              configured.source,
+              configured.name,
+              onRoot: (root) =>
+                  handleRoot(configured.source, configured.name, root),
+              onObject: (object) => handleObject(configured.name, object),
+            ),
         ],
       );
-      final bundles = <_LibraryBundle>[];
-      for (final root in listed[0] ?? const <ListedBundleRoot>[]) {
-        bundles.add(
-          _LibraryBundle(
-            root: root,
-            source: pair.github,
-            sourceName: 'GitHub',
-            manifest: root.manifest,
-            preview: root.preview,
-            hasPreview: root.hasPreview,
-            status: root.status,
-          ),
-        );
+      if (!mounted || scanGeneration != _scanGeneration) return;
+
+      // The first five roots release the initial loading state. If the
+      // source contains fewer files, publish whatever the complete scan
+      // found instead of leaving the loading state visible forever.
+      if (!published && listed.any((roots) => roots != null)) {
+        publishStagedBundles();
       }
-      for (final root in listed[1] ?? const <ListedBundleRoot>[]) {
-        bundles.add(
-          _LibraryBundle(
-            root: root,
-            source: pair.gitee,
-            sourceName: 'Gitee',
-            manifest: root.manifest,
-            preview: root.preview,
-            hasPreview: root.hasPreview,
-            status: root.status,
-          ),
-        );
-      }
-      await _hydrateLocalState(bundles, configuration.backupDirectory);
-      if (!mounted) {
-        _disposeBundlePreviews(bundles);
-        return;
-      }
-      final previousBundles = _bundles;
-      _client?.close();
-      _client = client;
-      nextClient = null;
       setState(() {
-        _bundles = List<_LibraryBundle>.unmodifiable(bundles);
         _busy = false;
+        _listingInBackground = false;
+        _encryptedBytesBySource = Map<String, int>.unmodifiable(
+          encryptedBytesBySource,
+        );
       });
-      _disposeBundlePreviews(previousBundles);
     } catch (error) {
-      if (mounted) {
+      if (mounted && scanGeneration == _scanGeneration) {
         setState(() {
           _busy = false;
+          _listingInBackground = false;
         });
         widget.controller.logger.warning(
           '读取云端文件失败',
@@ -909,8 +1499,30 @@ final class _LibraryPageState extends State<LibraryPage> {
         _showFeedback('暂时无法读取云端文件，请稍后重试。', error: true);
       }
     } finally {
+      if (!published) _disposeBundlePreviews(stagedBundles);
       nextClient?.close();
+      if (mounted && scanGeneration == _scanGeneration && _scanQueued) {
+        _scanQueued = false;
+        unawaited(_scan());
+      }
     }
+  }
+
+  Future<void> _hydrateListedBundle(
+    _LibraryBundle bundle, {
+    required String backupDirectory,
+    required int scanGeneration,
+  }) async {
+    try {
+      await _hydrateLocalState(<_LibraryBundle>[bundle], backupDirectory);
+    } catch (error) {
+      widget.controller.logger.warning(
+        '读取本地文件状态失败',
+        detail: AppLogger.describeError(error),
+      );
+    }
+    if (!mounted || scanGeneration != _scanGeneration) return;
+    setState(() {});
   }
 
   static void _disposeBundlePreviews(Iterable<_LibraryBundle> bundles) {
@@ -976,12 +1588,19 @@ final class _LibraryPageState extends State<LibraryPage> {
 
   Future<List<ListedBundleRoot>?> _listSource(
     EnumerableDataSource source,
-    String name,
-  ) async {
+    String name, {
+    required void Function(ListedBundleRoot root) onRoot,
+    required void Function(SourceObjectInfo object) onObject,
+  }) async {
     try {
       final record = widget.controller.identityRecord;
       final identity = record?.toPublicIdentity();
-      return await BundleListing.listRoots(source, identity: identity);
+      return await BundleListing.listRoots(
+        source,
+        identity: identity,
+        onRoot: onRoot,
+        onObject: onObject,
+      );
     } catch (error) {
       widget.controller.logger.warning(
         '$name：读取云端文件失败',
@@ -1006,10 +1625,146 @@ final class _LibraryPageState extends State<LibraryPage> {
     }
     final length = await File(path).length();
     if (!mounted) return;
+    final looksLikeVideo =
+        _looksLikeVideoFile(file.name) || _looksLikeVideoFile(file.path);
+    _videoPreviewRequestId++;
+    _disposeVideoPreviewCandidates();
     setState(() {
       _selectedFile = file;
       _selectedFileLength = length;
+      _selectedVideoPreviewIndex = 0;
+      _videoFileDetected = looksLikeVideo;
+      _videoPreviewLoading = looksLikeVideo && _generatePreview;
+      _videoPreviewError = null;
+      _videoPreviewMediaType = 'video/mp4';
     });
+    if (_generatePreview) await _prepareVideoPreviewCandidates(file);
+  }
+
+  void _setGeneratePreview(bool value) {
+    if (_generatePreview == value || _busy || _savingShardSize) return;
+    if (!value) {
+      _videoPreviewRequestId++;
+      _disposeVideoPreviewCandidates();
+      setState(() {
+        _generatePreview = false;
+        _videoPreviewLoading = false;
+        _videoFileDetected = false;
+        _videoPreviewError = null;
+      });
+      return;
+    }
+
+    setState(() => _generatePreview = true);
+    final file = _selectedFile;
+    if (file != null) _prepareVideoPreviewCandidates(file);
+  }
+
+  Future<void> _prepareVideoPreviewCandidates(XFile file) async {
+    final requestId = ++_videoPreviewRequestId;
+    final looksLikeVideo =
+        _looksLikeVideoFile(file.name) || _looksLikeVideoFile(file.path);
+    _disposeVideoPreviewCandidates();
+    if (mounted) {
+      setState(() {
+        _videoFileDetected = looksLikeVideo;
+        _videoPreviewLoading = looksLikeVideo && _generatePreview;
+        _videoPreviewError = null;
+        _selectedVideoPreviewIndex = 0;
+      });
+    }
+
+    final source = File(file.path);
+    final generator = PlatformPreviewGenerator(
+      videoPosterDecoder: widget.videoPosterDecoder,
+    );
+    if (!await generator.isVideo(source)) {
+      if (mounted &&
+          requestId == _videoPreviewRequestId &&
+          _selectedFile?.path == file.path) {
+        setState(() {
+          _videoPreviewLoading = false;
+          _videoPreviewError = looksLikeVideo ? '文件看起来像视频，但无法识别其视频格式。' : null;
+        });
+      }
+      return;
+    }
+    if (!mounted ||
+        requestId != _videoPreviewRequestId ||
+        _selectedFile?.path != file.path) {
+      return;
+    }
+    setState(() {
+      _videoFileDetected = true;
+      _videoPreviewLoading = true;
+      _videoPreviewError = null;
+    });
+
+    List<PreviewGenerated> generated;
+    try {
+      generated = await generator.generateVideoCandidates(
+        source,
+        count: defaultVideoPosterCandidateCount,
+      );
+    } on Object {
+      generated = <PreviewGenerated>[];
+    }
+    if (!mounted ||
+        requestId != _videoPreviewRequestId ||
+        _selectedFile?.path != file.path) {
+      for (final item in generated) {
+        item.preview.dispose();
+      }
+      return;
+    }
+
+    _videoPreviewCandidates.addAll(generated.map((item) => item.preview));
+    if (generated.isNotEmpty) {
+      _videoPreviewMediaType = generated.first.detectedSourceMediaType;
+    }
+    setState(() {
+      _videoPreviewLoading = false;
+      _selectedVideoPreviewIndex = 0;
+      _videoPreviewError = generated.isEmpty
+          ? '暂时无法提取候选画面，上传时会继续尝试生成默认缩略图。'
+          : null;
+    });
+  }
+
+  void _disposeVideoPreviewCandidates() {
+    for (final preview in _videoPreviewCandidates) {
+      preview.dispose();
+    }
+    _videoPreviewCandidates.clear();
+    _selectedVideoPreviewIndex = 0;
+  }
+
+  BundlePreview? _selectedVideoPreview() {
+    if (_videoPreviewCandidates.isEmpty ||
+        _selectedVideoPreviewIndex < 0 ||
+        _selectedVideoPreviewIndex >= _videoPreviewCandidates.length) {
+      return null;
+    }
+    return _videoPreviewCandidates[_selectedVideoPreviewIndex];
+  }
+
+  static bool _looksLikeVideoFile(String path) {
+    final extension = p.extension(path).toLowerCase();
+    return const <String>{
+      '.mp4',
+      '.m4v',
+      '.mov',
+      '.webm',
+      '.avi',
+      '.wmv',
+      '.mkv',
+      '.3gp',
+      '.3g2',
+      '.mpeg',
+      '.mpg',
+      '.m2ts',
+      '.mts',
+    }.contains(extension);
   }
 
   Future<void> _upload() async {
@@ -1030,6 +1785,7 @@ final class _LibraryPageState extends State<LibraryPage> {
       return;
     }
     final sourceFile = File(file.path);
+    final cancellation = CloudBundleUploadCancellation();
     if (!await sourceFile.exists()) {
       _showFeedback('找不到要上传的文件，请重新选择。', error: true);
       return;
@@ -1040,37 +1796,48 @@ final class _LibraryPageState extends State<LibraryPage> {
       _busyDetail = '文件正在加密并同步到云端，请稍候。';
       _uploadProgress = null;
       _downloadProgress = null;
+      _uploadCancellation = cancellation;
+      _uploadCancelRequested = false;
     });
     BundlePreview? preview;
     PreviewUnavailableReason? previewUnavailableReason;
     var mediaType = 'application/octet-stream';
     try {
+      cancellation.throwIfCancelled();
       if (_generatePreview) {
-        final generated = await const PlatformPreviewGenerator(
-          videoPosterDecoder: FlutterVideoPosterDecoder(),
-        ).generate(sourceFile);
-        switch (generated) {
-          case PreviewGenerated(
-            preview: final generatedPreview,
-            detectedSourceMediaType: final detected,
-          ):
-            preview = generatedPreview;
-            mediaType = detected;
-          case PreviewUnavailable(
-            reason: final reason,
-            detectedSourceMediaType: final detected,
-          ):
-            previewUnavailableReason = reason;
-            if (detected != null) mediaType = detected;
+        final selectedCandidate = _selectedVideoPreview();
+        if (selectedCandidate != null) {
+          preview = selectedCandidate.copy();
+          mediaType = _videoPreviewMediaType;
+        } else {
+          final generated = await PlatformPreviewGenerator(
+            videoPosterDecoder: widget.videoPosterDecoder,
+          ).generate(sourceFile);
+          switch (generated) {
+            case PreviewGenerated(
+              preview: final generatedPreview,
+              detectedSourceMediaType: final detected,
+            ):
+              preview = generatedPreview;
+              mediaType = detected;
+            case PreviewUnavailable(
+              reason: final reason,
+              detectedSourceMediaType: final detected,
+            ):
+              previewUnavailableReason = reason;
+              if (detected != null) mediaType = detected;
+          }
         }
       } else {
         previewUnavailableReason = PreviewUnavailableReason.userDisabled;
       }
+      cancellation.throwIfCancelled();
       final identity = PublicIdentityRecord(
         spkiDer: record.spkiDer,
         recipientKeyId: record.recipientKeyId,
       ).toPublicIdentity();
       final client = http.Client();
+      _uploadClient = client;
       late final CloudBundleUploadResult uploadResult;
       try {
         uploadResult =
@@ -1092,24 +1859,37 @@ final class _LibraryPageState extends State<LibraryPage> {
                     ? p.basename(file.path)
                     : file.name,
                 description: _descriptionController.text,
+                targetNominalShardPlaintextSize:
+                    widget.controller.targetNominalShardPlaintextSize,
                 preview: preview,
                 previewRequested: _generatePreview,
                 previewUnavailableReason: previewUnavailableReason,
               ),
               configuration: configuration,
               onProgress: _handleUploadProgress,
+              cancellation: cancellation,
             );
       } finally {
         client.close();
+        if (identical(_uploadClient, client)) _uploadClient = null;
       }
+      cancellation.throwIfCancelled();
       if (!mounted) return;
+      _videoPreviewRequestId++;
+      _disposeVideoPreviewCandidates();
       setState(() {
         _selectedFile = null;
         _selectedFileLength = null;
+        _videoFileDetected = false;
+        _videoPreviewLoading = false;
+        _videoPreviewError = null;
+        _videoPreviewMediaType = 'video/mp4';
         _descriptionController.clear();
         _busy = false;
         _uploadProgress = null;
         _downloadProgress = null;
+        _uploadCancellation = null;
+        _uploadCancelRequested = false;
       });
       _showFeedback(
         uploadResult.previewEmbedded
@@ -1118,11 +1898,31 @@ final class _LibraryPageState extends State<LibraryPage> {
       );
       await _scan();
     } catch (error) {
+      if (cancellation.isCancelled ||
+          error is SboxException && error.code == SboxErrorCode.cancelled) {
+        if (mounted) {
+          setState(() {
+            _busy = false;
+            _uploadProgress = null;
+            _downloadProgress = null;
+            if (identical(_uploadCancellation, cancellation)) {
+              _uploadCancellation = null;
+              _uploadCancelRequested = false;
+            }
+          });
+          _showFeedback('上传已取消');
+        }
+        return;
+      }
       if (mounted) {
         setState(() {
           _busy = false;
           _uploadProgress = null;
           _downloadProgress = null;
+          if (identical(_uploadCancellation, cancellation)) {
+            _uploadCancellation = null;
+            _uploadCancelRequested = false;
+          }
         });
         widget.controller.setError(error, operation: '安全保存文件失败');
         final message = error is SboxException
@@ -1151,12 +1951,27 @@ final class _LibraryPageState extends State<LibraryPage> {
     };
   }
 
-  void _handleUploadProgress(CloudBundleUploadProgress progress) {
+  void _cancelUpload() {
+    final cancellation = _uploadCancellation;
+    if (cancellation == null || cancellation.isCancelled) return;
+    cancellation.cancel();
+    _uploadClient?.close();
     if (!mounted) return;
+    setState(() {
+      _uploadCancelRequested = true;
+      _busyTitle = '正在取消上传';
+      _busyDetail = '正在停止当前上传请求，请稍候。';
+    });
+  }
+
+  void _handleUploadProgress(CloudBundleUploadProgress progress) {
+    if (!mounted || _uploadCancellation?.isCancelled == true) return;
     setState(() {
       _uploadProgress = progress;
       _busyTitle = switch (progress.stage) {
         CloudBundleUploadStage.preparing => '正在准备上传',
+        CloudBundleUploadStage.splitting => '正在切分文件',
+        CloudBundleUploadStage.encrypting => '正在加密文件',
         CloudBundleUploadStage.uploading => '正在上传加密分片',
         CloudBundleUploadStage.verifying => '正在核对云端分片',
         CloudBundleUploadStage.completed => '上传完成，正在收尾',
@@ -1172,10 +1987,33 @@ final class _LibraryPageState extends State<LibraryPage> {
       _busyTitle = switch (progress.stage) {
         BundleDownloadStage.preparing => '正在读取文件信息',
         BundleDownloadStage.downloading => '正在下载加密文件',
-        BundleDownloadStage.decrypting => '正在校验并解密',
+        BundleDownloadStage.decrypting => '正在解密文件',
+        BundleDownloadStage.merging => '正在合并文件',
       };
       _busyDetail = progress.detailLabel;
     });
+  }
+
+  void _handleMergeProgress(
+    BundleDownloadProgress base,
+    int processedBytes,
+    int totalBytes,
+  ) {
+    _handleDownloadProgress(
+      BundleDownloadProgress(
+        stage: BundleDownloadStage.merging,
+        downloadedBytes: base.downloadedBytes,
+        completedObjects: base.completedObjects,
+        totalObjects: base.totalObjects,
+        progressUnits: base.progressUnits,
+        processedBytes: processedBytes,
+        totalProcessingBytes: totalBytes,
+        processedShards: totalBytes == 0 || processedBytes >= totalBytes
+            ? 1
+            : 0,
+        processingTotalShards: 1,
+      ),
+    );
   }
 
   Future<void> _decryptLocal(_FileRow row) async {
@@ -1201,16 +2039,26 @@ final class _LibraryPageState extends State<LibraryPage> {
         mode: LocalDirectoryMode.readOnly,
         requestWrite: false,
       );
+      BundleDownloadProgress? lastProgress;
       final decrypted = await BundleSync.fetchAndDecrypt(
         source: source,
         rootPath: bundle.root.path,
         mnemonic: mnemonic,
         expectedIdentity: widget.controller.identityRecord?.toPublicIdentity(),
-        onProgress: _handleDownloadProgress,
+        onProgress: (progress) {
+          lastProgress = progress;
+          _handleDownloadProgress(progress);
+        },
       );
       final destination = await _cacheDecrypted(
         manifest: decrypted.manifest,
         plaintext: decrypted.plaintext,
+        onProgress: (processedBytes, totalBytes) {
+          final base = lastProgress ?? _downloadProgress;
+          if (base != null) {
+            _handleMergeProgress(base, processedBytes, totalBytes);
+          }
+        },
       );
       if (!mounted) return;
       setState(() {
@@ -1275,10 +2123,7 @@ final class _LibraryPageState extends State<LibraryPage> {
   Future<void> _downloadAndDecrypt(_FileRow row) async {
     final bundle = row.bundle;
     if (bundle == null) return;
-    final mnemonic = await _askMnemonic(
-      title: '下载并解密文件',
-      actionLabel: '下载并解密',
-    );
+    final mnemonic = await _askMnemonic(title: '下载并解密文件', actionLabel: '下载并解密');
     if (mnemonic == null || mnemonic.trim().isEmpty) return;
     if (!mounted) return;
     setState(() {
@@ -1288,16 +2133,26 @@ final class _LibraryPageState extends State<LibraryPage> {
       _downloadProgress = null;
     });
     try {
+      BundleDownloadProgress? lastProgress;
       final decrypted = await BundleSync.fetchAndDecrypt(
         source: bundle.source,
         rootPath: bundle.root.path,
         mnemonic: mnemonic,
         expectedIdentity: widget.controller.identityRecord?.toPublicIdentity(),
-        onProgress: _handleDownloadProgress,
+        onProgress: (progress) {
+          lastProgress = progress;
+          _handleDownloadProgress(progress);
+        },
       );
       final destination = await _cacheDecrypted(
         manifest: decrypted.manifest,
         plaintext: decrypted.plaintext,
+        onProgress: (processedBytes, totalBytes) {
+          final base = lastProgress ?? _downloadProgress;
+          if (base != null) {
+            _handleMergeProgress(base, processedBytes, totalBytes);
+          }
+        },
       );
       if (!mounted) return;
       setState(() {
@@ -1325,10 +2180,12 @@ final class _LibraryPageState extends State<LibraryPage> {
   Future<File> _cacheDecrypted({
     required BundleManifest manifest,
     required Uint8List plaintext,
+    void Function(int processedBytes, int totalBytes)? onProgress,
   }) async {
     final destination = await _temporaryStore.fileFor(manifest);
     await TemporaryPlaintextPlatform.protectRoot(_temporaryStore.path);
     if (await _temporaryStore.matches(destination, manifest)) {
+      onProgress?.call(plaintext.length, plaintext.length);
       plaintext.fillRange(0, plaintext.length, 0);
       return destination;
     }
@@ -1337,12 +2194,28 @@ final class _LibraryPageState extends State<LibraryPage> {
       '${destination.path}.${hexLower(secureRandomBytes(8))}.part',
     );
     var renamed = false;
+    IOSink? output;
     try {
-      await stage.writeAsBytes(plaintext, flush: true);
+      onProgress?.call(0, plaintext.length);
+      output = stage.openWrite();
+      var offset = 0;
+      while (offset < plaintext.length) {
+        final end = offset + SboxProtocol.chunkSize < plaintext.length
+            ? offset + SboxProtocol.chunkSize
+            : plaintext.length;
+        output.add(Uint8List.sublistView(plaintext, offset, end));
+        await output.flush();
+        offset = end;
+        onProgress?.call(offset, plaintext.length);
+      }
+      await output.flush();
+      await output.close();
+      output = null;
       await stage.rename(destination.path);
       renamed = true;
       return destination;
     } finally {
+      await output?.close();
       plaintext.fillRange(0, plaintext.length, 0);
       if (!renamed && await stage.exists()) await stage.delete();
     }

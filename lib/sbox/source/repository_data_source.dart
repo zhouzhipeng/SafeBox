@@ -69,6 +69,9 @@ abstract base class RepositoryDataSource
   /// directory in one response and ignore those query parameters.
   bool get supportsListPagination => true;
 
+  /// Repository reads and probes intentionally use only public headers. A
+  /// credential is loaded only by write operations below, so public
+  /// repositories remain usable even when no token is configured.
   Future<void> verifyRepository() async {
     logger?.info('$sourceName：开始测试 API 连接');
     final response = await httpTransport.get(
@@ -402,16 +405,20 @@ abstract base class RepositoryDataSource
           : hexLower(sha256);
       return RevisionToken(ascii.encode(providerRevision));
     } on SboxException catch (error) {
-      if (error.code != SboxErrorCode.immutableConflict) rethrow;
-      // Another upload may have created the immutable object between the
-      // preflight GET and the create request. Treat an exact-content object as
-      // success so a concurrent or resumed upload can continue.
-      final existingRevision = await _existingRevisionIfSame(
-        path,
-        length: length,
-        expectedHash: sha256,
-      );
-      if (existingRevision != null) return existingRevision;
+      // A PUT can have an ambiguous outcome: the provider may commit the
+      // object and then lose or reject the response. Confirm the immutable
+      // bytes before allowing the caller to retry the write. This covers the
+      // GitHub Contents API's HTTP 422 response after a path becomes visible,
+      // as well as transport failures after the request was submitted.
+      if (error.code == SboxErrorCode.immutableConflict ||
+          error.code == SboxErrorCode.sourceNetwork) {
+        final existingRevision = await _existingRevisionIfSame(
+          path,
+          length: length,
+          expectedHash: sha256,
+        );
+        if (existingRevision != null) return existingRevision;
+      }
       rethrow;
     }
   }
@@ -421,20 +428,40 @@ abstract base class RepositoryDataSource
     required int length,
     required Uint8List expectedHash,
   }) async {
-    try {
-      final remote = await get(path);
-      if (remote.length != length) return null;
-      final remoteBytes = await httpTransport.readBounded(
-        remote.body,
-        maximumBytes: length,
-      );
-      return constantTimeBytesEqual(sha256Bytes(remoteBytes), expectedHash)
-          ? remote.revision
-          : null;
-    } on SboxException catch (error) {
-      if (error.code == SboxErrorCode.sourceNotFound) return null;
-      rethrow;
+    // Directory and object metadata endpoints can briefly disagree after a
+    // successful commit. A short bounded confirmation window prevents a
+    // successful immutable upload from being reported as a failure.
+    const maxAttempts = 4;
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        final remote = await get(path);
+        if (remote.length != length) {
+          await httpTransport.discard(remote.body);
+          return null;
+        }
+        final remoteBytes = await httpTransport.readBounded(
+          remote.body,
+          maximumBytes: length,
+        );
+        return constantTimeBytesEqual(sha256Bytes(remoteBytes), expectedHash)
+            ? remote.revision
+            : null;
+      } on SboxException catch (error) {
+        if (error.code == SboxErrorCode.cancelled) rethrow;
+        if (error.code != SboxErrorCode.sourceNotFound &&
+            error.code != SboxErrorCode.sourceNetwork) {
+          return null;
+        }
+      } on Object {
+        return null;
+      }
+      if (attempt + 1 < maxAttempts) {
+        await Future<void>.delayed(
+          Duration(milliseconds: 100 * (1 << attempt)),
+        );
+      }
     }
+    return null;
   }
 
   @override
@@ -449,12 +476,26 @@ abstract base class RepositoryDataSource
     await _withCredential((token) async {
       final request = http.Request(deleteMethod, writeUri(path))
         ..headers.addAll(publicHeaders(raw: false))
-        ..headers['Content-Type'] = 'application/json; charset=utf-8'
-        ..body = jsonEncode(<String, Object?>{
-          'message': 'sbox: delete immutable object',
-          'sha': revision,
-        });
-      request.headers['Authorization'] = 'Bearer $token';
+        ..headers['Content-Type'] =
+            credentialPlacement == RepositoryCredentialPlacement.formBody
+            ? 'application/x-www-form-urlencoded'
+            : 'application/json; charset=utf-8';
+      final fields = <String, String>{
+        'message': 'sbox: delete immutable object',
+        'sha': revision,
+        if (credentialPlacement == RepositoryCredentialPlacement.jsonBody ||
+            credentialPlacement == RepositoryCredentialPlacement.formBody)
+          'access_token': token,
+      };
+      if (credentialPlacement == RepositoryCredentialPlacement.formBody) {
+        request.bodyFields = fields;
+      } else {
+        request.body = jsonEncode(fields);
+      }
+      if (credentialPlacement ==
+          RepositoryCredentialPlacement.authorizationHeader) {
+        request.headers['Authorization'] = 'Bearer $token';
+      }
       final response = await httpTransport.send(request);
       if (response.statusCode != 200 && response.statusCode != 204) {
         await httpTransport.throwForStatus(
@@ -543,7 +584,7 @@ abstract base class RepositoryDataSource
 
   /// Gitee's v5 API expects the legacy `token` authorization scheme, while
   /// GitHub accepts `Bearer`. Writes keep their provider-specific body format;
-  /// this scheme only applies to read/probe requests.
+  /// this scheme applies to read and probe requests.
   String get readAuthorizationScheme =>
       credentialPlacement == RepositoryCredentialPlacement.formBody
       ? 'token'

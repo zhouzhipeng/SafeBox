@@ -11,7 +11,7 @@ import '../identity/rsa_models.dart';
 import 'data_source.dart';
 import 'source_path.dart';
 
-enum BundleDownloadStage { preparing, downloading, decrypting }
+enum BundleDownloadStage { preparing, downloading, decrypting, merging }
 
 final class BundleDownloadProgress {
   const BundleDownloadProgress({
@@ -23,6 +23,10 @@ final class BundleDownloadProgress {
     this.currentShardIndex,
     this.currentObjectBytes = 0,
     this.currentObjectLength = 0,
+    this.processedBytes = 0,
+    this.totalProcessingBytes = 0,
+    this.processedShards = 0,
+    this.processingTotalShards = 0,
   });
 
   final BundleDownloadStage stage;
@@ -37,9 +41,20 @@ final class BundleDownloadProgress {
   final int? currentShardIndex;
   final int currentObjectBytes;
   final int currentObjectLength;
+  final int processedBytes;
+  final int totalProcessingBytes;
+  final int processedShards;
+  final int processingTotalShards;
 
   double? get fraction {
-    if (stage == BundleDownloadStage.decrypting || totalObjects <= 0) {
+    if (stage == BundleDownloadStage.decrypting ||
+        stage == BundleDownloadStage.merging) {
+      if (totalProcessingBytes <= 0) {
+        return null;
+      }
+      return (processedBytes / totalProcessingBytes).clamp(0, 1).toDouble();
+    }
+    if (totalObjects <= 0) {
       return null;
     }
     return (progressUnits / totalObjects).clamp(0, 1).toDouble();
@@ -48,15 +63,39 @@ final class BundleDownloadProgress {
   String get overallLabel {
     final value = fraction;
     if (value == null) {
-      return stage == BundleDownloadStage.decrypting ? '下载完成' : '读取文件信息';
+      return switch (stage) {
+        BundleDownloadStage.decrypting => '文件解密',
+        BundleDownloadStage.merging => '文件合并',
+        _ => '读取文件信息',
+      };
+    }
+    if (stage == BundleDownloadStage.decrypting ||
+        stage == BundleDownloadStage.merging) {
+      final action = stage == BundleDownloadStage.decrypting ? '文件解密' : '文件合并';
+      final shardLabel = processingTotalShards > 0
+          ? ' · $processedShards/$processingTotalShards 个分片'
+          : '';
+      return '$action ${(value * 100).toStringAsFixed(1)}%$shardLabel';
     }
     return '${(value * 100).toStringAsFixed(1)}% · '
         '$completedObjects/$totalObjects 个分片';
   }
 
   String get detailLabel {
-    if (stage == BundleDownloadStage.decrypting) {
-      return '已下载 ${_formatBytes(downloadedBytes)}，正在校验并解密文件。';
+    if (stage == BundleDownloadStage.decrypting ||
+        stage == BundleDownloadStage.merging) {
+      final action = stage == BundleDownloadStage.decrypting ? '解密文件' : '合并文件';
+      final processing = totalProcessingBytes <= 0
+          ? action
+          : '$action ${_formatBytes(processedBytes)} / '
+                '${_formatBytes(totalProcessingBytes)} '
+                '(${(processedBytes / totalProcessingBytes * 100).clamp(0, 100).toStringAsFixed(1)}%)';
+      return <String>[
+        '已下载 ${_formatBytes(downloadedBytes)}',
+        processing,
+        if (processingTotalShards > 0)
+          '已处理 $processedShards/$processingTotalShards 个分片',
+      ].join(' · ');
     }
     final current = currentShardIndex;
     final currentLabel = current == null || currentObjectLength <= 0
@@ -91,9 +130,10 @@ abstract final class BundleSync {
       onProgress: onProgress,
     );
     return BackgroundBundleCrypto.decrypt(
-      objects: objects,
+      objects: objects.objects,
       mnemonic: mnemonic,
       expectedIdentity: expectedIdentity,
+      onProgress: objects.reporter.updateDecryption,
     );
   }
 
@@ -130,14 +170,15 @@ abstract final class BundleSync {
       onProgress: onProgress,
     );
     await BackgroundBundleCrypto.decryptToFile(
-      objects: objects,
+      objects: objects.objects,
       mnemonic: mnemonic,
       destination: destination,
       expectedIdentity: expectedIdentity,
+      onProgress: objects.reporter.updateDecryption,
     );
   }
 
-  static Future<Map<String, List<int>>> _downloadObjects({
+  static Future<_DownloadedObjects> _downloadObjects({
     required DataSource source,
     required SourcePath rootPath,
     void Function(BundleDownloadProgress progress)? onProgress,
@@ -210,7 +251,7 @@ abstract final class BundleSync {
       },
     );
     reporter.emitDecrypting();
-    return objects;
+    return _DownloadedObjects(objects: objects, reporter: reporter);
   }
 
   static Future<List<RevisionToken>> publish(
@@ -324,6 +365,11 @@ final class _DownloadProgressReporter {
   int _completedObjects = 0;
   int _totalObjects = 0;
   int? _currentShardIndex;
+  int _processedBytes = 0;
+  int _totalProcessingBytes = 0;
+  int _processedShards = 0;
+  int _processingTotalShards = 0;
+  int? _processingCurrentShardIndex;
 
   void startObject({required int shardIndex, required int length}) {
     _active[shardIndex] = (bytes: 0, length: length);
@@ -356,31 +402,59 @@ final class _DownloadProgressReporter {
   }
 
   void emitDecrypting() {
+    _processedBytes = 0;
+    _totalProcessingBytes = 0;
+    _processedShards = 0;
+    _processingTotalShards = 0;
+    _processingCurrentShardIndex = null;
     _emit(stage: BundleDownloadStage.decrypting);
+  }
+
+  void updateDecryption(BundleDecryptionProgress progress) {
+    _processedBytes = progress.processedBytes;
+    _totalProcessingBytes = progress.totalBytes;
+    _processedShards = progress.completedShards;
+    _processingTotalShards = progress.totalShards;
+    _processingCurrentShardIndex = progress.currentShardIndex;
+    _emit(
+      stage: progress.stage == BundleDecryptionStage.merging
+          ? BundleDownloadStage.merging
+          : BundleDownloadStage.decrypting,
+    );
   }
 
   void _emit({BundleDownloadStage? stage}) {
     final callback = onProgress;
     if (callback == null) return;
+    final effectiveStage =
+        stage ??
+        (_totalObjects == 0
+            ? BundleDownloadStage.preparing
+            : BundleDownloadStage.downloading);
     final progress = _progressUnits;
     final current = _currentShardIndex == null
         ? null
         : _active[_currentShardIndex!];
+    final processing =
+        effectiveStage == BundleDownloadStage.decrypting ||
+        effectiveStage == BundleDownloadStage.merging;
     try {
       callback(
         BundleDownloadProgress(
-          stage:
-              stage ??
-              (_totalObjects == 0
-                  ? BundleDownloadStage.preparing
-                  : BundleDownloadStage.downloading),
+          stage: effectiveStage,
           downloadedBytes: _downloadedBytes,
           completedObjects: _completedObjects,
           totalObjects: _totalObjects,
           progressUnits: progress,
-          currentShardIndex: _currentShardIndex,
-          currentObjectBytes: current?.bytes ?? 0,
-          currentObjectLength: current?.length ?? 0,
+          currentShardIndex: processing
+              ? _processingCurrentShardIndex
+              : _currentShardIndex,
+          currentObjectBytes: processing ? 0 : current?.bytes ?? 0,
+          currentObjectLength: processing ? 0 : current?.length ?? 0,
+          processedBytes: _processedBytes,
+          totalProcessingBytes: _totalProcessingBytes,
+          processedShards: _processedShards,
+          processingTotalShards: _processingTotalShards,
         ),
       );
     } on Object {
@@ -397,6 +471,13 @@ final class _DownloadProgressReporter {
     }
     return value;
   }
+}
+
+final class _DownloadedObjects {
+  const _DownloadedObjects({required this.objects, required this.reporter});
+
+  final Map<String, List<int>> objects;
+  final _DownloadProgressReporter reporter;
 }
 
 String _formatBytes(int bytes) {

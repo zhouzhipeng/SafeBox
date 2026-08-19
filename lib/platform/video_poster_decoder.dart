@@ -8,6 +8,19 @@ abstract interface class VideoPosterDecoder {
   Future<VideoPosterFrame?> decode(File source);
 }
 
+/// Optional extension for decoders that can seek to several positions in a
+/// video. Keeping this separate from [VideoPosterDecoder] preserves the
+/// single-poster fallback on platforms whose native decoder only supports one
+/// frame.
+abstract interface class VideoPosterCandidatesDecoder {
+  Future<List<VideoPosterFrame>> decodeCandidates(
+    File source, {
+    int count = defaultVideoPosterCandidateCount,
+  });
+}
+
+const int defaultVideoPosterCandidateCount = 5;
+
 final class VideoPosterFrame {
   VideoPosterFrame({
     required this.width,

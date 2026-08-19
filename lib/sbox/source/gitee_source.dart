@@ -16,7 +16,7 @@ final class GiteeDataSource extends RepositoryDataSource {
   SourceCapabilities get capabilities => SourceCapabilities(
     canRead: true,
     canWrite: credentialStore != null && credentialId != null,
-    canDelete: false,
+    canDelete: credentialStore != null && credentialId != null,
     canListObjects: true,
     supportsRangeRead: true,
     maxObjectBytes: 20 * 1024 * 1024,

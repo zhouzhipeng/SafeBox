@@ -25,4 +25,22 @@ void main() {
     expect(github.toJson().containsKey('branch'), isFalse);
     expect(gitee.toJson().containsKey('branch'), isFalse);
   });
+
+  test('repository enabled state is persisted and old configs default to true', () {
+    final disabled = CloudRepositoryEndpoint.fromRepositoryUrl(
+      'https://github.com/example/disabled',
+      credentialId: SourceCredentialId('github-token'),
+      expectedHost: 'github.com',
+      enabled: false,
+    );
+    final restored = CloudRepositoryEndpoint.fromJson(disabled.toJson());
+    expect(restored.enabled, isFalse);
+
+    final legacy = CloudRepositoryEndpoint.fromJson(<String, Object?>{
+      'owner': 'example',
+      'repository': 'legacy',
+      'credential_id': 'github-token',
+    });
+    expect(legacy.enabled, isTrue);
+  });
 }

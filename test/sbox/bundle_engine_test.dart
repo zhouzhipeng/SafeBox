@@ -168,6 +168,7 @@ void main() {
         'sbox-v3-stream-',
       );
       try {
+        final encryptionProgress = <BundleEncryptionProgress>[];
         final committed = await BundleEncryptor().encryptToDirectory(
           input: MemoryBundleInput(plaintext),
           declaredLength: plaintext.length,
@@ -181,9 +182,25 @@ void main() {
             randomness: randomness,
           ),
           root: directory,
+          onProgress: encryptionProgress.add,
         );
         expect(committed, hasLength(2));
         expect(committed.last, contains('_0_2.sbox'));
+        expect(
+          encryptionProgress.any(
+            (item) => item.stage == BundleEncryptionStage.splitting,
+          ),
+          isTrue,
+        );
+        expect(
+          encryptionProgress.any(
+            (item) =>
+                item.stage == BundleEncryptionStage.encrypting &&
+                item.processedBytes > 0,
+          ),
+          isTrue,
+        );
+        expect(encryptionProgress.last.processedBytes, plaintext.length);
         expect(
           await Future.wait(
             committed.map((name) => File('${directory.path}/$name').exists()),
@@ -332,20 +349,17 @@ BundleEncryptionRandomness _randomness(
   int shardCount,
   int offset, {
   List<int>? bundleId,
-}) =>
-    BundleEncryptionRandomness(
-      bundleId: bundleId ??
-          List<int>.generate(
-            16,
-            (index) => (0xa0 + index + offset) & 0xff,
-          ),
-      bundleDek: List<int>.generate(32, (index) => (index + offset) & 0xff),
-      noncePrefixes: <List<int>>[
-        for (var index = 0; index < shardCount; index++)
-          <int>[index + 1, index + 2, index + 3, index + 4],
-      ],
-      oaepSeed: List<int>.filled(32, 0x55 + offset),
-    );
+}) => BundleEncryptionRandomness(
+  bundleId:
+      bundleId ??
+      List<int>.generate(16, (index) => (0xa0 + index + offset) & 0xff),
+  bundleDek: List<int>.generate(32, (index) => (index + offset) & 0xff),
+  noncePrefixes: <List<int>>[
+    for (var index = 0; index < shardCount; index++)
+      <int>[index + 1, index + 2, index + 3, index + 4],
+  ],
+  oaepSeed: List<int>.filled(32, 0x55 + offset),
+);
 
 final class _ChangingInput implements BundleInput {
   var _readCount = 0;

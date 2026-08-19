@@ -47,10 +47,7 @@ void main() {
     try {
       await source.writeAsBytes(<int>[0x47, 0x49, 0x46, 0x38, 0x39, 0x61]);
       final result = await const PlatformPreviewGenerator().generate(source);
-      expect(
-        result,
-        isA<PreviewUnavailable>(),
-      );
+      expect(result, isA<PreviewUnavailable>());
       expect(
         (result as PreviewUnavailable).reason,
         PreviewUnavailableReason.unsupportedMediaType,
@@ -113,6 +110,50 @@ void main() {
     }
   });
 
+  test('generates selectable previews for several video candidates', () async {
+    final directory = await Directory.systemTemp.createTemp('sbox-preview-');
+    final source = File('${directory.path}${Platform.pathSeparator}source.mp4');
+    try {
+      await source.writeAsBytes(<int>[
+        0x00,
+        0x00,
+        0x00,
+        0x18,
+        0x66,
+        0x74,
+        0x79,
+        0x70,
+        0x69,
+        0x73,
+        0x6f,
+        0x6d,
+      ], flush: true);
+      final result = await PlatformPreviewGenerator(
+        videoPosterDecoder: _FakeVideoPosterCandidatesDecoder(
+          <VideoPosterFrame>[
+            _solidFrame(96, 48, 0x40),
+            _solidFrame(96, 48, 0x80),
+            _solidFrame(96, 48, 0xc0),
+          ],
+        ),
+      ).generateVideoCandidates(source, count: 3);
+      expect(result, hasLength(3));
+      expect(result.first.preview.width, 96);
+      expect(result.first.preview.height, 48);
+      for (final generated in result) {
+        BaselineJpegInspector.validate(
+          generated.preview.encodedBytes,
+          width: 96,
+          height: 48,
+        );
+        generated.preview.dispose();
+      }
+    } finally {
+      if (await source.exists()) await source.delete();
+      await directory.delete();
+    }
+  });
+
   test('preview constants keep the protocol budgets bounded', () {
     expect(SboxProtocol.maxPreviewBytes, 10240);
     expect(SboxProtocol.maxPreviewDimension, 320);
@@ -128,4 +169,37 @@ final class _FakeVideoPosterDecoder implements VideoPosterDecoder {
 
   @override
   Future<VideoPosterFrame?> decode(File source) async => frame;
+}
+
+final class _FakeVideoPosterCandidatesDecoder
+    implements VideoPosterDecoder, VideoPosterCandidatesDecoder {
+  _FakeVideoPosterCandidatesDecoder(this.frames);
+
+  final List<VideoPosterFrame> frames;
+
+  @override
+  Future<VideoPosterFrame?> decode(File source) async =>
+      frames.isEmpty ? null : frames.first;
+
+  @override
+  Future<List<VideoPosterFrame>> decodeCandidates(
+    File source, {
+    int count = defaultVideoPosterCandidateCount,
+  }) async => frames.take(count).toList();
+}
+
+VideoPosterFrame _solidFrame(int width, int height, int value) {
+  final pixels = Uint8List(width * height * 4);
+  for (var index = 0; index < pixels.length; index += 4) {
+    pixels[index] = value;
+    pixels[index + 1] = value;
+    pixels[index + 2] = value;
+    pixels[index + 3] = 0xff;
+  }
+  return VideoPosterFrame(
+    width: width,
+    height: height,
+    rowStride: width * 4,
+    pixels: pixels,
+  );
 }

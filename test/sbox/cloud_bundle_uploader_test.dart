@@ -1,4 +1,5 @@
 import 'package:safebox/sbox/source/cloud_bundle_uploader.dart';
+import 'package:safebox/sbox/errors.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -31,5 +32,29 @@ void main() {
     expect(completed.isComplete, isTrue);
     expect(completed.fraction, 1);
     expect(completed.overallLabel, '44/44 (100.0%)');
+  });
+
+  test('upload cancellation exposes a stable cancelled error', () {
+    final cancellation = CloudBundleUploadCancellation();
+    var cleanupCalls = 0;
+    final unregister = cancellation.registerOnCancel(() => cleanupCalls++);
+
+    expect(cancellation.isCancelled, isFalse);
+    cancellation.cancel();
+    expect(cancellation.isCancelled, isTrue);
+    expect(cleanupCalls, 1);
+    unregister();
+    cancellation.cancel();
+    expect(cleanupCalls, 1);
+    expect(
+      cancellation.throwIfCancelled,
+      throwsA(
+        isA<SboxException>().having(
+          (error) => error.code,
+          'code',
+          SboxErrorCode.cancelled,
+        ),
+      ),
+    );
   });
 }

@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui' show PointerDeviceKind;
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
@@ -16,6 +17,7 @@ import '../../platform/flutter_video_poster_decoder.dart';
 import '../../platform/preview_generation_result.dart';
 import '../../platform/preview_generator.dart';
 import '../../platform/secure_credential_store.dart';
+import '../../platform/video_poster_decoder.dart';
 import '../../sbox/bytes.dart';
 import '../../sbox/constants.dart';
 import '../../sbox/engine/bundle_encryptor.dart';
@@ -24,16 +26,19 @@ import '../../sbox/format/bundle_preview.dart';
 import '../../sbox/identity/public_identity_record.dart';
 import '../../sbox/source/cloud_backup_config.dart';
 import '../../sbox/source/cloud_bundle_uploader.dart';
+import '../../sbox/source/credential.dart';
 
 final class EncryptPage extends StatefulWidget {
   const EncryptPage({
     super.key,
     required this.controller,
     this.onOpenCloudSettings,
+    this.videoPosterDecoder = const FlutterVideoPosterDecoder(),
   });
 
   final AppController controller;
   final VoidCallback? onOpenCloudSettings;
+  final VideoPosterDecoder videoPosterDecoder;
 
   @override
   State<EncryptPage> createState() => _EncryptPageState();
@@ -53,7 +58,17 @@ final class _EncryptPageState extends State<EncryptPage> {
   bool _generatePreview = true;
   XFile? _selectedFile;
   int? _selectedFileLength;
+  final List<BundlePreview> _videoPreviewCandidates = <BundlePreview>[];
+  int _selectedVideoPreviewIndex = 0;
+  bool _videoFileDetected = false;
+  bool _videoPreviewLoading = false;
+  String? _videoPreviewError;
+  String _videoPreviewMediaType = 'video/mp4';
+  int _videoPreviewRequestId = 0;
   CloudBundleUploadProgress? _uploadProgress;
+  CloudBundleUploadCancellation? _uploadCancellation;
+  http.Client? _uploadClient;
+  bool _uploadCancelRequested = false;
 
   @override
   void initState() {
@@ -63,6 +78,9 @@ final class _EncryptPageState extends State<EncryptPage> {
 
   @override
   void dispose() {
+    _uploadCancellation?.cancel();
+    _uploadClient?.close();
+    _disposeVideoPreviewCandidates();
     _textController.clear();
     _nameController.clear();
     _textController.dispose();
@@ -129,23 +147,18 @@ final class _EncryptPageState extends State<EncryptPage> {
                       },
               ),
               const SizedBox(height: 14),
-              if (_contentKind == SboxContentKind.file)
-                ...<Widget>[
-                  _buildFilePicker(context),
-                  const SizedBox(height: 8),
-                  SwitchListTile(
-                    value: _generatePreview,
-                    onChanged: _busy
-                        ? null
-                        : (value) => setState(() => _generatePreview = value),
-                    contentPadding: EdgeInsets.zero,
-                    secondary: const Icon(Icons.image_outlined),
-                    subtitle: const Text(
-                      '仅上传图片或视频时生效；持有完整公钥的人可以读取缩略图，完整文件仍需验证。',
-                    ),
-                  ),
-                ]
-              else ...<Widget>[
+              if (_contentKind == SboxContentKind.file) ...<Widget>[
+                _buildFilePicker(context),
+                const SizedBox(height: 8),
+                SwitchListTile(
+                  value: _generatePreview,
+                  onChanged: _busy ? null : _setGeneratePreview,
+                  contentPadding: EdgeInsets.zero,
+                  secondary: const Icon(Icons.image_outlined),
+                  subtitle: const Text('仅上传图片或视频时生效；持有完整公钥的人可以读取缩略图，完整文件仍需验证。'),
+                ),
+                _buildVideoPreviewPicker(context),
+              ] else ...<Widget>[
                 TextField(
                   controller: _nameController,
                   decoration: const InputDecoration(
@@ -169,14 +182,19 @@ final class _EncryptPageState extends State<EncryptPage> {
         const SizedBox(height: 14),
         if (_busy)
           SboxProgressCard(
-            title: _uploadProgress == null
+            title: _uploadCancelRequested
+                ? '正在取消上传'
+                : _uploadProgress == null
                 ? '正在加密并同步双云'
                 : _uploadStageTitle(_uploadProgress!),
-            detail: _uploadProgress == null
+            detail: _uploadCancelRequested
+                ? '正在停止当前上传请求，请稍候。'
+                : _uploadProgress == null
                 ? '先写入本地加密副本，再通过 GitHub、Gitee API 同时创建文件。相同 MD5 文件不会重新生成或上传。'
                 : _uploadProgress!.detailLabel,
             value: _uploadProgress?.fraction,
             progressLabel: _uploadProgress?.overallLabel,
+            onCancel: _uploadCancelRequested ? null : _cancelUpload,
           )
         else
           const SecurityNotice(
@@ -267,10 +285,7 @@ final class _EncryptPageState extends State<EncryptPage> {
 
   Widget _buildFileSelectionHint(BuildContext context, XFile? file) {
     if (file == null) {
-      return Text(
-        '或点击打开文件选择器',
-        style: Theme.of(context).textTheme.bodyMedium,
-      );
+      return Text('或点击打开文件选择器', style: Theme.of(context).textTheme.bodyMedium);
     }
 
     return TextButton(
@@ -284,6 +299,191 @@ final class _EncryptPageState extends State<EncryptPage> {
       child: Text(
         '${_formatBytes(_selectedFileLength ?? 0)} · 点击可更换文件',
         style: Theme.of(context).textTheme.bodyMedium,
+      ),
+    );
+  }
+
+  Widget _buildVideoPreviewPicker(BuildContext context) {
+    final selectedFile = _selectedFile;
+    final selectedFileLooksLikeVideo =
+        selectedFile != null &&
+        (_looksLikeVideoFile(selectedFile.name) ||
+            _looksLikeVideoFile(selectedFile.path));
+    if (!_generatePreview ||
+        (!_videoFileDetected && !selectedFileLooksLikeVideo)) {
+      return const SizedBox.shrink();
+    }
+
+    final candidates = _videoPreviewCandidates;
+    final selectedIndex = candidates.isEmpty
+        ? 0
+        : _selectedVideoPreviewIndex.clamp(0, candidates.length - 1).toInt();
+    final detail = _videoPreviewLoading
+        ? '正在随机抽取视频画面，请稍候。'
+        : candidates.isEmpty
+        ? (_videoPreviewError ?? '暂时无法提取候选画面，上传时会继续尝试生成默认缩略图。')
+        : '已随机抽取 ${candidates.length} 个画面，默认使用第 1 个；点击下方画面即可更换。';
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: SboxCard(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Row(
+              children: <Widget>[
+                const Icon(Icons.video_library_outlined, size: 20),
+                const SizedBox(width: 9),
+                Expanded(
+                  child: Text(
+                    '选择视频缩略图',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                ),
+                if (candidates.isNotEmpty)
+                  Text(
+                    '第 ${selectedIndex + 1} 帧',
+                    style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                      color: SboxColors.accent,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 7),
+            Text(
+              detail,
+              style: Theme.of(context).textTheme.bodyMedium
+                  ?.copyWith(color: SboxColors.textMuted),
+            ),
+            if (_videoPreviewLoading) ...<Widget>[
+              const SizedBox(height: 12),
+              const LinearProgressIndicator(minHeight: 4),
+            ],
+            if (candidates.isNotEmpty) ...<Widget>[
+              const SizedBox(height: 14),
+              SizedBox(
+                height: 112,
+                child: ScrollConfiguration(
+                  behavior: ScrollConfiguration.of(context).copyWith(
+                    dragDevices: <PointerDeviceKind>{
+                      ...ScrollConfiguration.of(context).dragDevices,
+                      PointerDeviceKind.mouse,
+                    },
+                  ),
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    primary: false,
+                    physics: const ClampingScrollPhysics(),
+                    itemCount: candidates.length,
+                    separatorBuilder: (_, index) => const SizedBox(width: 10),
+                    itemBuilder: (context, index) =>
+                        _buildVideoPreviewCandidate(
+                          context,
+                          candidates[index],
+                          index,
+                          selectedIndex == index,
+                        ),
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildVideoPreviewCandidate(
+    BuildContext context,
+    BundlePreview preview,
+    int index,
+    bool selected,
+  ) {
+    final accent = SboxColors.accent;
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: '视频缩略图候选 ${index + 1}',
+      child: InkWell(
+        onTap: _busy
+            ? null
+            : () => setState(() => _selectedVideoPreviewIndex = index),
+        borderRadius: BorderRadius.circular(9),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 140),
+          width: 148,
+          height: 108,
+          padding: EdgeInsets.all(selected ? 2 : 1),
+          decoration: BoxDecoration(
+            color: SboxColors.panelRaised,
+            borderRadius: BorderRadius.circular(9),
+            border: Border.all(
+              color: selected ? accent : SboxColors.border,
+              width: selected ? 2 : 1,
+            ),
+          ),
+          child: Stack(
+            fit: StackFit.expand,
+            children: <Widget>[
+              ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: Image.memory(
+                  preview.encodedBytesView,
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true,
+                  errorBuilder: (context, error, stackTrace) => const Icon(
+                    Icons.broken_image_outlined,
+                    color: SboxColors.textMuted,
+                  ),
+                ),
+              ),
+              Positioned(
+                left: 5,
+                bottom: 5,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.68),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 3,
+                    ),
+                    child: Text(
+                      '候选 ${index + 1}',
+                      style: Theme.of(context).textTheme.labelSmall
+                          ?.copyWith(color: Colors.white),
+                    ),
+                  ),
+                ),
+              ),
+              if (selected)
+                Positioned(
+                  right: 5,
+                  top: 5,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: accent,
+                      shape: BoxShape.circle,
+                      boxShadow: <BoxShadow>[
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.35),
+                          blurRadius: 5,
+                        ),
+                      ],
+                    ),
+                    child: const Padding(
+                      padding: EdgeInsets.all(3),
+                      child: Icon(Icons.check, size: 16, color: Colors.white),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -304,10 +504,145 @@ final class _EncryptPageState extends State<EncryptPage> {
     }
     final length = await File(path).length();
     if (!mounted) return;
+    final looksLikeVideo =
+        _looksLikeVideoFile(file.name) || _looksLikeVideoFile(file.path);
+    _videoPreviewRequestId++;
+    _disposeVideoPreviewCandidates();
     setState(() {
       _selectedFile = file;
       _selectedFileLength = length;
+      _selectedVideoPreviewIndex = 0;
+      _videoFileDetected = looksLikeVideo;
+      _videoPreviewLoading = looksLikeVideo && _generatePreview;
+      _videoPreviewError = null;
+      _videoPreviewMediaType = 'video/mp4';
     });
+    if (_generatePreview) await _prepareVideoPreviewCandidates(file);
+  }
+
+  void _setGeneratePreview(bool value) {
+    if (_generatePreview == value || _busy) return;
+    if (!value) {
+      _videoPreviewRequestId++;
+      _disposeVideoPreviewCandidates();
+      setState(() {
+        _generatePreview = false;
+        _videoPreviewLoading = false;
+        _videoFileDetected = false;
+        _videoPreviewError = null;
+      });
+      return;
+    }
+    setState(() => _generatePreview = true);
+    final file = _selectedFile;
+    if (file != null) _prepareVideoPreviewCandidates(file);
+  }
+
+  Future<void> _prepareVideoPreviewCandidates(XFile file) async {
+    final requestId = ++_videoPreviewRequestId;
+    final looksLikeVideo =
+        _looksLikeVideoFile(file.name) || _looksLikeVideoFile(file.path);
+    _disposeVideoPreviewCandidates();
+    if (mounted) {
+      setState(() {
+        _videoFileDetected = looksLikeVideo;
+        _videoPreviewLoading = looksLikeVideo && _generatePreview;
+        _videoPreviewError = null;
+        _selectedVideoPreviewIndex = 0;
+      });
+    }
+
+    final source = File(file.path);
+    final generator = PlatformPreviewGenerator(
+      videoPosterDecoder: widget.videoPosterDecoder,
+    );
+    if (!await generator.isVideo(source)) {
+      if (mounted &&
+          requestId == _videoPreviewRequestId &&
+          _selectedFile?.path == file.path) {
+        setState(() {
+          _videoPreviewLoading = false;
+          _videoPreviewError = '文件看起来像视频，但无法识别其视频格式。';
+        });
+      }
+      return;
+    }
+    if (!mounted ||
+        requestId != _videoPreviewRequestId ||
+        _selectedFile?.path != file.path) {
+      return;
+    }
+    setState(() {
+      _videoFileDetected = true;
+      _videoPreviewLoading = true;
+      _videoPreviewError = null;
+    });
+
+    List<PreviewGenerated> generated;
+    try {
+      generated = await generator.generateVideoCandidates(
+        source,
+        count: defaultVideoPosterCandidateCount,
+      );
+    } on Object {
+      generated = <PreviewGenerated>[];
+    }
+    if (!mounted ||
+        requestId != _videoPreviewRequestId ||
+        _selectedFile?.path != file.path) {
+      for (final item in generated) {
+        item.preview.dispose();
+      }
+      return;
+    }
+
+    _videoPreviewCandidates.addAll(generated.map((item) => item.preview));
+    if (generated.isNotEmpty) {
+      _videoPreviewMediaType = generated.first.detectedSourceMediaType;
+    }
+    setState(() {
+      _videoPreviewLoading = false;
+      _selectedVideoPreviewIndex = 0;
+      _videoPreviewError = generated.isEmpty
+          ? '暂时无法提取候选画面，上传时会继续尝试生成默认缩略图。'
+          : null;
+    });
+  }
+
+  void _disposeVideoPreviewCandidates() {
+    for (final preview in _videoPreviewCandidates) {
+      preview.dispose();
+    }
+    _videoPreviewCandidates.clear();
+    _selectedVideoPreviewIndex = 0;
+  }
+
+  BundlePreview? _selectedVideoPreview() {
+    if (_videoPreviewCandidates.isEmpty ||
+        _selectedVideoPreviewIndex < 0 ||
+        _selectedVideoPreviewIndex >= _videoPreviewCandidates.length) {
+      return null;
+    }
+    return _videoPreviewCandidates[_selectedVideoPreviewIndex];
+  }
+
+  static bool _looksLikeVideoFile(String path) {
+    final extension = p.extension(path).toLowerCase();
+    return const <String>{
+      '.mp4',
+      '.m4v',
+      '.mov',
+      '.webm',
+      '.avi',
+      '.wmv',
+      '.mkv',
+      '.3gp',
+      '.3g2',
+      '.mpeg',
+      '.mpg',
+      '.m2ts',
+      '.mts',
+    }.contains(extension);
   }
 
   static String _formatBytes(int bytes) {
@@ -396,15 +731,21 @@ final class _EncryptPageState extends State<EncryptPage> {
       final configuration = await _store.load();
       var credentialsReady = false;
       if (configuration != null) {
-        final githubToken = await _credentialStore.getAccessToken(
-          configuration.github.credentialId,
+        final endpoints = <CloudRepositoryEndpoint>[
+          if (configuration.github.enabled) configuration.github,
+          if (configuration.gitee.enabled) configuration.gitee,
+        ];
+        final tokens = await Future.wait<SourceAccessToken?>(
+          endpoints.map(
+            (endpoint) =>
+                _credentialStore.getAccessToken(endpoint.credentialId),
+          ),
         );
-        final giteeToken = await _credentialStore.getAccessToken(
-          configuration.gitee.credentialId,
-        );
-        credentialsReady = githubToken != null && giteeToken != null;
-        githubToken?.dispose();
-        giteeToken?.dispose();
+        credentialsReady =
+            endpoints.isNotEmpty && tokens.every((token) => token != null);
+        for (final token in tokens) {
+          token?.dispose();
+        }
       }
       if (!mounted) return;
       setState(() {
@@ -473,37 +814,51 @@ final class _EncryptPageState extends State<EncryptPage> {
       mediaType = 'text/plain; charset=utf-8';
     }
 
+    final cancellation = CloudBundleUploadCancellation();
     setState(() {
       _busy = true;
       _uploadProgress = null;
+      _uploadCancellation = cancellation;
+      _uploadCancelRequested = false;
     });
     try {
+      cancellation.throwIfCancelled();
       if (_contentKind == SboxContentKind.file && _generatePreview) {
-        final generated = await const PlatformPreviewGenerator(
-          videoPosterDecoder: FlutterVideoPosterDecoder(),
-        ).generate(File((_selectedFile!).path));
-        switch (generated) {
-          case PreviewGenerated(
-            preview: final generatedPreview,
-            detectedSourceMediaType: final detected,
-          ):
-            preview = generatedPreview;
-            mediaType = detected;
-          case PreviewUnavailable(
-            reason: final reason,
-            detectedSourceMediaType: final detected,
-          ):
-            previewUnavailableReason = reason;
-            if (detected != null) mediaType = detected;
+        final selectedCandidate = _selectedVideoPreview();
+        if (selectedCandidate != null) {
+          // Keep the candidates alive for the next upload; the encryptor owns
+          // this copy for the duration of the current upload.
+          preview = selectedCandidate.copy();
+          mediaType = _videoPreviewMediaType;
+        } else {
+          final generated = await PlatformPreviewGenerator(
+            videoPosterDecoder: widget.videoPosterDecoder,
+          ).generate(File((_selectedFile!).path));
+          switch (generated) {
+            case PreviewGenerated(
+              preview: final generatedPreview,
+              detectedSourceMediaType: final detected,
+            ):
+              preview = generatedPreview;
+              mediaType = detected;
+            case PreviewUnavailable(
+              reason: final reason,
+              detectedSourceMediaType: final detected,
+            ):
+              previewUnavailableReason = reason;
+              if (detected != null) mediaType = detected;
+          }
         }
       } else {
         previewUnavailableReason = PreviewUnavailableReason.userDisabled;
       }
+      cancellation.throwIfCancelled();
       final identity = PublicIdentityRecord(
         spkiDer: record.spkiDer,
         recipientKeyId: record.recipientKeyId,
       ).toPublicIdentity();
       final client = http.Client();
+      _uploadClient = client;
       CloudBundleUploadResult result;
       try {
         result =
@@ -520,17 +875,22 @@ final class _EncryptPageState extends State<EncryptPage> {
                 originalName: originalName,
                 mediaType: mediaType,
                 title: originalName,
+                targetNominalShardPlaintextSize:
+                    widget.controller.targetNominalShardPlaintextSize,
                 preview: preview,
-                previewRequested: _contentKind == SboxContentKind.file &&
-                    _generatePreview,
+                previewRequested:
+                    _contentKind == SboxContentKind.file && _generatePreview,
                 previewUnavailableReason: previewUnavailableReason,
               ),
               configuration: configuration,
               onProgress: _handleUploadProgress,
+              cancellation: cancellation,
             );
       } finally {
         client.close();
+        if (identical(_uploadClient, client)) _uploadClient = null;
       }
+      cancellation.throwIfCancelled();
       if (!mounted) return;
       final pushed = result.uploadedSources;
       if (result.duplicate && pushed.isEmpty) {
@@ -552,6 +912,11 @@ final class _EncryptPageState extends State<EncryptPage> {
         );
       }
     } catch (error) {
+      if (cancellation.isCancelled ||
+          error is SboxException && error.code == SboxErrorCode.cancelled) {
+        if (mounted) showSboxFeedback(context, '上传已取消');
+        return;
+      }
       if (mounted) {
         widget.controller.setError(error, operation: '加密并上传文件失败');
         final message = error is SboxException
@@ -567,9 +932,22 @@ final class _EncryptPageState extends State<EncryptPage> {
         setState(() {
           _busy = false;
           _uploadProgress = null;
+          if (identical(_uploadCancellation, cancellation)) {
+            _uploadCancellation = null;
+            _uploadCancelRequested = false;
+          }
         });
       }
     }
+  }
+
+  void _cancelUpload() {
+    final cancellation = _uploadCancellation;
+    if (cancellation == null || cancellation.isCancelled) return;
+    cancellation.cancel();
+    _uploadClient?.close();
+    if (!mounted) return;
+    setState(() => _uploadCancelRequested = true);
   }
 
   static String _previewReasonLabel(PreviewUnavailableReason reason) {
@@ -589,13 +967,15 @@ final class _EncryptPageState extends State<EncryptPage> {
   }
 
   void _handleUploadProgress(CloudBundleUploadProgress progress) {
-    if (!mounted) return;
+    if (!mounted || _uploadCancellation?.isCancelled == true) return;
     setState(() => _uploadProgress = progress);
   }
 
   static String _uploadStageTitle(CloudBundleUploadProgress progress) {
     return switch (progress.stage) {
       CloudBundleUploadStage.preparing => '正在准备上传',
+      CloudBundleUploadStage.splitting => '正在切分文件',
+      CloudBundleUploadStage.encrypting => '正在加密文件',
       CloudBundleUploadStage.uploading => '正在上传加密分片',
       CloudBundleUploadStage.verifying => '正在核对云端分片',
       CloudBundleUploadStage.completed => '上传完成，正在收尾',

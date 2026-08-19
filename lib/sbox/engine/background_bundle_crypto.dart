@@ -44,6 +44,7 @@ abstract final class BackgroundBundleCrypto {
     required int declaredLength,
     required BundleEncryptionOptions options,
     required Directory root,
+    void Function(BundleEncryptionProgress progress)? onProgress,
   }) async {
     final request = _EncryptionRequest.fromValues(
       input: input,
@@ -51,10 +52,26 @@ abstract final class BackgroundBundleCrypto {
       options: options,
       rootPath: root.path,
     );
-    final result = await Isolate.run<List<String>>(
-      () => _encryptWorker(request),
-      debugName: 'safebox-encrypt',
-    );
+    late final List<String> result;
+    if (onProgress == null) {
+      result = await _runEncryptionIsolate(request);
+    } else {
+      final port = ReceivePort();
+      final subscription = port.listen((message) {
+        try {
+          onProgress(_decodeEncryptionProgress(message));
+        } on Object {
+          // Progress listeners must never be able to interrupt encryption.
+        }
+      });
+      final sendPort = port.sendPort;
+      try {
+        result = await _runEncryptionIsolate(request, sendPort);
+      } finally {
+        await subscription.cancel();
+        port.close();
+      }
+    }
     return List<String>.unmodifiable(result);
   }
 
@@ -62,16 +79,33 @@ abstract final class BackgroundBundleCrypto {
     required Map<String, List<int>> objects,
     required String mnemonic,
     PublicIdentity? expectedIdentity,
+    void Function(BundleDecryptionProgress progress)? onProgress,
   }) async {
     final request = _DecryptRequest.fromValues(
       objects: objects,
       mnemonic: mnemonic,
       expectedIdentity: expectedIdentity,
     );
-    final result = await Isolate.run<Map<String, Object?>>(
-      () => _decryptWorker(request),
-      debugName: 'safebox-decrypt',
-    );
+    late final Map<String, Object?> result;
+    if (onProgress == null) {
+      result = await _runDecryptionIsolate(request);
+    } else {
+      final port = ReceivePort();
+      final subscription = port.listen((message) {
+        try {
+          onProgress(_decodeDecryptionProgress(message));
+        } on Object {
+          // Progress listeners must never be able to interrupt decryption.
+        }
+      });
+      final sendPort = port.sendPort;
+      try {
+        result = await _runDecryptionIsolate(request, sendPort);
+      } finally {
+        await subscription.cancel();
+        port.close();
+      }
+    }
     final manifestJson = Map<String, Object?>.from(
       result['manifest']! as Map<Object?, Object?>,
     );
@@ -101,16 +135,32 @@ abstract final class BackgroundBundleCrypto {
     required String mnemonic,
     required File destination,
     PublicIdentity? expectedIdentity,
+    void Function(BundleDecryptionProgress progress)? onProgress,
   }) async {
     final request = _DecryptRequest.fromValues(
       objects: objects,
       mnemonic: mnemonic,
       expectedIdentity: expectedIdentity,
     );
-    await Isolate.run<void>(
-      () => _decryptToFileWorker(request, destination.path),
-      debugName: 'safebox-decrypt-file',
-    );
+    if (onProgress == null) {
+      await _runFileDecryptionIsolate(request, destination.path);
+      return;
+    }
+    final port = ReceivePort();
+    final subscription = port.listen((message) {
+      try {
+        onProgress(_decodeDecryptionProgress(message));
+      } on Object {
+        // Progress listeners must never be able to interrupt decryption.
+      }
+    });
+    final sendPort = port.sendPort;
+    try {
+      await _runFileDecryptionIsolate(request, destination.path, sendPort);
+    } finally {
+      await subscription.cancel();
+      port.close();
+    }
   }
 
   static Future<Uint8List> sha256File(File file) async {
@@ -175,6 +225,35 @@ abstract final class BackgroundBundleCrypto {
   );
 }
 
+/// Creates the isolate callback in a top-level scope containing only sendable
+/// values. Creating it inside [BackgroundBundleCrypto.encryptToDirectory]
+/// would also capture that method's progress callback and, transitively, a
+/// Flutter State/controller object graph.
+Future<List<String>> _runEncryptionIsolate(
+  _EncryptionRequest request, [
+  SendPort? progressPort,
+]) => Isolate.run<List<String>>(
+  () => _encryptWorker(request, progressPort),
+  debugName: 'safebox-encrypt',
+);
+
+Future<Map<String, Object?>> _runDecryptionIsolate(
+  _DecryptRequest request, [
+  SendPort? progressPort,
+]) => Isolate.run<Map<String, Object?>>(
+  () => _decryptWorker(request, progressPort),
+  debugName: 'safebox-decrypt',
+);
+
+Future<void> _runFileDecryptionIsolate(
+  _DecryptRequest request,
+  String destinationPath, [
+  SendPort? progressPort,
+]) => Isolate.run<void>(
+  () => _decryptToFileWorker(request, destinationPath, progressPort),
+  debugName: 'safebox-decrypt-file',
+);
+
 Future<Uint8List> _md5Worker(
   _InputRequest input, {
   required int declaredLength,
@@ -187,7 +266,10 @@ Future<Uint8List> _md5Worker(
   );
 }
 
-Future<List<String>> _encryptWorker(_EncryptionRequest request) async {
+Future<List<String>> _encryptWorker(
+  _EncryptionRequest request, [
+  SendPort? progressPort,
+]) async {
   final identity = request.identity.toPublicIdentity();
   final options = BundleEncryptionOptions(
     recipient: identity,
@@ -212,14 +294,23 @@ Future<List<String>> _encryptWorker(_EncryptionRequest request) async {
     declaredLength: request.declaredLength,
     options: options,
     root: Directory(request.rootPath),
+    onProgress: progressPort == null
+        ? null
+        : (progress) => progressPort.send(_encodeEncryptionProgress(progress)),
   );
 }
 
-Future<Map<String, Object?>> _decryptWorker(_DecryptRequest request) async {
+Future<Map<String, Object?>> _decryptWorker(
+  _DecryptRequest request, [
+  SendPort? progressPort,
+]) async {
   final decrypted = await BundleDecryptor().decrypt(
     objects: request.materializeObjects(),
     mnemonic: request.mnemonic,
     expectedIdentity: request.expectedIdentity?.toPublicIdentity(),
+    onProgress: progressPort == null
+        ? null
+        : (progress) => progressPort.send(_encodeDecryptionProgress(progress)),
   );
   final plaintext = decrypted.plaintext;
   final transferable = TransferableTypedData.fromList(<TypedData>[plaintext]);
@@ -239,13 +330,67 @@ Future<Map<String, Object?>> _decryptWorker(_DecryptRequest request) async {
 
 Future<void> _decryptToFileWorker(
   _DecryptRequest request,
-  String destinationPath,
-) => BundleDecryptor().decryptToFile(
+  String destinationPath, [
+  SendPort? progressPort,
+]) => BundleDecryptor().decryptToFile(
   objects: request.materializeObjects(),
   mnemonic: request.mnemonic,
   destination: File(destinationPath),
   expectedIdentity: request.expectedIdentity?.toPublicIdentity(),
+  onProgress: progressPort == null
+      ? null
+      : (progress) => progressPort.send(_encodeDecryptionProgress(progress)),
 );
+
+Map<String, Object?> _encodeEncryptionProgress(
+  BundleEncryptionProgress progress,
+) => <String, Object?>{
+  'stage': progress.stage.index,
+  'processed_bytes': progress.processedBytes,
+  'total_bytes': progress.totalBytes,
+  'completed_shards': progress.completedShards,
+  'total_shards': progress.totalShards,
+  'current_shard_index': progress.currentShardIndex,
+  'current_shard_bytes': progress.currentShardBytes,
+  'current_shard_length': progress.currentShardLength,
+};
+
+BundleEncryptionProgress _decodeEncryptionProgress(Object? message) {
+  final value = Map<Object?, Object?>.from(message! as Map);
+  return BundleEncryptionProgress(
+    stage: BundleEncryptionStage.values[value['stage']! as int],
+    processedBytes: value['processed_bytes']! as int,
+    totalBytes: value['total_bytes']! as int,
+    completedShards: value['completed_shards']! as int,
+    totalShards: value['total_shards']! as int,
+    currentShardIndex: value['current_shard_index'] as int?,
+    currentShardBytes: value['current_shard_bytes']! as int,
+    currentShardLength: value['current_shard_length']! as int,
+  );
+}
+
+Map<String, Object?> _encodeDecryptionProgress(
+  BundleDecryptionProgress progress,
+) => <String, Object?>{
+  'stage': progress.stage.index,
+  'processed_bytes': progress.processedBytes,
+  'total_bytes': progress.totalBytes,
+  'completed_shards': progress.completedShards,
+  'total_shards': progress.totalShards,
+  'current_shard_index': progress.currentShardIndex,
+};
+
+BundleDecryptionProgress _decodeDecryptionProgress(Object? message) {
+  final value = Map<Object?, Object?>.from(message! as Map);
+  return BundleDecryptionProgress(
+    stage: BundleDecryptionStage.values[value['stage']! as int],
+    processedBytes: value['processed_bytes']! as int,
+    totalBytes: value['total_bytes']! as int,
+    completedShards: value['completed_shards']! as int,
+    totalShards: value['total_shards']! as int,
+    currentShardIndex: value['current_shard_index'] as int?,
+  );
+}
 
 Future<Uint8List> _sha256FileWorker(String path) =>
     io_hash.sha256File(File(path));
@@ -341,13 +486,12 @@ final class _PreviewRequest {
     required List<int> bytes,
   }) : bytes = Uint8List.fromList(bytes);
 
-  factory _PreviewRequest.fromPreview(BundlePreview preview) =>
-      _PreviewRequest(
-        codecId: preview.codec.wireId,
-        width: preview.width,
-        height: preview.height,
-        bytes: preview.encodedBytes,
-      );
+  factory _PreviewRequest.fromPreview(BundlePreview preview) => _PreviewRequest(
+    codecId: preview.codec.wireId,
+    width: preview.width,
+    height: preview.height,
+    bytes: preview.encodedBytes,
+  );
 
   factory _PreviewRequest.fromMap(Map<String, Object?> value) =>
       _PreviewRequest(

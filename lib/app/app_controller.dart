@@ -9,6 +9,7 @@ import '../platform/source_configuration_store.dart';
 import '../platform/public_identity_store.dart';
 import '../platform/temporary_plaintext_platform.dart';
 import '../sbox/bytes.dart';
+import '../sbox/constants.dart';
 import '../sbox/identity/bip39_identity.dart';
 import '../sbox/identity/public_identity_record.dart';
 import '../sbox/source/credential.dart';
@@ -52,6 +53,8 @@ final class AppController extends ChangeNotifier {
   final AppLogger _logger;
   final bool _ownsLogger;
   PublicIdentityRecord? _identity;
+  int _targetNominalShardPlaintextSize =
+      SboxProtocol.defaultNominalShardPlaintextSize;
   bool _initialized = false;
   String? _statusMessage;
   String? _errorMessage;
@@ -62,6 +65,7 @@ final class AppController extends ChangeNotifier {
   String? get statusMessage => _statusMessage;
   String? get errorMessage => _errorMessage;
   AppLogger get logger => _logger;
+  int get targetNominalShardPlaintextSize => _targetNominalShardPlaintextSize;
   String get shortFingerprint {
     final record = _identity;
     if (record == null) return '未配置公开身份';
@@ -73,8 +77,16 @@ final class AppController extends ChangeNotifier {
     if (_initialized) return;
     await _logger.initialize();
     _identity = await _identityStore.load();
+    _targetNominalShardPlaintextSize = await _appSettingsStore
+        .loadTargetNominalShardPlaintextSize();
     _initialized = true;
     _statusMessage = _identity == null ? '请创建或恢复 RSA 公开身份' : '已加载 RSA 公开身份';
+    notifyListeners();
+  }
+
+  Future<void> saveTargetNominalShardPlaintextSize(int value) async {
+    await _appSettingsStore.saveTargetNominalShardPlaintextSize(value);
+    _targetNominalShardPlaintextSize = value;
     notifyListeners();
   }
 
@@ -172,6 +184,8 @@ final class AppController extends ChangeNotifier {
     }
 
     _identity = null;
+    _targetNominalShardPlaintextSize =
+        SboxProtocol.defaultNominalShardPlaintextSize;
     _statusMessage = '请创建或恢复 RSA 公开身份';
     _errorMessage = null;
     notifyListeners();

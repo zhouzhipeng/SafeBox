@@ -246,6 +246,34 @@ final class RemoteHttp {
     }
   }
 
+  Future<Uint8List> _readErrorBody(Stream<List<int>> source) async {
+    final output = BytesBuilder(copy: false);
+    var count = 0;
+    try {
+      await for (final chunk in withIdleTimeout(source)) {
+        final remaining = maximumErrorBodyBytes - count;
+        if (remaining <= 0) break;
+        if (chunk.length <= remaining) {
+          output.add(chunk);
+          count += chunk.length;
+        } else {
+          output.add(chunk.sublist(0, remaining));
+          count += remaining;
+          break;
+        }
+      }
+    } on Object catch (error) {
+      // Error-body inspection is best effort. The HTTP status remains the
+      // authoritative failure even when the provider closes the body early.
+      _logError(
+        error,
+        operation: '$sourceName：读取云端错误响应失败',
+        context: '已读取 $count 字节',
+      );
+    }
+    return output.takeBytes();
+  }
+
   Future<Never> throwForStatus(
     http.StreamedResponse response,
     RemoteFailureContext context,
@@ -257,16 +285,29 @@ final class RemoteHttp {
           '${response.request?.method ?? 'REQUEST'} ${_endpoint(response.request?.url)} · '
           'HTTP $statusCode · 阶段 ${context.name}',
     );
-    await discard(response.stream);
+    final errorBody = await _readErrorBody(response.stream);
+    if (_isRateLimitResponse(statusCode, response.headers, errorBody)) {
+      throw SboxException(
+        SboxErrorCode.sourceRateLimit,
+        '数据源暂时限制请求频率',
+        retryAfter: _retryAfter(response.headers),
+        httpStatus: statusCode,
+      );
+    }
     switch (statusCode) {
       case 401:
       case 403:
-        throw const SboxException(
+        throw SboxException(
           SboxErrorCode.sourceAuthentication,
           '数据源授权失败',
+          httpStatus: statusCode,
         );
       case 404:
-        throw const SboxException(SboxErrorCode.sourceNotFound, '数据源对象不存在');
+        throw SboxException(
+          SboxErrorCode.sourceNotFound,
+          '数据源对象不存在',
+          httpStatus: statusCode,
+        );
       case 409:
       case 412:
         throw SboxException(
@@ -274,15 +315,26 @@ final class RemoteHttp {
               ? SboxErrorCode.immutableConflict
               : SboxErrorCode.shardConflict,
           '远端对象状态发生冲突',
+          httpStatus: statusCode,
         );
       case 429:
-        throw const SboxException(SboxErrorCode.sourceRateLimit, '数据源暂时限制请求频率');
+        // Handled above, including any provider retry hint.
+        throw SboxException(
+          SboxErrorCode.sourceRateLimit,
+          '数据源暂时限制请求频率',
+          httpStatus: statusCode,
+        );
       case 413:
-        throw const SboxException(SboxErrorCode.sourceLimit, '对象超过数据源上限');
+        throw SboxException(
+          SboxErrorCode.sourceLimit,
+          '对象超过数据源上限',
+          httpStatus: statusCode,
+        );
       default:
         throw SboxException(
           SboxErrorCode.sourceNetwork,
           '数据源请求失败（HTTP $statusCode）',
+          httpStatus: statusCode,
         );
     }
   }
@@ -342,6 +394,66 @@ final class RemoteHttp {
       left.scheme == right.scheme &&
       left.host.toLowerCase() == right.host.toLowerCase() &&
       left.port == right.port;
+
+  static bool _isRateLimitResponse(
+    int statusCode,
+    Map<String, String> headers,
+    Uint8List body,
+  ) {
+    if (statusCode == 429) return true;
+    if (statusCode != 403 && statusCode != 503) return false;
+    final retryAfter = _headerValue(headers, 'retry-after');
+    if (retryAfter != null && retryAfter.trim().isNotEmpty) return true;
+    for (final name in const <String>[
+      'x-ratelimit-remaining',
+      'x-rate-limit-remaining',
+      'ratelimit-remaining',
+    ]) {
+      if (_headerValue(headers, name)?.trim() == '0') return true;
+    }
+    if (body.isEmpty) return false;
+    final detail = utf8.decode(body, allowMalformed: true).toLowerCase();
+    return const <String>[
+      'rate limit',
+      'rate_limit',
+      'too many requests',
+      'secondary rate',
+      'abuse detection',
+      '请求过于频繁',
+      '请求频繁',
+      '操作过于频繁',
+      '操作频繁',
+      '访问频率',
+      '频率限制',
+    ].any(detail.contains);
+  }
+
+  static Duration? _retryAfter(Map<String, String> headers) {
+    const maximumHintSeconds = 24 * 60 * 60;
+    final retryAfter = _headerValue(headers, 'retry-after')?.trim();
+    final seconds = retryAfter == null ? null : int.tryParse(retryAfter);
+    if (seconds != null && seconds >= 0) {
+      return Duration(seconds: seconds.clamp(0, maximumHintSeconds));
+    }
+    final resetValue =
+        _headerValue(headers, 'x-ratelimit-reset') ??
+        _headerValue(headers, 'x-rate-limit-reset');
+    final resetSeconds = int.tryParse(resetValue?.trim() ?? '');
+    if (resetSeconds == null) return null;
+    final nowSeconds = DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000;
+    final remaining = resetSeconds - nowSeconds;
+    return Duration(seconds: remaining.clamp(0, maximumHintSeconds));
+  }
+
+  static String? _headerValue(Map<String, String> headers, String name) {
+    final direct = headers[name];
+    if (direct != null) return direct;
+    final lowerName = name.toLowerCase();
+    for (final entry in headers.entries) {
+      if (entry.key.toLowerCase() == lowerName) return entry.value;
+    }
+    return null;
+  }
 
   static void _requireHttps(Uri uri) {
     if (uri.scheme != 'https' || uri.host.isEmpty || uri.userInfo.isNotEmpty) {

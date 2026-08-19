@@ -33,10 +33,17 @@ void main() {
       unreadablePath: unreadablePath,
     );
 
-    final roots = await BundleListing.listRoots(source, identity: null);
+    final emitted = <ListedBundleRoot>[];
+    final roots = await BundleListing.listRoots(
+      source,
+      identity: null,
+      onRoot: emitted.add,
+    );
 
     expect(roots, hasLength(1));
     expect(roots.single.path, readablePath);
+    expect(emitted, hasLength(1));
+    expect(emitted.single.path, readablePath);
   });
 }
 

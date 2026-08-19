@@ -185,6 +185,34 @@ final class BundleEncryptionOptions {
   bool get wantsPreview => previewRequested || preview != null;
 }
 
+enum BundleEncryptionStage { splitting, encrypting }
+
+final class BundleEncryptionProgress {
+  const BundleEncryptionProgress({
+    required this.stage,
+    required this.processedBytes,
+    required this.totalBytes,
+    required this.completedShards,
+    required this.totalShards,
+    this.currentShardIndex,
+    this.currentShardBytes = 0,
+    this.currentShardLength = 0,
+  });
+
+  final BundleEncryptionStage stage;
+  final int processedBytes;
+  final int totalBytes;
+  final int completedShards;
+  final int totalShards;
+  final int? currentShardIndex;
+  final int currentShardBytes;
+  final int currentShardLength;
+
+  double get fraction => totalBytes <= 0
+      ? (completedShards >= totalShards ? 1 : 0)
+      : (processedBytes / totalBytes).clamp(0, 1).toDouble();
+}
+
 final class EncryptedBundleObject {
   EncryptedBundleObject({
     required this.basename,
@@ -344,6 +372,7 @@ final class BundleEncryptor {
     required int declaredLength,
     required BundleEncryptionOptions options,
     required Directory root,
+    void Function(BundleEncryptionProgress progress)? onProgress,
   }) async {
     final plan = await _preflight(
       input: input,
@@ -351,6 +380,18 @@ final class BundleEncryptor {
       options: options,
     );
     final canonicalRoot = await _prepareRoot(root);
+    _emitProgress(
+      onProgress,
+      BundleEncryptionProgress(
+        stage: BundleEncryptionStage.splitting,
+        processedBytes: 0,
+        totalBytes: declaredLength,
+        completedShards: 0,
+        totalShards: plan.shardCount,
+        currentShardIndex: plan.shards.first.index,
+        currentShardLength: plan.shards.first.length,
+      ),
+    );
     final firstPass = await _hashRange(
       input,
       0,
@@ -377,6 +418,18 @@ final class BundleEncryptor {
     var secondLength = 0;
     try {
       for (final shard in plan.shards) {
+        _emitProgress(
+          onProgress,
+          BundleEncryptionProgress(
+            stage: BundleEncryptionStage.splitting,
+            processedBytes: shard.offset,
+            totalBytes: declaredLength,
+            completedShards: shard.index,
+            totalShards: plan.shardCount,
+            currentShardIndex: shard.index,
+            currentShardLength: shard.length,
+          ),
+        );
         final header = prepared.headerFor(shard.index, shard.length);
         final stage = File(
           '${canonicalRoot.path}${Platform.pathSeparator}.${header.canonicalBasename}.${hexLower(secureRandomBytes(8))}.part',
@@ -404,8 +457,36 @@ final class BundleEncryptor {
               shardKey: shardKey,
               output: output,
               overallHashSink: secondHashSink,
+              onChunkEncrypted: (bytes) {
+                _emitProgress(
+                  onProgress,
+                  BundleEncryptionProgress(
+                    stage: BundleEncryptionStage.encrypting,
+                    processedBytes: shard.offset + bytes,
+                    totalBytes: declaredLength,
+                    completedShards: shard.index,
+                    totalShards: plan.shardCount,
+                    currentShardIndex: shard.index,
+                    currentShardBytes: bytes,
+                    currentShardLength: shard.length,
+                  ),
+                );
+              },
             );
             secondLength += shardResult;
+            _emitProgress(
+              onProgress,
+              BundleEncryptionProgress(
+                stage: BundleEncryptionStage.encrypting,
+                processedBytes: shard.offset + shardResult,
+                totalBytes: declaredLength,
+                completedShards: shard.index + 1,
+                totalShards: plan.shardCount,
+                currentShardIndex: shard.index,
+                currentShardBytes: shardResult,
+                currentShardLength: shard.length,
+              ),
+            );
           } finally {
             shardKey.fillRange(0, shardKey.length, 0);
             headerHash.fillRange(0, headerHash.length, 0);
@@ -453,6 +534,17 @@ final class BundleEncryptor {
       } finally {
         secondDigest.fillRange(0, secondDigest.length, 0);
       }
+
+      _emitProgress(
+        onProgress,
+        BundleEncryptionProgress(
+          stage: BundleEncryptionStage.encrypting,
+          processedBytes: declaredLength,
+          totalBytes: declaredLength,
+          completedShards: plan.shardCount,
+          totalShards: plan.shardCount,
+        ),
+      );
 
       final committed = <String>[];
       for (final shard in staged.where((item) => !item.isRoot)) {
@@ -748,6 +840,7 @@ final class BundleEncryptor {
     required List<int> shardKey,
     required IOSink output,
     required ByteConversionSink overallHashSink,
+    void Function(int bytes)? onChunkEncrypted,
   }) async {
     final shardAccumulator = HashDigestSink();
     final shardHashSink = crypto.sha256.startChunkedConversion(
@@ -777,6 +870,7 @@ final class BundleEncryptor {
         record.fillRange(0, record.length, 0);
         shardLength += plainChunk.length;
         dataCount++;
+        onChunkEncrypted?.call(shardLength);
       } finally {
         plainChunk.fillRange(0, plainChunk.length, 0);
       }
@@ -842,6 +936,17 @@ final class BundleEncryptor {
       throw const SboxException(SboxErrorCode.remoteChanged, '数据源根目录无效');
     }
     return Directory(canonical);
+  }
+
+  static void _emitProgress(
+    void Function(BundleEncryptionProgress progress)? onProgress,
+    BundleEncryptionProgress progress,
+  ) {
+    try {
+      onProgress?.call(progress);
+    } on Object {
+      // Progress listeners must never be able to interrupt encryption.
+    }
   }
 
   static Future<void> _commitImmutable(

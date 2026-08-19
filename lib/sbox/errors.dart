@@ -37,10 +37,27 @@ enum SboxErrorCode {
 /// A deliberately low-detail exception. Secret material and untrusted paths
 /// must never be interpolated into [message].
 final class SboxException implements Exception {
-  const SboxException(this.code, this.message);
+  const SboxException(
+    this.code,
+    this.message, {
+    this.retryAfter,
+    this.httpStatus,
+  });
 
   final SboxErrorCode code;
   final String message;
+
+  /// Provider-supplied lower bound for retrying a transient request.
+  ///
+  /// This is deliberately kept out of [message] so UI and logs do not need
+  /// to parse provider text or headers to implement safe backoff.
+  final Duration? retryAfter;
+
+  /// HTTP status when this error came directly from a provider response.
+  ///
+  /// Keeping the status separate from [message] lets retry policy distinguish
+  /// permanent validation responses such as HTTP 422 from transport failures.
+  final int? httpStatus;
 
   @override
   String toString() => '${code.value}: $message';

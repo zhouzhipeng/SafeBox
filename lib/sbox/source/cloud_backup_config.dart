@@ -10,6 +10,7 @@ final class CloudRepositoryEndpoint {
     required this.owner,
     required this.repository,
     required this.credentialId,
+    this.enabled = true,
     this.pathPrefix = '',
     this.repositoryUrl,
   }) {
@@ -20,6 +21,7 @@ final class CloudRepositoryEndpoint {
   final String repository;
   final String pathPrefix;
   final SourceCredentialId credentialId;
+  final bool enabled;
   final String? repositoryUrl;
 
   String webUrl({required String host}) =>
@@ -31,6 +33,7 @@ final class CloudRepositoryEndpoint {
     String value, {
     required SourceCredentialId credentialId,
     required String expectedHost,
+    bool enabled = true,
   }) {
     final uri = Uri.tryParse(value.trim());
     if (uri == null ||
@@ -55,6 +58,7 @@ final class CloudRepositoryEndpoint {
       owner: parts[0],
       repository: repository,
       credentialId: credentialId,
+      enabled: enabled,
       repositoryUrl: value,
     );
   }
@@ -64,6 +68,7 @@ final class CloudRepositoryEndpoint {
   Map<String, Object?> toJson() => <String, Object?>{
     'owner': owner,
     'repository': repository,
+    'enabled': enabled,
     if (pathPrefix.isNotEmpty) 'path_prefix': pathPrefix,
     'credential_id': credentialId.value,
     if (repositoryUrl != null) 'repository_url': repositoryUrl,
@@ -73,6 +78,7 @@ final class CloudRepositoryEndpoint {
     const allowed = <String>{
       'owner',
       'repository',
+      'enabled',
       'path_prefix',
       'credential_id',
       'repository_url',
@@ -97,11 +103,16 @@ final class CloudRepositoryEndpoint {
       throw const FormatException('Invalid cloud repository URL');
     }
     final String? repositoryUrl = repositoryUrlValue as String?;
+    final enabledValue = json['enabled'] ?? true;
+    if (enabledValue is! bool) {
+      throw const FormatException('Invalid cloud repository enabled flag');
+    }
     return CloudRepositoryEndpoint(
       owner: requiredString('owner'),
       repository: requiredString('repository'),
       pathPrefix: prefix,
       credentialId: SourceCredentialId(requiredString('credential_id')),
+      enabled: enabledValue,
       repositoryUrl: repositoryUrl,
     );
   }

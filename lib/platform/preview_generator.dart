@@ -29,6 +29,93 @@ final class PlatformPreviewGenerator implements PreviewGenerator {
   final int maxSourceBytes;
   final VideoPosterDecoder? videoPosterDecoder;
 
+  /// Returns whether the file has the lightweight video signature understood
+  /// by the preview pipeline. This avoids invoking a native video decoder for
+  /// every ordinary image selected by the user.
+  Future<bool> isVideo(File source) async {
+    try {
+      final snapshot = await _snapshot(source);
+      if (snapshot == null) return false;
+      final prefixLength = snapshot.length.clamp(0, 1024 * 1024).toInt();
+      final prefix = await _readRange(source, prefixLength);
+      final probe = _probeMedia(prefix);
+      return probe.kind == _MediaKind.video ||
+          _videoMediaTypeFromPath(source.path) != null;
+    } on Object {
+      return false;
+    }
+  }
+
+  /// Generates bounded previews for several randomly selected video frames.
+  /// The first returned preview is the first sampled candidate so the UI can
+  /// provide a predictable default selection without using the opening frame.
+  Future<List<PreviewGenerated>> generateVideoCandidates(
+    File source, {
+    int count = defaultVideoPosterCandidateCount,
+  }) async {
+    final generatedPreviews = <PreviewGenerated>[];
+    try {
+      final before = await _snapshot(source);
+      if (before == null) return generatedPreviews;
+      final prefixLength = before.length.clamp(0, 1024 * 1024).toInt();
+      final prefix = await _readRange(source, prefixLength);
+      final probe = _probeMedia(prefix);
+      final mediaType = probe.mediaType ?? _videoMediaTypeFromPath(source.path);
+      if (mediaType == null) return generatedPreviews;
+      final decoder = videoPosterDecoder;
+      if (decoder == null) return generatedPreviews;
+      final candidateTimeout = timeout < const Duration(seconds: 30)
+          ? const Duration(seconds: 30)
+          : timeout;
+      late final List<VideoPosterFrame> frames;
+      if (decoder is VideoPosterCandidatesDecoder) {
+        final candidatesDecoder = decoder as VideoPosterCandidatesDecoder;
+        frames = await candidatesDecoder
+            .decodeCandidates(
+              source,
+              count: count.clamp(1, defaultVideoPosterCandidateCount).toInt(),
+            )
+            .timeout(candidateTimeout);
+      } else {
+        frames = await _decodeSingleFrame(
+          decoder,
+          source,
+        ).timeout(candidateTimeout);
+      }
+      for (final frame in frames) {
+        try {
+          if (_validateFrame(frame) == null) continue;
+          final decoded = img.Image.fromBytes(
+            width: frame.width,
+            height: frame.height,
+            bytes: frame.pixels.buffer,
+            bytesOffset: frame.pixels.offsetInBytes,
+            rowStride: frame.rowStride,
+            numChannels: 4,
+            order: img.ChannelOrder.bgra,
+          );
+          final result = _encodePreview(decoded, mediaType);
+          if (result is PreviewGenerated) {
+            generatedPreviews.add(result);
+          }
+        } finally {
+          frame.dispose();
+        }
+      }
+      await _requireStable(source, before);
+      return generatedPreviews;
+    } on TimeoutException {
+      _disposePreviews(generatedPreviews);
+      return <PreviewGenerated>[];
+    } on SboxException {
+      _disposePreviews(generatedPreviews);
+      rethrow;
+    } on Object {
+      _disposePreviews(generatedPreviews);
+      return <PreviewGenerated>[];
+    }
+  }
+
   @override
   Future<PreviewGenerationResult> generate(File source) async {
     try {
@@ -59,26 +146,28 @@ final class PlatformPreviewGenerator implements PreviewGenerator {
     final prefixLength = before.length.clamp(0, 1024 * 1024).toInt();
     final prefix = await _readRange(source, prefixLength);
     final probe = _probeMedia(prefix);
-    if (probe.kind == _MediaKind.video) {
+    final pathVideoMediaType = _videoMediaTypeFromPath(source.path);
+    if (probe.kind == _MediaKind.video || pathVideoMediaType != null) {
+      final videoMediaType = probe.mediaType ?? pathVideoMediaType;
       final decoder = videoPosterDecoder;
       if (decoder == null) {
         return PreviewUnavailable(
           reason: PreviewUnavailableReason.platformUnsupported,
-          detectedSourceMediaType: probe.mediaType,
+          detectedSourceMediaType: videoMediaType,
         );
       }
       final frame = await decoder.decode(source);
       if (frame == null) {
         return PreviewUnavailable(
           reason: PreviewUnavailableReason.decodeFailed,
-          detectedSourceMediaType: probe.mediaType,
+          detectedSourceMediaType: videoMediaType,
         );
       }
       try {
         if (_validateFrame(frame) == null) {
           return PreviewUnavailable(
             reason: PreviewUnavailableReason.resourceLimit,
-            detectedSourceMediaType: probe.mediaType,
+            detectedSourceMediaType: videoMediaType,
           );
         }
         final decoded = img.Image.fromBytes(
@@ -90,7 +179,7 @@ final class PlatformPreviewGenerator implements PreviewGenerator {
           numChannels: 4,
           order: img.ChannelOrder.bgra,
         );
-        return _encodePreview(decoded, probe.mediaType!);
+        return _encodePreview(decoded, videoMediaType!);
       } finally {
         frame.dispose();
       }
@@ -249,6 +338,22 @@ final class PlatformPreviewGenerator implements PreviewGenerator {
     );
   }
 
+  static void _disposePreviews(List<PreviewGenerated> previews) {
+    for (final generated in previews) {
+      generated.preview.dispose();
+    }
+  }
+
+  static Future<List<VideoPosterFrame>> _decodeSingleFrame(
+    VideoPosterDecoder decoder,
+    File source,
+  ) async {
+    final frame = await decoder.decode(source);
+    return frame == null
+        ? const <VideoPosterFrame>[]
+        : <VideoPosterFrame>[frame];
+  }
+
   Future<_FileSnapshot?> _snapshot(File source) async {
     try {
       final stat = await source.stat();
@@ -277,7 +382,16 @@ final class PlatformPreviewGenerator implements PreviewGenerator {
         dimensions: dimensions,
       );
     }
-    if (_hasPrefix(bytes, const <int>[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) {
+    if (_hasPrefix(bytes, const <int>[
+      0x89,
+      0x50,
+      0x4e,
+      0x47,
+      0x0d,
+      0x0a,
+      0x1a,
+      0x0a,
+    ])) {
       if (_containsAscii(bytes, 'acTL')) {
         return const _MediaProbe(
           kind: _MediaKind.animated,
@@ -312,10 +426,31 @@ final class PlatformPreviewGenerator implements PreviewGenerator {
         dimensions: dimensions,
       );
     }
-    if (_containsAsciiAt(bytes, 4, 'ftyp')) {
+    if (_containsAscii(bytes, 'ftyp')) {
       return const _MediaProbe(kind: _MediaKind.video, mediaType: 'video/mp4');
     }
     return const _MediaProbe(kind: _MediaKind.unknown);
+  }
+
+  static String? _videoMediaTypeFromPath(String path) {
+    final lower = path.toLowerCase();
+    final forwardSlash = lower.lastIndexOf('/');
+    final backwardSlash = lower.lastIndexOf('\\');
+    final slash = forwardSlash > backwardSlash ? forwardSlash : backwardSlash;
+    final dot = lower.lastIndexOf('.');
+    if (dot <= slash || dot < 0 || dot + 1 >= lower.length) return null;
+    return switch (lower.substring(dot)) {
+      '.mp4' || '.m4v' => 'video/mp4',
+      '.mov' => 'video/quicktime',
+      '.webm' => 'video/webm',
+      '.avi' => 'video/x-msvideo',
+      '.wmv' => 'video/x-ms-wmv',
+      '.mkv' => 'video/x-matroska',
+      '.3gp' || '.3g2' => 'video/3gpp',
+      '.mpeg' || '.mpg' => 'video/mpeg',
+      '.m2ts' || '.mts' => 'video/mp2t',
+      _ => null,
+    };
   }
 
   static img.Image _flattenToRgb(img.Image source) {
@@ -430,10 +565,14 @@ final class PlatformPreviewGenerator implements PreviewGenerator {
       final length = _uint32Le(bytes, offset + 4);
       if (length < 0 || offset + 8 + length > bytes.length) return null;
       if (type == 'VP8X' && length >= 10) {
-        final width = 1 + bytes[offset + 12] +
+        final width =
+            1 +
+            bytes[offset + 12] +
             (bytes[offset + 13] << 8) +
             (bytes[offset + 14] << 16);
-        final height = 1 + bytes[offset + 15] +
+        final height =
+            1 +
+            bytes[offset + 15] +
             (bytes[offset + 16] << 8) +
             (bytes[offset + 17] << 16);
         return _Dimensions(width: width, height: height);
@@ -470,11 +609,7 @@ final class _FileSnapshot {
 enum _MediaKind { staticImage, animated, video, unknown }
 
 final class _MediaProbe {
-  const _MediaProbe({
-    required this.kind,
-    this.mediaType,
-    this.dimensions,
-  });
+  const _MediaProbe({required this.kind, this.mediaType, this.dimensions});
 
   final _MediaKind kind;
   final String? mediaType;

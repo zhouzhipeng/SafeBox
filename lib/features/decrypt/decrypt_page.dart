@@ -68,7 +68,12 @@ final class _DecryptPageState extends State<DecryptPage> {
           title: '从公开云下载解密',
           subtitle: '通过 GitHub 和 Gitee API 读取单个 Bundle；校验所有分片后才会写入本地明文目标。',
           trailing: ElevatedButton.icon(
-            onPressed: _busy || _loading || _pair == null ? null : _decrypt,
+            onPressed: _busy ||
+                    _loading ||
+                    _pair == null ||
+                    _pair!.enabledSources.isEmpty
+                ? null
+                : _decrypt,
             icon: const Icon(Icons.lock_open_outlined),
             label: const Text('下载并解密'),
           ),
@@ -215,10 +220,11 @@ final class _DecryptPageState extends State<DecryptPage> {
       _downloadProgress = null;
     });
     Object? lastError;
-    final sources = <({String name, DataSource source})>[
-      (name: 'GitHub', source: pair.github),
-      (name: 'Gitee', source: pair.gitee),
-    ];
+    final sources = pair.enabledSources
+        .map<({String name, DataSource source})>(
+          (source) => (name: source.name, source: source.source),
+        )
+        .toList(growable: false);
     try {
       for (final candidate in sources) {
         try {
@@ -270,7 +276,8 @@ final class _DecryptPageState extends State<DecryptPage> {
     return switch (stage) {
       BundleDownloadStage.preparing => '正在读取文件信息',
       BundleDownloadStage.downloading => '正在下载加密文件',
-      BundleDownloadStage.decrypting => '正在校验并解密',
+      BundleDownloadStage.decrypting => '正在解密文件',
+      BundleDownloadStage.merging => '正在合并文件',
     };
   }
 

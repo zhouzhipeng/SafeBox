@@ -98,6 +98,22 @@ final class _HomeShell extends StatefulWidget {
 }
 
 final class _HomeShellState extends State<_HomeShell> {
+  var _cloudConfigurationVersion = 0;
+  late final Widget _settingsPage = SettingsPage(
+    controller: widget.controller,
+    onOpenOnboarding: widget.onOpenOnboarding,
+    onCloudStateChanged: () {
+      if (!mounted) return;
+      setState(() => _cloudConfigurationVersion++);
+    },
+  );
+
+  Widget _buildLibraryPage() => LibraryPage(
+    key: ValueKey<int>(_cloudConfigurationVersion),
+    controller: widget.controller,
+    onOpenCloudSettings: () => widget.onSectionChanged(AppSection.settings),
+  );
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -106,16 +122,6 @@ final class _HomeShellState extends State<_HomeShell> {
           builder: (context, constraints) {
             final mobile = constraints.maxWidth < 760;
             final settingsSelected = widget.section == AppSection.settings;
-            final page = settingsSelected
-                ? SettingsPage(
-                    controller: widget.controller,
-                    onOpenOnboarding: widget.onOpenOnboarding,
-                  )
-                : LibraryPage(
-                    controller: widget.controller,
-                    onOpenCloudSettings: () =>
-                        widget.onSectionChanged(AppSection.settings),
-                  );
             return DecoratedBox(
               decoration: const BoxDecoration(
                 gradient: LinearGradient(
@@ -138,7 +144,12 @@ final class _HomeShellState extends State<_HomeShell> {
                     onSettingsTap: () =>
                         widget.onSectionChanged(AppSection.settings),
                   ),
-                  Expanded(child: page),
+                  Expanded(
+                    child: IndexedStack(
+                      index: settingsSelected ? 1 : 0,
+                      children: <Widget>[_buildLibraryPage(), _settingsPage],
+                    ),
+                  ),
                 ],
               ),
             );

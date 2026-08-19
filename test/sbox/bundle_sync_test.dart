@@ -58,10 +58,41 @@ void main() {
         ),
         isTrue,
       );
+      expect(
+        progress.any(
+          (item) =>
+              item.stage == BundleDownloadStage.decrypting &&
+              item.processedBytes > 0 &&
+              item.totalProcessingBytes == plaintext.length,
+        ),
+        isTrue,
+      );
       final finalProgress = progress.last;
       expect(finalProgress.stage, BundleDownloadStage.decrypting);
       expect(finalProgress.completedObjects, encrypted.objects.length);
       expect(finalProgress.downloadedBytes, greaterThan(0));
+
+      final output = File('${temporary.path}${Platform.pathSeparator}out.bin');
+      final streamingProgress = <BundleDownloadProgress>[];
+      await BundleSync.fetchAndDecryptToFileStreaming(
+        source: source,
+        rootPath: SourcePath(encrypted.root.basename),
+        mnemonic: mnemonic,
+        expectedIdentity: identity.publicIdentity,
+        destination: output,
+        onProgress: streamingProgress.add,
+      );
+      expect(await output.readAsBytes(), orderedEquals(plaintext));
+      expect(
+        streamingProgress.any(
+          (item) =>
+              item.stage == BundleDownloadStage.merging &&
+              item.processedBytes > 0 &&
+              item.totalProcessingBytes == plaintext.length,
+        ),
+        isTrue,
+      );
+      expect(streamingProgress.last.stage, BundleDownloadStage.merging);
     } finally {
       identity.disposeControlledSecrets();
       if (await temporary.exists()) await temporary.delete(recursive: true);

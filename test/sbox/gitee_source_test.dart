@@ -11,7 +11,7 @@ import 'package:safebox/sbox/source/source_path.dart';
 import 'package:test/test.dart';
 
 void main() {
-  test('Gitee read requests use the provider token scheme', () async {
+  test('Gitee read requests use the configured token', () async {
     final client = _RecordingClient();
     final source = GiteeDataSource(
       config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
@@ -70,6 +70,7 @@ void main() {
       sha256: sha256Bytes(bytes),
     );
 
+    expect(client.readRequest?.headers['authorization'], 'token test-token');
     final request = client.createRequest;
     expect(request, isNotNull);
     expect(request!.method, 'POST');
@@ -82,6 +83,35 @@ void main() {
       'access_token': 'test-token',
       'content': base64Encode(bytes),
       'message': 'sbox: add immutable object',
+    });
+  });
+
+  test('Gitee deletes files with form-encoded API parameters', () async {
+    final client = _RecordingClient();
+    final source = GiteeDataSource(
+      config: RepositorySourceConfig(owner: 'zzp', repository: 'sbox-files'),
+      client: client,
+      credentialStore: _CredentialStore(),
+      credentialId: SourceCredentialId('gitee-test-token'),
+    );
+
+    await source.deleteIfMatch(
+      SourcePath('0123456789abcdef0123456789abcdef-0-of-1.sbox'),
+      RevisionToken(ascii.encode('provider-revision')),
+    );
+
+    final request = client.deleteRequest;
+    expect(request, isNotNull);
+    expect(request!.method, 'DELETE');
+    expect(
+      request.headers['content-type'],
+      'application/x-www-form-urlencoded',
+    );
+    expect(request.headers['authorization'], isNull);
+    expect(request.bodyFields, <String, String>{
+      'access_token': 'test-token',
+      'message': 'sbox: delete immutable object',
+      'sha': 'provider-revision',
     });
   });
 
@@ -190,6 +220,7 @@ final class _RecordingClient extends http.BaseClient {
 
   final List<Object?> directoryEntries;
   http.Request? createRequest;
+  http.Request? deleteRequest;
   http.BaseRequest? readRequest;
 
   @override
@@ -206,6 +237,14 @@ final class _RecordingClient extends http.BaseClient {
       return http.StreamedResponse(
         Stream<List<int>>.value(utf8.encode(jsonEncode(directoryEntries))),
         200,
+        request: request,
+      );
+    }
+    if (request.method == 'DELETE') {
+      deleteRequest = request as http.Request;
+      return http.StreamedResponse(
+        const Stream<List<int>>.empty(),
+        204,
         request: request,
       );
     }
@@ -245,9 +284,7 @@ final class _FullObjectRawClient extends http.BaseClient {
         request: request,
       );
     }
-    if (request.url.host == 'gitee.com' &&
-        request.url.path.contains('/api/v5/repos/') &&
-        request.url.path.contains('/raw/')) {
+    if (request.url.host == 'gitee.com' && request.url.path.contains('/raw/')) {
       rawRequest = request;
       if (omitRawHeaders) {
         return http.StreamedResponse(

@@ -59,6 +59,8 @@ final class _SettingsPageState extends State<SettingsPage> {
   bool _saving = false;
   bool _githubConnected = false;
   bool _giteeConnected = false;
+  bool _githubEnabled = true;
+  bool _giteeEnabled = true;
   bool _removingIdentity = false;
   String? _testingProvider;
   String? _activeTokenField;
@@ -332,6 +334,7 @@ final class _SettingsPageState extends State<SettingsPage> {
                     addressController: _githubAddressController,
                     tokenController: _githubTokenController,
                     connected: _githubConnected,
+                    enabled: _githubEnabled,
                   ),
                 ),
                 SizedBox(
@@ -342,6 +345,7 @@ final class _SettingsPageState extends State<SettingsPage> {
                     addressController: _giteeAddressController,
                     tokenController: _giteeTokenController,
                     connected: _giteeConnected,
+                    enabled: _giteeEnabled,
                   ),
                 ),
               ],
@@ -371,6 +375,7 @@ final class _SettingsPageState extends State<SettingsPage> {
     required TextEditingController addressController,
     required TextEditingController tokenController,
     required bool connected,
+    required bool enabled,
   }) {
     final tokenField = '$provider-token';
     final tokenVisible = _activeTokenField == tokenField;
@@ -432,11 +437,40 @@ final class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           const SizedBox(height: 12),
-          OutlinedButton(
-            onPressed: _testingProvider == provider
-                ? null
-                : () => _testConnection(provider),
-            child: Text(_testingProvider == provider ? '测试中…' : '测试连接'),
+          Wrap(
+            spacing: 12,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: <Widget>[
+              OutlinedButton(
+                onPressed: _testingProvider == provider
+                    ? null
+                    : () => _testConnection(provider),
+                child: Text(_testingProvider == provider ? '测试中…' : '测试连接'),
+              ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Checkbox(
+                    key: ValueKey<String>('$provider-enabled'),
+                    value: enabled,
+                    onChanged: _saving
+                        ? null
+                        : (value) {
+                            if (value == null) return;
+                            setState(() {
+                              if (provider == 'GitHub') {
+                                _githubEnabled = value;
+                              } else {
+                                _giteeEnabled = value;
+                              }
+                            });
+                          },
+                  ),
+                  const Text('是否启用'),
+                ],
+              ),
+            ],
           ),
         ],
       ),
@@ -593,6 +627,8 @@ final class _SettingsPageState extends State<SettingsPage> {
         _giteeAddressController.text = configuration.gitee.webUrl(
           host: 'gitee.com',
         );
+        _githubEnabled = configuration.github.enabled;
+        _giteeEnabled = configuration.gitee.enabled;
         _githubConnected = await _hasToken(configuration.github.credentialId);
         _giteeConnected = await _hasToken(configuration.gitee.credentialId);
       }
@@ -625,11 +661,13 @@ final class _SettingsPageState extends State<SettingsPage> {
           githubUrl,
           credentialId: _githubCredential,
           expectedHost: 'github.com',
+          enabled: _githubEnabled,
         ),
         gitee: CloudRepositoryEndpoint.fromRepositoryUrl(
           giteeUrl,
           credentialId: _giteeCredential,
           expectedHost: 'gitee.com',
+          enabled: _giteeEnabled,
         ),
       );
     } catch (_) {
@@ -828,8 +866,8 @@ final class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _openCacheDirectory() async {
     try {
-      final directory = await _temporaryStore.ensureRoot();
-      await FileOpener.openDirectory(directory);
+      final plaintextDirectory = await _temporaryStore.ensureRoot();
+      await FileOpener.openDirectory(plaintextDirectory.parent);
       if (mounted) _showFeedback('缓存目录已打开。');
     } catch (error) {
       if (!mounted) return;

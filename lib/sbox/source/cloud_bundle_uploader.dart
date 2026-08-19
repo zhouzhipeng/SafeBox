@@ -26,7 +26,65 @@ import 'gitee_source.dart';
 import 'github_source.dart';
 import 'source_path.dart';
 
-enum CloudBundleUploadStage { preparing, uploading, verifying, completed }
+enum CloudBundleUploadStage {
+  preparing,
+  splitting,
+  encrypting,
+  uploading,
+  verifying,
+  completed,
+}
+
+/// Signals that the current upload should stop at the next safe boundary.
+///
+/// The UI also closes the upload's HTTP client so an in-flight request is
+/// interrupted immediately. The checks in the uploader cover the local
+/// preparation, retry and verification phases where there may not be an
+/// active HTTP request to close.
+final class CloudBundleUploadCancellation {
+  bool _cancelled = false;
+  final Set<void Function()> _listeners = <void Function()>{};
+
+  bool get isCancelled => _cancelled;
+
+  void cancel() {
+    if (_cancelled) return;
+    _cancelled = true;
+    final listeners = List<void Function()>.of(_listeners);
+    _listeners.clear();
+    for (final listener in listeners) {
+      try {
+        listener();
+      } on Object {
+        // A cancellation listener must not prevent the other cleanup hooks.
+      }
+    }
+  }
+
+  /// Registers a cleanup hook and returns a function that removes it.
+  ///
+  /// This lets the uploader close its HTTP client even when callers cancel
+  /// the token directly instead of going through the page action.
+  void Function() registerOnCancel(void Function() listener) {
+    if (_cancelled) {
+      listener();
+      return () {};
+    }
+    _listeners.add(listener);
+    var registered = true;
+    return () {
+      if (!registered) return;
+      registered = false;
+      _listeners.remove(listener);
+    };
+  }
+
+  void throwIfCancelled() {
+    if (_cancelled) {
+      throw const SboxException(SboxErrorCode.cancelled, '上传已取消');
+    }
+  }
+}
 
 final class CloudBundleSourceProgress {
   const CloudBundleSourceProgress({
@@ -53,6 +111,12 @@ final class CloudBundleUploadProgress {
     this.currentSource,
     this.currentShardIndex,
     this.attempt = 1,
+    this.processedBytes = 0,
+    this.totalBytes = 0,
+    this.processedShards = 0,
+    this.processingTotalShards = 0,
+    this.currentShardBytes = 0,
+    this.currentShardLength = 0,
   });
 
   final CloudBundleUploadStage stage;
@@ -60,20 +124,32 @@ final class CloudBundleUploadProgress {
   final String? currentSource;
   final int? currentShardIndex;
   final int attempt;
+  final int processedBytes;
+  final int totalBytes;
+  final int processedShards;
+  final int processingTotalShards;
+  final int currentShardBytes;
+  final int currentShardLength;
 
   bool get isComplete => stage == CloudBundleUploadStage.completed;
 
-  int get completedShards => sources.values.fold(
-    0,
-    (total, source) => total + source.completedShards,
-  );
+  int get completedShards =>
+      sources.values.fold(0, (total, source) => total + source.completedShards);
 
-  int get totalShards => sources.values.fold(
-    0,
-    (total, source) => total + source.totalShards,
-  );
+  int get totalShards =>
+      sources.values.fold(0, (total, source) => total + source.totalShards);
 
   double get fraction {
+    if (stage == CloudBundleUploadStage.splitting ||
+        stage == CloudBundleUploadStage.encrypting) {
+      if (totalBytes <= 0) {
+        return processingTotalShards > 0 &&
+                processedShards >= processingTotalShards
+            ? 1
+            : 0;
+      }
+      return (processedBytes / totalBytes).clamp(0, 1).toDouble();
+    }
     if (totalShards == 0) return 0;
     final value = (completedShards / totalShards).clamp(0, 1).toDouble();
     // The last shard can be written before the verification pass and the
@@ -84,6 +160,16 @@ final class CloudBundleUploadProgress {
   }
 
   String get overallLabel {
+    if (stage == CloudBundleUploadStage.splitting ||
+        stage == CloudBundleUploadStage.encrypting) {
+      final action = stage == CloudBundleUploadStage.splitting
+          ? '切分文件'
+          : '加密文件';
+      final shardLabel = processingTotalShards > 0
+          ? ' · $processedShards/$processingTotalShards 个分片'
+          : '';
+      return '$action ${(fraction * 100).toStringAsFixed(1)}%$shardLabel';
+    }
     if (!isComplete && totalShards > 0 && completedShards >= totalShards) {
       return '$completedShards/$totalShards（正在核对）';
     }
@@ -95,6 +181,22 @@ final class CloudBundleUploadProgress {
       .join(' · ');
 
   String get detailLabel {
+    if (stage == CloudBundleUploadStage.splitting ||
+        stage == CloudBundleUploadStage.encrypting) {
+      final action = stage == CloudBundleUploadStage.splitting
+          ? '正在切分文件'
+          : '正在加密文件';
+      final bytes = totalBytes <= 0
+          ? null
+          : '$action ${_formatBytes(processedBytes)} / ${_formatBytes(totalBytes)}';
+      final shard = currentShardIndex == null || processingTotalShards <= 0
+          ? null
+          : '分片 ${currentShardIndex! + 1}/$processingTotalShards';
+      final currentBytes = currentShardLength <= 0
+          ? null
+          : '当前 ${_formatBytes(currentShardBytes)} / ${_formatBytes(currentShardLength)}';
+      return <String>[action, ?bytes, ?shard, ?currentBytes].join(' · ');
+    }
     final current = currentSource == null || currentShardIndex == null
         ? null
         : '$currentSource 分片 ${currentShardIndex! + 1}';
@@ -153,10 +255,7 @@ final class CloudBundleUploader {
     // ignore: prefer_initializing_formals
   }) : _encryptor = encryptor {
     if (maxShardUploadRetries < 0) {
-      throw ArgumentError.value(
-        maxShardUploadRetries,
-        'maxShardUploadRetries',
-      );
+      throw ArgumentError.value(maxShardUploadRetries, 'maxShardUploadRetries');
     }
     if (retryBaseDelay.isNegative) {
       throw ArgumentError.value(retryBaseDelay, 'retryBaseDelay');
@@ -165,6 +264,7 @@ final class CloudBundleUploader {
 
   static const int _giteeObjectLimit = 20 * 1024 * 1024;
   static const Duration _remoteListingTimeout = Duration(seconds: 45);
+  static const Duration _maximumProviderRetryDelay = Duration(hours: 1);
 
   final CredentialStore _credentialStore;
   final http.Client _client;
@@ -179,22 +279,27 @@ final class CloudBundleUploader {
     required BundleEncryptionOptions options,
     required CloudBackupConfiguration configuration,
     void Function(CloudBundleUploadProgress progress)? onProgress,
+    CloudBundleUploadCancellation? cancellation,
   }) async {
-    final effectiveOptions = _withSharedObjectLimit(options);
-    final md5 =
-        _encryptor == null && BackgroundBundleCrypto.supportsInput(input)
-        ? await BackgroundBundleCrypto.md5ForInput(
-            input: input,
-            declaredLength: declaredLength,
-            validateUtf8: options.contentKind == SboxContentKind.text,
-          )
-        : await (_encryptor ?? BundleEncryptor()).md5ForInput(
-            input: input,
-            declaredLength: declaredLength,
-            validateUtf8: options.contentKind == SboxContentKind.text,
-          );
-    final bundleId = hexLower(md5);
+    final signal = cancellation ?? CloudBundleUploadCancellation();
+    final unregisterCancellation = signal.registerOnCancel(_client.close);
+    Uint8List? md5;
     try {
+      signal.throwIfCancelled();
+      final effectiveOptions = _withSharedObjectLimit(options);
+      md5 = _encryptor == null && BackgroundBundleCrypto.supportsInput(input)
+          ? await BackgroundBundleCrypto.md5ForInput(
+              input: input,
+              declaredLength: declaredLength,
+              validateUtf8: options.contentKind == SboxContentKind.text,
+            )
+          : await (_encryptor ?? BundleEncryptor()).md5ForInput(
+              input: input,
+              declaredLength: declaredLength,
+              validateUtf8: options.contentKind == SboxContentKind.text,
+            );
+      signal.throwIfCancelled();
+      final bundleId = hexLower(md5);
       final plan = BundlePlanner.plan(
         logicalLength: declaredLength,
         targetNominalShardPlaintextSize:
@@ -209,67 +314,114 @@ final class CloudBundleUploader {
             shardCount: plan.shardCount,
           ),
       ];
+      final expected = objectNames.toSet();
+      final sources = <_CloudUploadSource>[
+        if (configuration.github.enabled)
+          _CloudUploadSource(
+            name: 'GitHub',
+            source: GitHubDataSource(
+              config: configuration.github.repositoryConfig,
+              client: _client,
+              credentialStore: _credentialStore,
+              credentialId: configuration.github.credentialId,
+              logger: _logger,
+            ),
+          ),
+        if (configuration.gitee.enabled)
+          _CloudUploadSource(
+            name: 'Gitee',
+            source: GiteeDataSource(
+              config: configuration.gitee.repositoryConfig,
+              client: _client,
+              credentialStore: _credentialStore,
+              credentialId: configuration.gitee.credentialId,
+              logger: _logger,
+            ),
+          ),
+      ];
+      if (sources.isEmpty) {
+        throw const SboxException(
+          SboxErrorCode.sourceAuthentication,
+          '至少启用一个云端仓库后才能上传',
+        );
+      }
       final progress = _UploadProgressReporter(
         totalShards: plan.shardCount,
+        totalBytes: declaredLength,
+        sourceNames: sources.map((source) => source.name),
         onProgress: onProgress,
       )..emit(stage: CloudBundleUploadStage.preparing);
-      final expected = objectNames.toSet();
-      final github = GitHubDataSource(
-        config: configuration.github.repositoryConfig,
-        client: _client,
-        credentialStore: _credentialStore,
-        credentialId: configuration.github.credentialId,
-        logger: _logger,
-      );
-      final gitee = GiteeDataSource(
-        config: configuration.gitee.repositoryConfig,
-        client: _client,
-        credentialStore: _credentialStore,
-        credentialId: configuration.gitee.credentialId,
-        logger: _logger,
-      );
 
-      final remoteObjects = await Future.wait(<Future<Set<String>>>[
-        _remoteObjects(github, expected, sourceName: 'GitHub'),
-        _remoteObjects(gitee, expected, sourceName: 'Gitee'),
-      ]);
-      final githubObjects = remoteObjects[0];
-      final giteeObjects = remoteObjects[1];
-      await _assertRemoteSourcesAgree(
-        github,
-        gitee,
-        githubObjects.intersection(giteeObjects),
+      final remoteObjects = <String, Set<String>>{};
+      await Future.wait<void>(
+        sources.map((configured) async {
+          remoteObjects[configured.name] = await _remoteObjects(
+            configured.source,
+            expected,
+            sourceName: configured.name,
+            cancellation: signal,
+          );
+        }),
       );
-      final githubComplete = githubObjects.length == expected.length;
-      final giteeComplete = giteeObjects.length == expected.length;
-      progress
-        ..setCompleted('GitHub', githubObjects.length)
-        ..setCompleted('Gitee', giteeObjects.length)
-        ..emit(stage: CloudBundleUploadStage.preparing);
+      final first = sources.first;
+      final firstObjects = remoteObjects[first.name]!;
+      for (final configured in sources.skip(1)) {
+        await _assertRemoteSourcesAgree(
+          first.source,
+          configured.source,
+          firstObjects.intersection(remoteObjects[configured.name]!),
+          cancellation: signal,
+        );
+      }
+      final remoteComplete = <String, bool>{
+        for (final configured in sources)
+          configured.name:
+              remoteObjects[configured.name]!.length == expected.length,
+      };
+      for (final configured in sources) {
+        progress.setCompleted(
+          configured.name,
+          remoteObjects[configured.name]!.length,
+        );
+      }
+      progress.emit(stage: CloudBundleUploadStage.preparing);
 
       final root = Directory(configuration.backupDirectory);
-      var localObjects = await _localObjects(root, expected);
+      var localObjects = await _localObjects(
+        root,
+        expected,
+        cancellation: signal,
+      );
       var localComplete = localObjects.length == expected.length;
-      await _assertRemoteMatchesLocal(
-        source: github,
-        root: root,
-        names: githubObjects.intersection(localObjects),
-      );
-      await _assertRemoteMatchesLocal(
-        source: gitee,
-        root: root,
-        names: giteeObjects.intersection(localObjects),
-      );
+      for (final configured in sources) {
+        await _assertRemoteMatchesLocal(
+          source: configured.source,
+          root: root,
+          names: remoteObjects[configured.name]!.intersection(localObjects),
+          cancellation: signal,
+        );
+      }
 
-      if (!localComplete && (githubComplete || giteeComplete)) {
-        final mirror = githubComplete ? github : gitee;
+      _CloudUploadSource? mirror;
+      for (final configured in sources) {
+        if (remoteComplete[configured.name] == true) {
+          mirror = configured;
+          break;
+        }
+      }
+      if (!localComplete && mirror != null) {
         await _restoreLocalCopy(
-          source: mirror,
+          source: mirror.source,
           root: root,
           objectNames: objectNames,
           existing: localObjects,
+          cancellation: signal,
         );
-        localObjects = await _localObjects(root, expected);
+        localObjects = await _localObjects(
+          root,
+          expected,
+          cancellation: signal,
+        );
         localComplete = localObjects.length == expected.length;
       }
 
@@ -285,6 +437,7 @@ final class CloudBundleUploader {
             declaredLength: declaredLength,
             options: effectiveOptions,
             root: root,
+            onProgress: progress.updateEncryption,
           );
         } else {
           await (_encryptor ?? BundleEncryptor()).encryptToDirectory(
@@ -292,9 +445,15 @@ final class CloudBundleUploader {
             declaredLength: declaredLength,
             options: effectiveOptions,
             root: root,
+            onProgress: progress.updateEncryption,
           );
         }
-        localObjects = await _localObjects(root, expected);
+        signal.throwIfCancelled();
+        localObjects = await _localObjects(
+          root,
+          expected,
+          cancellation: signal,
+        );
         localComplete = localObjects.length == expected.length;
         created = true;
       }
@@ -311,67 +470,48 @@ final class CloudBundleUploader {
       // material; same-name objects with different bytes must never be mixed
       // into one Bundle.
       if (created) {
-        await _assertRemoteMatchesLocal(
-          source: github,
-          root: root,
-          names: githubObjects.intersection(localObjects),
-        );
-        await _assertRemoteMatchesLocal(
-          source: gitee,
-          root: root,
-          names: giteeObjects.intersection(localObjects),
-        );
+        for (final configured in sources) {
+          await _assertRemoteMatchesLocal(
+            source: configured.source,
+            root: root,
+            names: remoteObjects[configured.name]!.intersection(localObjects),
+            cancellation: signal,
+          );
+        }
       }
 
       progress.emit(stage: CloudBundleUploadStage.uploading);
       final uploadTasks = <Future<void>>[];
       final uploadedSources = <String>[];
-      if (!githubComplete) {
-        uploadedSources.add('GitHub');
+      for (final configured in sources) {
+        if (remoteComplete[configured.name] == true) continue;
+        uploadedSources.add(configured.name);
         uploadTasks.add(
           _publishDirectory(
-            source: github,
+            source: configured.source,
             root: root,
             objectNames: objectNames,
-            existing: githubObjects,
-            sourceName: 'GitHub',
+            existing: remoteObjects[configured.name]!,
+            sourceName: configured.name,
             progress: progress,
-          ),
-        );
-      }
-      if (!giteeComplete) {
-        uploadedSources.add('Gitee');
-        uploadTasks.add(
-          _publishDirectory(
-            source: gitee,
-            root: root,
-            objectNames: objectNames,
-            existing: giteeObjects,
-            sourceName: 'Gitee',
-            progress: progress,
+            cancellation: signal,
           ),
         );
       }
       await Future.wait(uploadTasks);
 
       progress.emit(stage: CloudBundleUploadStage.verifying);
-      await Future.wait(<Future<void>>[
-        _verifyPublishedObjects(
-          source: github,
-          root: root,
-          objectNames: objectNames,
-          expected: expected,
-          sourceName: 'GitHub',
-          progress: progress,
-        ),
-        _verifyPublishedObjects(
-          source: gitee,
-          root: root,
-          objectNames: objectNames,
-          expected: expected,
-          sourceName: 'Gitee',
-          progress: progress,
-        ),
+      await Future.wait<void>([
+        for (final configured in sources)
+          _verifyPublishedObjects(
+            source: configured.source,
+            root: root,
+            objectNames: objectNames,
+            expected: expected,
+            sourceName: configured.name,
+            progress: progress,
+            cancellation: signal,
+          ),
       ]);
       final previewOutcome = await _readPreviewOutcome(
         root: root,
@@ -380,6 +520,7 @@ final class CloudBundleUploader {
         ),
         options: effectiveOptions,
         reused: !created,
+        cancellation: signal,
       );
       // This is the terminal event. It must be emitted only after remote
       // verification and local metadata inspection have both completed;
@@ -394,21 +535,36 @@ final class CloudBundleUploader {
         previewEmbedded: previewOutcome.embedded,
         previewUnavailableReason: previewOutcome.reason,
       );
+    } on Object {
+      if (signal.isCancelled) {
+        throw const SboxException(SboxErrorCode.cancelled, '上传已取消');
+      }
+      rethrow;
     } finally {
-      md5.fillRange(0, md5.length, 0);
+      unregisterCancellation();
+      final digest = md5;
+      digest?.fillRange(0, digest.length, 0);
     }
   }
 
   Future<void> _assertRemoteSourcesAgree(
     EnumerableDataSource left,
     EnumerableDataSource right,
-    Iterable<String> names,
-  ) async {
+    Iterable<String> names, {
+    required CloudBundleUploadCancellation cancellation,
+  }) async {
     for (final name in names) {
+      cancellation.throwIfCancelled();
       final leftRead = await left.get(SourcePath(name));
       final rightRead = await right.get(SourcePath(name));
-      final leftHash = await _hashSourceRead(leftRead);
-      final rightHash = await _hashSourceRead(rightRead);
+      final leftHash = await _hashSourceRead(
+        leftRead,
+        cancellation: cancellation,
+      );
+      final rightHash = await _hashSourceRead(
+        rightRead,
+        cancellation: cancellation,
+      );
       try {
         if (leftRead.length != rightRead.length ||
             !constantTimeBytesEqual(leftHash, rightHash)) {
@@ -428,8 +584,10 @@ final class CloudBundleUploader {
     required EnumerableDataSource source,
     required Directory root,
     required Iterable<String> names,
+    required CloudBundleUploadCancellation cancellation,
   }) async {
     for (final name in names) {
+      cancellation.throwIfCancelled();
       final local = File(p.join(root.path, name));
       if (await FileSystemEntity.type(local.path, followLinks: false) !=
           FileSystemEntityType.file) {
@@ -438,7 +596,11 @@ final class CloudBundleUploader {
       final remote = await source.get(SourcePath(name));
       final localLength = await local.length();
       final localHash = await BackgroundBundleCrypto.sha256File(local);
-      final remoteHash = await _hashSourceRead(remote);
+      cancellation.throwIfCancelled();
+      final remoteHash = await _hashSourceRead(
+        remote,
+        cancellation: cancellation,
+      );
       try {
         if (localLength != remote.length ||
             !constantTimeBytesEqual(localHash, remoteHash)) {
@@ -454,25 +616,23 @@ final class CloudBundleUploader {
     }
   }
 
-  Future<Uint8List> _hashSourceRead(SourceRead read) async {
+  Future<Uint8List> _hashSourceRead(
+    SourceRead read, {
+    required CloudBundleUploadCancellation cancellation,
+  }) async {
     final accumulator = HashDigestSink();
     final sink = crypto.sha256.startChunkedConversion(accumulator);
     var count = 0;
     await for (final chunk in read.body) {
+      cancellation.throwIfCancelled();
       count += chunk.length;
       if (count > read.length) {
-        throw const SboxException(
-          SboxErrorCode.remoteChanged,
-          '远端对象超过声明长度',
-        );
+        throw const SboxException(SboxErrorCode.remoteChanged, '远端对象超过声明长度');
       }
       sink.add(chunk);
     }
     if (count != read.length) {
-      throw const SboxException(
-        SboxErrorCode.remoteChanged,
-        '远端对象长度不一致',
-      );
+      throw const SboxException(SboxErrorCode.remoteChanged, '远端对象长度不一致');
     }
     sink.close();
     return Uint8List.fromList(accumulator.value.bytes);
@@ -483,7 +643,9 @@ final class CloudBundleUploader {
     required String rootObjectName,
     required BundleEncryptionOptions options,
     required bool reused,
+    required CloudBundleUploadCancellation cancellation,
   }) async {
+    cancellation.throwIfCancelled();
     final rootFile = File(p.join(root.path, rootObjectName));
     final headerBytes = await _readHeader(rootFile);
     final header = BundleHeader.parse(headerBytes);
@@ -501,6 +663,7 @@ final class CloudBundleUploader {
       identity: options.recipient,
     );
     try {
+      cancellation.throwIfCancelled();
       if (result.preview != null) {
         return const _PreviewOutcome(embedded: true);
       }
@@ -541,6 +704,7 @@ final class CloudBundleUploader {
     EnumerableDataSource source,
     Set<String> expected, {
     required String sourceName,
+    required CloudBundleUploadCancellation cancellation,
   }) async {
     final objects = <String>{};
     try {
@@ -548,31 +712,44 @@ final class CloudBundleUploader {
       String? cursor;
       final visitedCursors = <String>{};
       final visitedPages = <String>{};
-      final listingClock = Stopwatch()..start();
       do {
+        cancellation.throwIfCancelled();
         if (cursor != null && !visitedCursors.add(cursor)) {
           throw const SboxException(
             SboxErrorCode.sourceNetwork,
             '数据源分页游标重复，无法完成云端校验',
           );
         }
-        SourceListPage page;
-        try {
-          final remaining = _remoteListingTimeout - listingClock.elapsed;
-          if (remaining <= Duration.zero) {
-            throw const SboxException(
+        late SourceListPage page;
+        for (var retry = 0; ; retry++) {
+          late Object error;
+          try {
+            page = await source
+                .listObjects(cursor: cursor)
+                .timeout(_remoteListingTimeout);
+            cancellation.throwIfCancelled();
+            break;
+          } on SboxException catch (caught) {
+            if (caught.code == SboxErrorCode.sourceNotFound) return objects;
+            error = caught;
+          } on TimeoutException {
+            error = const SboxException(
               SboxErrorCode.sourceNetwork,
               '云端目录校验超时',
             );
           }
-          page = await source.listObjects(cursor: cursor).timeout(remaining);
-        } on SboxException catch (error) {
-          if (error.code == SboxErrorCode.sourceNotFound) return objects;
-          rethrow;
-        } on TimeoutException {
-          throw const SboxException(
-            SboxErrorCode.sourceNetwork,
-            '云端目录校验超时',
+          cancellation.throwIfCancelled();
+          if (retry >= maxShardUploadRetries || !_shouldRetry(error)) {
+            throw error;
+          }
+          _logger?.warning(
+            '$sourceName: listing failed; retrying',
+            detail: describeSboxError(error),
+          );
+          await _waitBeforeRetry(
+            retry,
+            cancellation: cancellation,
+            error: error,
           );
         }
         final pageSignature = page.objects
@@ -585,6 +762,7 @@ final class CloudBundleUploader {
           );
         }
         for (final object in page.objects) {
+          cancellation.throwIfCancelled();
           if (expected.contains(object.path.value)) {
             objects.add(object.path.value);
           }
@@ -601,7 +779,12 @@ final class CloudBundleUploader {
         '$sourceName: listing failed',
         detail: describeSboxError(error),
       );
-      throw SboxException(error.code, '$sourceName: ${error.message}');
+      throw SboxException(
+        error.code,
+        '$sourceName: ${error.message}',
+        retryAfter: error.retryAfter,
+        httpStatus: error.httpStatus,
+      );
     } on Object catch (error) {
       _logger?.error(error, operation: '$sourceName: listing failed');
       throw SboxException(
@@ -613,11 +796,14 @@ final class CloudBundleUploader {
 
   Future<Set<String>> _localObjects(
     Directory root,
-    Set<String> expected,
-  ) async {
+    Set<String> expected, {
+    required CloudBundleUploadCancellation cancellation,
+  }) async {
+    cancellation.throwIfCancelled();
     if (!await root.exists()) return <String>{};
     final objects = <String>{};
     for (final name in expected) {
+      cancellation.throwIfCancelled();
       final file = File(p.join(root.path, name));
       if (await FileSystemEntity.type(file.path, followLinks: false) ==
           FileSystemEntityType.file) {
@@ -632,7 +818,9 @@ final class CloudBundleUploader {
     required Directory root,
     required List<String> objectNames,
     required Set<String> existing,
+    required CloudBundleUploadCancellation cancellation,
   }) async {
+    cancellation.throwIfCancelled();
     await root.create(recursive: true);
     final pending = objectNames
         .where((name) => !existing.contains(name))
@@ -640,7 +828,12 @@ final class CloudBundleUploader {
     await _parallelForEach(
       pending,
       maxParallel: source.capabilities.maxParallelTransfers,
-      action: (name) => _restoreObject(source: source, root: root, name: name),
+      action: (name) => _restoreObject(
+        source: source,
+        root: root,
+        name: name,
+        cancellation: cancellation,
+      ),
     );
   }
 
@@ -648,7 +841,9 @@ final class CloudBundleUploader {
     required DataSource source,
     required Directory root,
     required String name,
+    required CloudBundleUploadCancellation cancellation,
   }) async {
+    cancellation.throwIfCancelled();
     final target = File(p.join(root.path, name));
     final type = await FileSystemEntity.type(target.path, followLinks: false);
     if (type != FileSystemEntityType.notFound) {
@@ -665,6 +860,7 @@ final class CloudBundleUploader {
     try {
       output = stage.openWrite();
       await for (final chunk in read.body) {
+        cancellation.throwIfCancelled();
         count += chunk.length;
         if (count > read.length) {
           throw const SboxException(
@@ -698,8 +894,10 @@ final class CloudBundleUploader {
     required Set<String> existing,
     required String sourceName,
     required _UploadProgressReporter progress,
+    required CloudBundleUploadCancellation cancellation,
   }) async {
     try {
+      cancellation.throwIfCancelled();
       if (!source.capabilities.canWrite) {
         throw const SboxException(
           SboxErrorCode.sourceAuthentication,
@@ -708,6 +906,7 @@ final class CloudBundleUploader {
       }
       var observed = Set<String>.of(existing);
       for (var pass = 0; ; pass++) {
+        cancellation.throwIfCancelled();
         final pending = _publicationOrder(objectNames)
             .where((name) => !observed.contains(name))
             .toList(growable: false);
@@ -727,21 +926,25 @@ final class CloudBundleUploader {
         // branch. Publish them serially, then publish the root as the final
         // Bundle commit marker.
         for (final name in continuations) {
+          cancellation.throwIfCancelled();
           await _publishObject(
             source: source,
             root: root,
             name: name,
             sourceName: sourceName,
             progress: progress,
+            cancellation: cancellation,
           );
         }
         if (rootName != null) {
+          cancellation.throwIfCancelled();
           await _publishObject(
             source: source,
             root: root,
             name: rootName,
             sourceName: sourceName,
             progress: progress,
+            cancellation: cancellation,
           );
         }
 
@@ -752,10 +955,12 @@ final class CloudBundleUploader {
           stage: CloudBundleUploadStage.verifying,
           currentSource: sourceName,
         );
+        cancellation.throwIfCancelled();
         observed = await _remoteObjects(
           source,
           objectNames.toSet(),
           sourceName: sourceName,
+          cancellation: cancellation,
         );
         progress.setCompleted(sourceName, observed.length);
         if (observed.length == objectNames.length) return;
@@ -763,21 +968,26 @@ final class CloudBundleUploader {
           throw SboxException(
             SboxErrorCode.shardMissing,
             '上传校验失败，$sourceName 仍缺少 '
-                '${objectNames.length - observed.length} 个分片',
+            '${objectNames.length - observed.length} 个分片',
           );
         }
         progress.emit(
           stage: CloudBundleUploadStage.verifying,
           currentSource: sourceName,
         );
-        await _waitBeforeRetry(pass);
+        await _waitBeforeRetry(pass, cancellation: cancellation);
       }
     } on SboxException catch (error) {
       _logger?.warning(
         '$sourceName: publish failed',
         detail: describeSboxError(error),
       );
-      throw SboxException(error.code, '$sourceName: ${error.message}');
+      throw SboxException(
+        error.code,
+        '$sourceName: ${error.message}',
+        retryAfter: error.retryAfter,
+        httpStatus: error.httpStatus,
+      );
     } on Object catch (error) {
       _logger?.error(error, operation: '$sourceName: publish failed');
       throw SboxException(
@@ -793,7 +1003,9 @@ final class CloudBundleUploader {
     required String name,
     required String sourceName,
     required _UploadProgressReporter progress,
+    required CloudBundleUploadCancellation cancellation,
   }) async {
+    cancellation.throwIfCancelled();
     final file = File(p.join(root.path, name));
     if (await FileSystemEntity.type(file.path, followLinks: false) !=
         FileSystemEntityType.file) {
@@ -808,9 +1020,11 @@ final class CloudBundleUploader {
     final length = await file.length();
     final digest = await BackgroundBundleCrypto.sha256File(file);
     try {
+      cancellation.throwIfCancelled();
       final shard = parseCanonicalBundleBasename(name);
       Object? lastError;
       for (var retry = 0; retry <= maxShardUploadRetries; retry++) {
+        cancellation.throwIfCancelled();
         final attempt = retry + 1;
         progress.emit(
           stage: CloudBundleUploadStage.uploading,
@@ -827,6 +1041,7 @@ final class CloudBundleUploader {
             length: length,
             sha256: digest,
           );
+          cancellation.throwIfCancelled();
           progress.completed(
             sourceName,
             shardIndex: shard.shardIndex,
@@ -834,6 +1049,7 @@ final class CloudBundleUploader {
           );
           return;
         } on Object catch (error) {
+          cancellation.throwIfCancelled();
           lastError = error;
           if (error is SboxException &&
               error.code == SboxErrorCode.immutableConflict &&
@@ -842,6 +1058,7 @@ final class CloudBundleUploader {
                 name: name,
                 length: length,
                 expectedHash: digest,
+                cancellation: cancellation,
               )) {
             // A concurrent or resumed upload may have published this exact
             // shard after the listing. It is already complete, so advance
@@ -854,17 +1071,17 @@ final class CloudBundleUploader {
             return;
           }
           if (retry >= maxShardUploadRetries || !_shouldRetry(error)) {
-            throw _shardUploadError(
-              shard,
-              attempt: attempt,
-              error: error,
-            );
+            throw _shardUploadError(shard, attempt: attempt, error: error);
           }
           _logger?.warning(
             '$sourceName: shard upload failed; retrying',
             detail: describeSboxError(error),
           );
-          await _waitBeforeRetry(retry);
+          await _waitBeforeRetry(
+            retry,
+            cancellation: cancellation,
+            error: error,
+          );
         }
       }
       throw _shardUploadError(
@@ -882,10 +1099,15 @@ final class CloudBundleUploader {
     required String name,
     required int length,
     required Uint8List expectedHash,
+    required CloudBundleUploadCancellation cancellation,
   }) async {
     try {
+      cancellation.throwIfCancelled();
       final remote = await source.get(SourcePath(name));
-      final remoteHash = await _hashSourceRead(remote);
+      final remoteHash = await _hashSourceRead(
+        remote,
+        cancellation: cancellation,
+      );
       try {
         return remote.length == length &&
             constantTimeBytesEqual(remoteHash, expectedHash);
@@ -893,6 +1115,7 @@ final class CloudBundleUploader {
         remoteHash.fillRange(0, remoteHash.length, 0);
       }
     } on SboxException catch (error) {
+      if (error.code == SboxErrorCode.cancelled) rethrow;
       // The object may not have been committed yet. Any other read failure
       // is treated as "not confirmed" and the original upload error remains
       // authoritative.
@@ -955,14 +1178,47 @@ final class CloudBundleUploader {
     return bytes;
   }
 
-  Future<void> _waitBeforeRetry(int retry) async {
-    if (retryBaseDelay == Duration.zero) return;
+  Future<void> _waitBeforeRetry(
+    int retry, {
+    required CloudBundleUploadCancellation cancellation,
+    Object? error,
+  }) async {
+    cancellation.throwIfCancelled();
     final multiplier = 1 << retry.clamp(0, 6).toInt();
-    await Future<void>.delayed(retryBaseDelay * multiplier);
+    var delay = retryBaseDelay * multiplier;
+    final providerDelay = error is SboxException ? error.retryAfter : null;
+    if (providerDelay != null && providerDelay.compareTo(delay) > 0) {
+      delay = providerDelay;
+    }
+    if (delay.compareTo(_maximumProviderRetryDelay) > 0) {
+      delay = _maximumProviderRetryDelay;
+    }
+    if (delay <= Duration.zero) return;
+
+    // A provider can ask the uploader to wait for minutes. Keep that wait
+    // cancellable instead of leaving the page stuck in Future.delayed.
+    final completed = Completer<void>();
+    void finish() {
+      if (!completed.isCompleted) completed.complete();
+    }
+
+    final unregisterCancellation = cancellation.registerOnCancel(finish);
+    final timer = Timer(delay, finish);
+    try {
+      await completed.future;
+    } finally {
+      timer.cancel();
+      unregisterCancellation();
+    }
+    cancellation.throwIfCancelled();
   }
 
   static bool _shouldRetry(Object error) {
     if (error is! SboxException) return true;
+    // HTTP 422 is a provider validation response, not a transient network
+    // failure. putNew has already confirmed whether the object was committed;
+    // repeating the same Contents API PUT only creates more false failures.
+    if (error.httpStatus == 422) return false;
     switch (error.code) {
       case SboxErrorCode.sourceNetwork:
       case SboxErrorCode.sourceRateLimit:
@@ -981,14 +1237,13 @@ final class CloudBundleUploader {
   }) {
     final sourceError = error is SboxException
         ? error
-        : SboxException(
-            SboxErrorCode.sourceNetwork,
-            '上传请求失败',
-          );
+        : SboxException(SboxErrorCode.sourceNetwork, '上传请求失败');
     return SboxException(
       sourceError.code,
       '分片 ${shard.shardIndex + 1}/${shard.shardCount} 上传失败（已尝试 $attempt 次）：'
-          '${sourceError.message}',
+      '${sourceError.message}',
+      retryAfter: sourceError.retryAfter,
+      httpStatus: sourceError.httpStatus,
     );
   }
 
@@ -999,11 +1254,14 @@ final class CloudBundleUploader {
     required Set<String> expected,
     required String sourceName,
     required _UploadProgressReporter progress,
+    required CloudBundleUploadCancellation cancellation,
   }) async {
+    cancellation.throwIfCancelled();
     final observed = await _remoteObjects(
       source,
       expected,
       sourceName: sourceName,
+      cancellation: cancellation,
     );
     progress.setCompleted(sourceName, observed.length);
     if (observed.length != expected.length) {
@@ -1014,9 +1272,17 @@ final class CloudBundleUploader {
         existing: observed,
         sourceName: sourceName,
         progress: progress,
+        cancellation: cancellation,
       );
     }
   }
+}
+
+final class _CloudUploadSource {
+  const _CloudUploadSource({required this.name, required this.source});
+
+  final String name;
+  final EnumerableDataSource source;
 }
 
 final class _PreviewOutcome {
@@ -1029,12 +1295,38 @@ final class _PreviewOutcome {
 final class _UploadProgressReporter {
   _UploadProgressReporter({
     required this.totalShards,
+    required this.totalBytes,
+    required Iterable<String> sourceNames,
     this.onProgress,
-  }) : _completed = <String, int>{'GitHub': 0, 'Gitee': 0};
+  }) : _completed = <String, int>{
+         for (final sourceName in sourceNames) sourceName: 0,
+       };
 
   final int totalShards;
+  final int totalBytes;
   final void Function(CloudBundleUploadProgress progress)? onProgress;
   final Map<String, int> _completed;
+  int _processedBytes = 0;
+  int _processedShards = 0;
+  int _processingTotalShards = 0;
+  int _currentShardBytes = 0;
+  int _currentShardLength = 0;
+
+  void updateEncryption(BundleEncryptionProgress progress) {
+    _processedBytes = progress.processedBytes.clamp(0, totalBytes).toInt();
+    _processedShards = progress.completedShards
+        .clamp(0, progress.totalShards)
+        .toInt();
+    _processingTotalShards = progress.totalShards;
+    _currentShardBytes = progress.currentShardBytes;
+    _currentShardLength = progress.currentShardLength;
+    emit(
+      stage: progress.stage == BundleEncryptionStage.splitting
+          ? CloudBundleUploadStage.splitting
+          : CloudBundleUploadStage.encrypting,
+      currentShardIndex: progress.currentShardIndex,
+    );
+  }
 
   void setCompleted(String sourceName, int value) {
     _completed[sourceName] = value.clamp(0, totalShards).toInt();
@@ -1078,12 +1370,29 @@ final class _UploadProgressReporter {
           currentSource: currentSource,
           currentShardIndex: currentShardIndex,
           attempt: attempt,
+          processedBytes: _processedBytes,
+          totalBytes: totalBytes,
+          processedShards: _processedShards,
+          processingTotalShards: _processingTotalShards,
+          currentShardBytes: _currentShardBytes,
+          currentShardLength: _currentShardLength,
         ),
       );
     } on Object {
       // UI progress must never be able to interrupt an upload.
     }
   }
+}
+
+String _formatBytes(int bytes) {
+  if (bytes >= 1024 * 1024 * 1024) {
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GiB';
+  }
+  if (bytes >= 1024 * 1024) {
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MiB';
+  }
+  if (bytes >= 1024) return '${(bytes / 1024).toStringAsFixed(1)} KiB';
+  return '$bytes B';
 }
 
 Future<void> _parallelForEach<T>(

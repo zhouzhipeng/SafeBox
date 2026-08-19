@@ -39,6 +39,30 @@ final class DecryptedBundle {
   bool get complete => status == BundleTrustStatus.complete;
 }
 
+enum BundleDecryptionStage { decrypting, merging }
+
+final class BundleDecryptionProgress {
+  const BundleDecryptionProgress({
+    required this.stage,
+    required this.processedBytes,
+    required this.totalBytes,
+    required this.completedShards,
+    required this.totalShards,
+    this.currentShardIndex,
+  });
+
+  final BundleDecryptionStage stage;
+  final int processedBytes;
+  final int totalBytes;
+  final int completedShards;
+  final int totalShards;
+  final int? currentShardIndex;
+
+  double? get fraction => totalBytes <= 0
+      ? (processedBytes == totalBytes ? 1 : null)
+      : (processedBytes / totalBytes).clamp(0, 1).toDouble();
+}
+
 final class BundleDecryptor {
   BundleDecryptor({BundleRecordCodec? records})
     : _records = records ?? BundleRecordCodec();
@@ -61,7 +85,10 @@ final class BundleDecryptor {
       final candidate = _parseObject(entry.key, entry.value);
       if (candidate.header.isRoot) {
         if (root != null) {
-          throw const SboxException(SboxErrorCode.shardConflict, 'Bundle 存在多个根分片');
+          throw const SboxException(
+            SboxErrorCode.shardConflict,
+            'Bundle 存在多个根分片',
+          );
         }
         root = candidate;
       }
@@ -99,6 +126,7 @@ final class BundleDecryptor {
     required Map<String, List<int>> objects,
     required String mnemonic,
     PublicIdentity? expectedIdentity,
+    void Function(BundleDecryptionProgress progress)? onProgress,
   }) async {
     final parsed = _parseObjects(objects);
     final root = parsed.root;
@@ -117,17 +145,31 @@ final class BundleDecryptor {
         identity.publicIdentity.recipientKeyId,
         root.header.recipientKeyId,
       )) {
-        throw const SboxException(SboxErrorCode.keyMismatch, '助记词与 Bundle 身份不匹配');
+        throw const SboxException(
+          SboxErrorCode.keyMismatch,
+          '助记词与 Bundle 身份不匹配',
+        );
       }
 
       final identityForMetadata = expectedIdentity ?? identity.publicIdentity;
-       final fast = await BundleProbe.readMetadata(
+      final fast = await BundleProbe.readMetadata(
         basename: root.basename,
         objectPrefix: root.bytes.sublist(0, root.header.headerLength),
         identity: identityForMetadata,
       );
       final manifest = fast.manifest!;
       _validateManifestAgainstBundle(manifest, parsed);
+      final totalPlaintextBytes = manifest.logicalPlaintextSize.toInt();
+      _emitProgress(
+        onProgress,
+        BundleDecryptionProgress(
+          stage: BundleDecryptionStage.decrypting,
+          processedBytes: 0,
+          totalBytes: totalPlaintextBytes,
+          completedShards: 0,
+          totalShards: root.header.shardCount,
+        ),
+      );
 
       try {
         bundleDek = RsaOaepSha256().decrypt(
@@ -161,10 +203,32 @@ final class BundleDecryptor {
             parsed.byIndex[index]!,
             bundleDek,
             overallHashSink,
+            onChunkDecrypted: (bytes) => _emitProgress(
+              onProgress,
+              BundleDecryptionProgress(
+                stage: BundleDecryptionStage.decrypting,
+                processedBytes: overallLength + bytes,
+                totalBytes: totalPlaintextBytes,
+                completedShards: index,
+                totalShards: root.header.shardCount,
+                currentShardIndex: index,
+              ),
+            ),
           );
           heldShardPlaintexts.add(result.bytes);
           output.add(result.bytes);
           overallLength += result.length;
+          _emitProgress(
+            onProgress,
+            BundleDecryptionProgress(
+              stage: BundleDecryptionStage.decrypting,
+              processedBytes: overallLength,
+              totalBytes: totalPlaintextBytes,
+              completedShards: index + 1,
+              totalShards: root.header.shardCount,
+              currentShardIndex: index,
+            ),
+          );
         }
       } catch (_) {
         for (final shardPlaintext in heldShardPlaintexts) {
@@ -184,7 +248,10 @@ final class BundleDecryptor {
       try {
         if (BigInt.from(overallLength) != manifest.logicalPlaintextSize ||
             !constantTimeBytesEqual(digest, manifest.logicalPlaintextSha256)) {
-          throw const SboxException(SboxErrorCode.integrity, 'Bundle 整体完整性校验失败');
+          throw const SboxException(
+            SboxErrorCode.integrity,
+            'Bundle 整体完整性校验失败',
+          );
         }
       } catch (_) {
         for (final shardPlaintext in heldShardPlaintexts) {
@@ -206,6 +273,16 @@ final class BundleDecryptor {
           throw const SboxException(SboxErrorCode.integrity, '文本明文不是严格 UTF-8');
         }
       }
+      _emitProgress(
+        onProgress,
+        BundleDecryptionProgress(
+          stage: BundleDecryptionStage.decrypting,
+          processedBytes: totalPlaintextBytes,
+          totalBytes: totalPlaintextBytes,
+          completedShards: root.header.shardCount,
+          totalShards: root.header.shardCount,
+        ),
+      );
       return DecryptedBundle(
         manifest: manifest,
         rootHeader: root.header,
@@ -251,11 +328,13 @@ final class BundleDecryptor {
     required String mnemonic,
     required File destination,
     PublicIdentity? expectedIdentity,
+    void Function(BundleDecryptionProgress progress)? onProgress,
   }) async {
     final decrypted = await decrypt(
       objects: objects,
       mnemonic: mnemonic,
       expectedIdentity: expectedIdentity,
+      onProgress: onProgress,
     );
     final parent = destination.parent;
     await parent.create(recursive: true);
@@ -274,13 +353,58 @@ final class BundleDecryptor {
       '${parent.path}${Platform.pathSeparator}.sbox-plaintext-${hexLower(secureRandomBytes(8))}.part',
     );
     var renamed = false;
+    IOSink? output;
     try {
-      await stage.writeAsBytes(decrypted.plaintext, flush: true);
+      final plaintext = decrypted.plaintext;
+      _emitProgress(
+        onProgress,
+        BundleDecryptionProgress(
+          stage: BundleDecryptionStage.merging,
+          processedBytes: 0,
+          totalBytes: plaintext.length,
+          completedShards: 0,
+          totalShards: 1,
+        ),
+      );
+      output = stage.openWrite();
+      var offset = 0;
+      while (offset < plaintext.length) {
+        final end = offset + SboxProtocol.chunkSize < plaintext.length
+            ? offset + SboxProtocol.chunkSize
+            : plaintext.length;
+        output.add(Uint8List.sublistView(plaintext, offset, end));
+        await output.flush();
+        offset = end;
+        _emitProgress(
+          onProgress,
+          BundleDecryptionProgress(
+            stage: BundleDecryptionStage.merging,
+            processedBytes: offset,
+            totalBytes: plaintext.length,
+            completedShards: 1,
+            totalShards: 1,
+          ),
+        );
+      }
+      await output.flush();
+      _emitProgress(
+        onProgress,
+        BundleDecryptionProgress(
+          stage: BundleDecryptionStage.merging,
+          processedBytes: plaintext.length,
+          totalBytes: plaintext.length,
+          completedShards: 1,
+          totalShards: 1,
+        ),
+      );
+      await output.close();
+      output = null;
       await stage.rename(destination.path);
       renamed = true;
     } on FileSystemException {
       throw const SboxException(SboxErrorCode.temporaryCleanup, '明文发布失败');
     } finally {
+      await output?.close();
       decrypted.plaintext.fillRange(0, decrypted.plaintext.length, 0);
       if (!renamed && await stage.exists()) await stage.delete();
     }
@@ -295,7 +419,8 @@ final class BundleDecryptor {
       parsed.add(_parseObject(entry.key, entry.value));
     }
     parsed.sort(
-      (left, right) => left.header.shardIndex.compareTo(right.header.shardIndex),
+      (left, right) =>
+          left.header.shardIndex.compareTo(right.header.shardIndex),
     );
     final roots = parsed.where((object) => object.header.isRoot).toList();
     if (roots.isEmpty) {
@@ -321,7 +446,10 @@ final class BundleDecryptor {
           ) ||
           header.shardCount != root.header.shardCount ||
           byIndex.containsKey(header.shardIndex)) {
-        throw const SboxException(SboxErrorCode.shardConflict, 'Bundle 分片身份或索引冲突');
+        throw const SboxException(
+          SboxErrorCode.shardConflict,
+          'Bundle 分片身份或索引冲突',
+        );
       }
       byIndex[header.shardIndex] = object;
     }
@@ -359,7 +487,10 @@ final class BundleDecryptor {
         identity.publicIdentity.recipientKeyId,
         root.header.recipientKeyId,
       )) {
-        throw const SboxException(SboxErrorCode.keyMismatch, '助记词与 Bundle 身份不匹配');
+        throw const SboxException(
+          SboxErrorCode.keyMismatch,
+          '助记词与 Bundle 身份不匹配',
+        );
       }
       final fast = await BundleProbe.readMetadata(
         basename: root.basename,
@@ -419,7 +550,10 @@ final class BundleDecryptor {
     for (final object in parsed.objects) {
       if (manifest.expectedShardPlaintextSize(object.header.shardIndex) !=
           object.header.shardPlaintextSize) {
-        throw const SboxException(SboxErrorCode.shardMismatch, '分片长度与 Manifest 不一致');
+        throw const SboxException(
+          SboxErrorCode.shardMismatch,
+          '分片长度与 Manifest 不一致',
+        );
       }
     }
   }
@@ -427,8 +561,9 @@ final class BundleDecryptor {
   Future<_ShardPlaintext> _decryptShard(
     _ParsedObject object,
     List<int> bundleDek,
-    ByteConversionSink overallHashSink,
-  ) async {
+    ByteConversionSink overallHashSink, {
+    void Function(int bytes)? onChunkDecrypted,
+  }) async {
     final header = object.header;
     final headerHash = sha256Bytes(header.rawBytes);
     final shardKey = ShardKdf.derive(
@@ -440,7 +575,9 @@ final class BundleDecryptor {
     final output = BytesBuilder(copy: false);
     final heldChunks = <Uint8List>[];
     final shardAccumulator = HashDigestSink();
-    final shardHashSink = crypto.sha256.startChunkedConversion(shardAccumulator);
+    final shardHashSink = crypto.sha256.startChunkedConversion(
+      shardAccumulator,
+    );
     var offset = header.headerLength;
     var expectedIndex = BigInt.one;
     var dataCount = 0;
@@ -454,11 +591,17 @@ final class BundleDecryptor {
           maximumPlaintextLength: SboxProtocol.chunkSize,
         );
         if (record.index != expectedIndex) {
-          throw const SboxException(SboxErrorCode.invalidRecord, 'SBOX 记录索引不连续');
+          throw const SboxException(
+            SboxErrorCode.invalidRecord,
+            'SBOX 记录索引不连续',
+          );
         }
         if (record.type == BundleRecordType.finalRecord) {
           if (record.plaintextLength != SboxProtocol.finalPlaintextLength) {
-            throw const SboxException(SboxErrorCode.invalidRecord, 'Final 记录长度无效');
+            throw const SboxException(
+              SboxErrorCode.invalidRecord,
+              'Final 记录长度无效',
+            );
           }
           final finalBytes = await _records.decrypt(
             record: record,
@@ -492,7 +635,10 @@ final class BundleDecryptor {
             record.plaintextLength == 0 ||
             sawShort ||
             header.shardPlaintextSize == BigInt.zero) {
-          throw const SboxException(SboxErrorCode.invalidRecord, 'Data 记录顺序或长度无效');
+          throw const SboxException(
+            SboxErrorCode.invalidRecord,
+            'Data 记录顺序或长度无效',
+          );
         }
         final plaintext = await _records.decrypt(
           record: record,
@@ -503,7 +649,10 @@ final class BundleDecryptor {
         try {
           if (plaintext.length != record.plaintextLength ||
               plaintext.length > SboxProtocol.chunkSize) {
-            throw const SboxException(SboxErrorCode.invalidRecord, 'Data 记录长度不一致');
+            throw const SboxException(
+              SboxErrorCode.invalidRecord,
+              'Data 记录长度不一致',
+            );
           }
           shardHashSink.add(plaintext);
           overallHashSink.add(plaintext);
@@ -512,6 +661,7 @@ final class BundleDecryptor {
           output.add(verifiedChunk);
           dataLength += plaintext.length;
           dataCount++;
+          onChunkDecrypted?.call(plaintext.length);
           sawShort = plaintext.length < SboxProtocol.chunkSize;
         } finally {
           plaintext.fillRange(0, plaintext.length, 0);
@@ -527,6 +677,17 @@ final class BundleDecryptor {
     } finally {
       shardKey.fillRange(0, shardKey.length, 0);
       headerHash.fillRange(0, headerHash.length, 0);
+    }
+  }
+
+  static void _emitProgress(
+    void Function(BundleDecryptionProgress progress)? onProgress,
+    BundleDecryptionProgress progress,
+  ) {
+    try {
+      onProgress?.call(progress);
+    } on Object {
+      // Progress listeners must never be able to interrupt decryption.
     }
   }
 }

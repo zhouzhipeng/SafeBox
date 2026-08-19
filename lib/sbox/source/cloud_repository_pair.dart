@@ -11,7 +11,12 @@ import '../logging.dart';
 /// Creates the two HTTP data sources described by one SafeBox configuration.
 /// The caller owns and closes [client] after all requests finish.
 final class CloudRepositoryPair {
-  CloudRepositoryPair._({required this.github, required this.gitee});
+  CloudRepositoryPair._({
+    required this.github,
+    required this.gitee,
+    required this.githubEnabled,
+    required this.giteeEnabled,
+  });
 
   factory CloudRepositoryPair.fromConfiguration({
     required CloudBackupConfiguration configuration,
@@ -28,6 +33,7 @@ final class CloudRepositoryPair {
         credentialId: configuration.github.credentialId,
         logger: logger,
       ),
+      githubEnabled: configuration.github.enabled,
       gitee: GiteeDataSource(
         config: configuration.gitee.repositoryConfig,
         client: client,
@@ -35,9 +41,22 @@ final class CloudRepositoryPair {
         credentialId: configuration.gitee.credentialId,
         logger: logger,
       ),
+      giteeEnabled: configuration.gitee.enabled,
     );
   }
 
   final EnumerableDataSource github;
   final EnumerableDataSource gitee;
+  final bool githubEnabled;
+  final bool giteeEnabled;
+
+  /// Returns only repositories that are enabled in the current configuration.
+  ///
+  /// The concrete [github] and [gitee] fields remain available for callers
+  /// that need a stable provider reference, but normal sync and listing flows
+  /// should use this collection so a disabled repository is never contacted.
+  List<({String name, EnumerableDataSource source})> get enabledSources => [
+    if (githubEnabled) (name: 'GitHub', source: github),
+    if (giteeEnabled) (name: 'Gitee', source: gitee),
+  ];
 }

@@ -33,12 +33,18 @@ final class ListedBundleRoot {
 }
 
 abstract final class BundleListing {
+  /// Lists all roots and calls [onRoot] as each valid root is decoded.
+  ///
+  /// The callback is useful for UIs that should publish the first few files
+  /// without waiting for the complete repository scan.
   static Future<List<ListedBundleRoot>> listRoots(
     EnumerableDataSource source, {
     int pageSize = 1000,
     PublicIdentity? identity,
     int? maxParallelTransfers,
     int maxRetainedPreviewBytes = SboxProtocol.maxRetainedPreviewBytes,
+    void Function(ListedBundleRoot root)? onRoot,
+    void Function(SourceObjectInfo object)? onObject,
   }) async {
     if (!source.capabilities.canListObjects ||
         !source.capabilities.supportsRangeRead) {
@@ -54,7 +60,10 @@ abstract final class BundleListing {
       );
     }
     if (maxRetainedPreviewBytes < 0) {
-      throw ArgumentError.value(maxRetainedPreviewBytes, 'maxRetainedPreviewBytes');
+      throw ArgumentError.value(
+        maxRetainedPreviewBytes,
+        'maxRetainedPreviewBytes',
+      );
     }
     final rangeSource = source as RangeReadableDataSource;
     var roots = <ListedBundleRoot>[];
@@ -69,6 +78,7 @@ abstract final class BundleListing {
       final page = await source.listObjects(cursor: cursor, pageSize: pageSize);
       final candidates = <SourceObjectInfo>[];
       for (final info in page.objects) {
+        if (info.path.value.endsWith('.sbox')) onObject?.call(info);
         if (!seenPaths.add(info.path.value)) {
           throw const SboxException(SboxErrorCode.shardConflict, '数据源返回重复对象路径');
         }
@@ -120,19 +130,20 @@ abstract final class BundleListing {
                   maxRetainedPreviewBytes - retainedPreviewBytes) {
             if (preview != null) retainedPreviewBytes += preview.encodedLength;
             roots.add(root);
+            onRoot?.call(root);
             continue;
           }
           preview.dispose();
-          roots.add(
-            ListedBundleRoot(
-              path: root.path,
-              info: root.info,
-              header: root.header,
-              manifest: root.manifest,
-              hasPreview: true,
-              status: root.status,
-            ),
+          final withoutPreview = ListedBundleRoot(
+            path: root.path,
+            info: root.info,
+            header: root.header,
+            manifest: root.manifest,
+            hasPreview: true,
+            status: root.status,
           );
+          roots.add(withoutPreview);
+          onRoot?.call(withoutPreview);
         }
       }
       cursor = page.nextCursor;
