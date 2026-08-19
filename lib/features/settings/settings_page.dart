@@ -58,7 +58,6 @@ final class _SettingsPageState extends State<SettingsPage> {
   final _githubTokenController = TextEditingController();
   final _giteeTokenController = TextEditingController();
   bool _cloudExpanded = false;
-  bool _clearOnExit = false;
   bool _lightTheme = false;
   bool _loading = true;
   bool _saving = false;
@@ -495,20 +494,6 @@ final class _SettingsPageState extends State<SettingsPage> {
       value: _lightTheme ? '亮色' : '深色',
       onTap: _chooseTheme,
     );
-    final fileRow = _HabitRow(
-      icon: Icons.description_outlined,
-      title: '打开文件后',
-      value: _clearOnExit ? '不保留临时文件' : '保留临时文件',
-      onTap: () async {
-        final value = !_clearOnExit;
-        setState(() => _clearOnExit = value);
-        try {
-          await _appSettingsStore.saveClearPlaintextOnExit(value);
-        } catch (error) {
-          if (mounted) widget.controller.setError(error, operation: '保存使用习惯失败');
-        }
-      },
-    );
     return SboxCard(
       padding: EdgeInsets.fromLTRB(
         mobile ? 18 : 30,
@@ -524,8 +509,6 @@ final class _SettingsPageState extends State<SettingsPage> {
           SizedBox(height: mobile ? 18 : 18),
           if (mobile) ...<Widget>[
             themeRow,
-            const Divider(height: 1),
-            fileRow,
             const SizedBox(height: 14),
             Align(
               alignment: Alignment.centerLeft,
@@ -543,14 +526,6 @@ final class _SettingsPageState extends State<SettingsPage> {
               crossAxisAlignment: CrossAxisAlignment.center,
               children: <Widget>[
                 Expanded(child: themeRow),
-                const SizedBox(width: 28),
-                Container(
-                  width: 1,
-                  height: 42,
-                  color: context.sboxColors.textDim,
-                ),
-                const SizedBox(width: 28),
-                Expanded(child: fileRow),
                 const SizedBox(width: 40),
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.end,
@@ -605,7 +580,6 @@ final class _SettingsPageState extends State<SettingsPage> {
         _githubConnected = await _hasToken(configuration.github.credentialId);
         _giteeConnected = await _hasToken(configuration.gitee.credentialId);
       }
-      _clearOnExit = await _appSettingsStore.loadClearPlaintextOnExit();
       _lightTheme = await _appSettingsStore.loadLightTheme();
     } catch (error) {
       if (mounted) {
@@ -830,7 +804,7 @@ final class _SettingsPageState extends State<SettingsPage> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('清理缓存？'),
-        content: const Text('这会删除已经准备好的临时文件、文件信息索引和缩略图缓存，云端安全文件和本地加密备份不会受到影响。'),
+        content: const Text('这会删除临时文件、文件信息索引、缩略图缓存和本地加密备份；云端安全文件不会受到影响。'),
         actions: <Widget>[
           TextButton(
             onPressed: () => Navigator.of(context).pop(false),
@@ -869,7 +843,7 @@ final class _SettingsPageState extends State<SettingsPage> {
       };
       for (final root in cacheRoots) {
         try {
-          await LocalBundleIndexStore.clearAll(Directory(root));
+          await LocalBundleIndexStore.deleteAll(Directory(root));
         } on Object catch (error) {
           failures.add(error);
         }

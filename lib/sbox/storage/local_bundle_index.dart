@@ -422,6 +422,27 @@ final class LocalBundleIndexStore {
     }
   }
 
+  /// Deletes every local backup object and cache entry below [cipherRoot].
+  ///
+  /// The backup root itself is kept so it can be reused. Links are removed as
+  /// links and are never followed.
+  static Future<void> deleteAll(Directory cipherRoot) async {
+    final rootType = await FileSystemEntity.type(
+      cipherRoot.path,
+      followLinks: false,
+    );
+    if (rootType == FileSystemEntityType.notFound) return;
+    if (rootType != FileSystemEntityType.directory) {
+      throw FileSystemException(
+        'Local backup root is not a directory',
+        cipherRoot.path,
+      );
+    }
+    await for (final entity in cipherRoot.list(followLinks: false)) {
+      await _deleteEntityNoFollow(entity);
+    }
+  }
+
   Future<LocalBundleIndex> _loadPreviews(LocalBundleIndex index) async {
     final entries = <LocalBundleIndexEntry>[];
     for (var entryIndex = 0; entryIndex < index.entries.length; entryIndex++) {

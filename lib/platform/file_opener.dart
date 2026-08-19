@@ -2,6 +2,17 @@ import 'dart:io';
 
 /// Opens files and directories with the operating system's default app.
 abstract final class FileOpener {
+  static Future<void> _startDetached(
+    String executable,
+    List<String> arguments,
+  ) async {
+    await Process.start(
+      executable,
+      arguments,
+      mode: ProcessStartMode.detached,
+    );
+  }
+
   static Future<void> open(File file) async {
     if (await FileSystemEntity.type(file.path, followLinks: false) !=
         FileSystemEntityType.file) {
@@ -9,15 +20,15 @@ abstract final class FileOpener {
     }
     final path = file.absolute.path;
     if (Platform.isWindows) {
-      await Process.start('explorer.exe', <String>[path]);
+      await _startDetached('explorer.exe', <String>[path]);
       return;
     }
     if (Platform.isMacOS) {
-      await Process.start('open', <String>[path]);
+      await _startDetached('open', <String>[path]);
       return;
     }
     if (Platform.isLinux) {
-      await Process.start('xdg-open', <String>[path]);
+      await _startDetached('xdg-open', <String>[path]);
       return;
     }
     throw UnsupportedError('当前平台不支持直接打开临时文件');
@@ -30,15 +41,15 @@ abstract final class FileOpener {
     }
     final path = directory.absolute.path;
     if (Platform.isWindows) {
-      await Process.start('explorer.exe', <String>[path]);
+      await _startDetached('explorer.exe', <String>[path]);
       return;
     }
     if (Platform.isMacOS) {
-      await Process.start('open', <String>[path]);
+      await _startDetached('open', <String>[path]);
       return;
     }
     if (Platform.isLinux) {
-      await Process.start('xdg-open', <String>[path]);
+      await _startDetached('xdg-open', <String>[path]);
       return;
     }
     throw UnsupportedError('当前平台不支持直接打开目录');

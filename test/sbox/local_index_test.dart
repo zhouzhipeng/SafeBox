@@ -135,6 +135,17 @@ void main() {
         expect(await store.file.exists(), isFalse);
         expect(await store.previewDirectory.exists(), isFalse);
         expect(await encryptedBundle.exists(), isTrue);
+
+        await Directory(p.join(root.path, 'nested')).create();
+        await File(p.join(root.path, 'nested', 'other.sbox'))
+            .writeAsString('another encrypted bundle placeholder');
+        await LocalBundleIndexStore.deleteAll(root);
+        expect(await root.exists(), isTrue);
+        expect(await encryptedBundle.exists(), isFalse);
+        expect(
+          await File(p.join(root.path, 'nested', 'other.sbox')).exists(),
+          isFalse,
+        );
       } finally {
         loadedPreview?.dispose();
         preview?.dispose();
