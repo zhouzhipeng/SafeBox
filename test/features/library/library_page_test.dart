@@ -12,9 +12,6 @@ void main() {
   testWidgets('second file selection keeps the upload action responsive', (
     tester,
   ) async {
-    // Diagnostic milestones also make a stalled widget pump obvious in CI.
-    // ignore: avoid_print
-    print('library upload test: setup');
     SharedPreferences.setMockInitialValues(<String, Object>{});
     final temporary = (await tester.runAsync(() async {
       final directory = await Directory.systemTemp.createTemp(
@@ -31,8 +28,6 @@ void main() {
     addTearDown(() => tester.runAsync(() => temporary.delete(recursive: true)));
     final first = File('${temporary.path}${Platform.pathSeparator}first.zip');
     final second = File('${temporary.path}${Platform.pathSeparator}second.zip');
-    // ignore: avoid_print
-    print('library upload test: files ready');
 
     const fileSelectorChannel = MethodChannel(
       'plugins.flutter.io/file_selector',
@@ -48,8 +43,6 @@ void main() {
 
     final controller = AppController();
     addTearDown(controller.dispose);
-    // ignore: avoid_print
-    print('library upload test: pumping widget');
     await tester.pumpWidget(
       MaterialApp(
         theme: buildSboxTheme(),
@@ -61,8 +54,6 @@ void main() {
         ),
       ),
     );
-    // ignore: avoid_print
-    print('library upload test: first frame');
     tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
       fileSelectorChannel,
       (call) async {
@@ -84,27 +75,20 @@ void main() {
     }
 
     await tester.tap(find.byKey(const Key('library-select-file-button')));
-    // ignore: avoid_print
-    print('library upload test: first picker tapped');
     await waitForText('first.zip');
     expect(find.text('first.zip'), findsOneWidget);
 
     await tester.tap(find.textContaining('点击可更换文件'));
-    // ignore: avoid_print
-    print('library upload test: second picker tapped');
     await waitForText('second.zip');
     expect(find.text('second.zip'), findsOneWidget);
     expect(selectionCount, 2);
 
     await tester.tap(find.byKey(const Key('library-upload-file-button')));
-    // ignore: avoid_print
-    print('library upload test: upload tapped');
     await tester.pump();
 
     expect(selectionCount, 2, reason: '上传按钮不应重新打开文件选择器');
     expect(find.text('请先完成安全身份设置。'), findsOneWidget);
 
-    await tester.tap(find.text('关闭'));
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();
   });
