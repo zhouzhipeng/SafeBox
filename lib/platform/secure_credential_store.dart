@@ -10,7 +10,15 @@ import '../sbox/source/credential.dart';
 /// passed to it accidentally.
 final class PlatformCredentialStore implements CredentialStore {
   PlatformCredentialStore({FlutterSecureStorage? storage})
-    : _storage = storage ?? const FlutterSecureStorage();
+    : _storage =
+          storage ??
+          const FlutterSecureStorage(
+            // The macOS data-protection keychain requires a restricted
+            // keychain-access-groups entitlement. Use the per-app traditional
+            // Keychain instead so sandboxed/debug and ad-hoc builds can start
+            // without an entitlement that invalidates their code signature.
+            mOptions: MacOsOptions(usesDataProtectionKeychain: false),
+          );
 
   static const String _keyPrefix = 'sbox.source_token.';
   final FlutterSecureStorage _storage;
