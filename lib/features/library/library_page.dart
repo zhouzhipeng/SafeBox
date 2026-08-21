@@ -7,6 +7,7 @@ import 'dart:ui' show PointerDeviceKind;
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
@@ -41,6 +42,7 @@ import '../../sbox/source/cloud_repository_pair.dart';
 import '../../sbox/source/credential.dart';
 import '../../sbox/source/data_source.dart';
 import '../../sbox/source/local_directory_source.dart';
+import '../../sbox/source/repository_data_source.dart';
 import '../../sbox/source/source_path.dart';
 import '../../sbox/storage/local_bundle_index.dart';
 import '../../sbox/storage/temporary_plaintext_store.dart';
@@ -1276,7 +1278,9 @@ final class _LibraryPageState extends State<LibraryPage> {
         ),
       ],
     };
-    if (_canDeleteCloudBundle(row)) {
+    final canCopyPublicLink = _canCopyPublicLink(row);
+    final canDeleteCloudBundle = _canDeleteCloudBundle(row);
+    if (canCopyPublicLink || canDeleteCloudBundle) {
       final deleteEnabled = !_busy && !_listingInBackground;
       buttons.add(
         SizedBox(
@@ -1288,6 +1292,8 @@ final class _LibraryPageState extends State<LibraryPage> {
             padding: EdgeInsets.zero,
             onSelected: (action) {
               switch (action) {
+                case _FileRowMenuAction.copyPublicLink:
+                  _copyPublicLink(row);
                 case _FileRowMenuAction.deleteCloudBundle:
                   _deleteCloudBundle(row);
               }
@@ -1295,18 +1301,33 @@ final class _LibraryPageState extends State<LibraryPage> {
             itemBuilder: (context) {
               final errorColor = Theme.of(context).colorScheme.error;
               return <PopupMenuEntry<_FileRowMenuAction>>[
-                PopupMenuItem<_FileRowMenuAction>(
-                  enabled: deleteEnabled,
-                  value: _FileRowMenuAction.deleteCloudBundle,
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: <Widget>[
-                      Icon(Icons.delete_outline, color: errorColor, size: 20),
-                      const SizedBox(width: 10),
-                      Text('删除云端文件', style: TextStyle(color: errorColor)),
-                    ],
+                if (canCopyPublicLink)
+                  const PopupMenuItem<_FileRowMenuAction>(
+                    value: _FileRowMenuAction.copyPublicLink,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Icon(Icons.link_outlined, size: 20),
+                        SizedBox(width: 10),
+                        Text('复制链接'),
+                      ],
+                    ),
                   ),
-                ),
+                if (canCopyPublicLink && canDeleteCloudBundle)
+                  const PopupMenuDivider(),
+                if (canDeleteCloudBundle)
+                  PopupMenuItem<_FileRowMenuAction>(
+                    enabled: deleteEnabled,
+                    value: _FileRowMenuAction.deleteCloudBundle,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Icon(Icons.delete_outline, color: errorColor, size: 20),
+                        const SizedBox(width: 10),
+                        Text('删除云端文件', style: TextStyle(color: errorColor)),
+                      ],
+                    ),
+                  ),
               ];
             },
           ),
@@ -1319,6 +1340,27 @@ final class _LibraryPageState extends State<LibraryPage> {
       runSpacing: 8,
       children: buttons,
     );
+  }
+
+  bool _canCopyPublicLink(_FileRow row) =>
+      row.bundle?.source is RepositoryDataSource;
+
+  Future<void> _copyPublicLink(_FileRow row) async {
+    final bundle = row.bundle;
+    final source = bundle?.source;
+    if (bundle == null || source is! RepositoryDataSource) return;
+    final uri = source.publicReleaseAssetUri(bundle.root.path);
+    try {
+      await Clipboard.setData(ClipboardData(text: uri.toString()));
+      if (mounted) _showFeedback('${bundle.sourceName} Release 公开链接已复制。');
+    } catch (error) {
+      if (!mounted) return;
+      widget.controller.logger.warning(
+        '复制云端公开链接失败',
+        detail: AppLogger.describeError(error),
+      );
+      _showFeedback('复制链接失败，请稍后重试。', error: true);
+    }
   }
 
   bool _canDeleteCloudBundle(_FileRow row) {
@@ -3262,7 +3304,7 @@ final class _LibraryBundle {
 
 enum _FileActionState { localPlaintext, localEncrypted, remoteOnly }
 
-enum _FileRowMenuAction { deleteCloudBundle }
+enum _FileRowMenuAction { copyPublicLink, deleteCloudBundle }
 
 enum _LibrarySource {
   github('GitHub'),

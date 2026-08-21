@@ -76,6 +76,26 @@ abstract base class RepositoryDataSource
   final RemoteHttp httpTransport;
   final String sourceName;
 
+  /// Public web host used by provider Release download links.
+  String get publicWebHost;
+
+  /// Returns the public Release URL for one object in this repository.
+  ///
+  /// SafeBox uses a stable dedicated tag, so a known root-object URL can also
+  /// be used to derive the URLs of the remaining Bundle shards.
+  Uri publicReleaseAssetUri(SourcePath path) => Uri(
+    scheme: 'https',
+    host: publicWebHost,
+    pathSegments: <String>[
+      config.owner,
+      config.repository,
+      'releases',
+      'download',
+      safeBoxReleaseTag,
+      _assetNameForPath(path),
+    ],
+  );
+
   /// Provider-specific release and asset endpoints.
   Uri latestReleaseUri();
 

@@ -12,6 +12,23 @@ import 'package:safebox/sbox/source/source_path.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('GitHub exposes a public Release URL for an object', () {
+    final source = GitHubDataSource(
+      config: RepositorySourceConfig(
+        owner: 'owner',
+        repository: 'repo',
+        pathPrefix: 'nested',
+      ),
+      client: _GitHubReleaseClient(),
+    );
+
+    expect(
+      source.publicReleaseAssetUri(SourcePath('object.sbox')).toString(),
+      'https://github.com/owner/repo/releases/download/latest/'
+      'safebox-bmVzdGVk--object.sbox',
+    );
+  });
+
   test('GitHub creates the dedicated latest release lazily', () async {
     final client = _GitHubReleaseClient();
     final source = _source(client);

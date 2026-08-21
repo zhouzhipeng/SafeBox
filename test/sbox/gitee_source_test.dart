@@ -12,6 +12,18 @@ import 'package:safebox/sbox/source/source_path.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('Gitee exposes a public Release URL for an object', () {
+    final source = GiteeDataSource(
+      config: RepositorySourceConfig(owner: 'zzp', repository: 'repo'),
+      client: _GiteeReleaseClient(),
+    );
+
+    expect(
+      source.publicReleaseAssetUri(SourcePath('object.sbox')).toString(),
+      'https://gitee.com/zzp/repo/releases/download/latest/object.sbox',
+    );
+  });
+
   test('Gitee release assets expose bounded parallel transfers', () {
     expect(_source(_GiteeReleaseClient()).capabilities.maxParallelTransfers, 2);
   });

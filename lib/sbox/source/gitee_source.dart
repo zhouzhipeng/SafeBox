@@ -18,6 +18,9 @@ final class GiteeDataSource extends RepositoryDataSource {
   });
 
   @override
+  String get publicWebHost => 'gitee.com';
+
+  @override
   SourceCapabilities get capabilities => SourceCapabilities(
     canRead: true,
     canWrite: credentialStore != null && credentialId != null,

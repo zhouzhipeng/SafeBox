@@ -17,6 +17,9 @@ final class GitHubDataSource extends RepositoryDataSource {
   });
 
   @override
+  String get publicWebHost => 'github.com';
+
+  @override
   SourceCapabilities get capabilities => SourceCapabilities(
     canRead: true,
     canWrite: credentialStore != null && credentialId != null,
