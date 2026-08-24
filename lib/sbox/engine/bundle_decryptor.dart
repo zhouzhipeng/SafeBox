@@ -4,6 +4,7 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
+import 'package:flutter/foundation.dart' show kIsWeb;
 
 import '../bytes.dart';
 import '../constants.dart';
@@ -136,7 +137,10 @@ final class BundleDecryptor {
     EphemeralIdentity? identity;
     Uint8List? bundleDek;
     try {
-      identity = await SboxIdentityDeriver().deriveIdentity(mnemonic);
+      final deriver = SboxIdentityDeriver();
+      identity = kIsWeb
+          ? await deriver.deriveIdentityCooperatively(mnemonic)
+          : await deriver.deriveIdentity(mnemonic);
       if (expectedIdentity != null &&
           !constantTimeBytesEqual(
             identity.publicIdentity.spkiDer,
@@ -465,7 +469,10 @@ final class BundleDecryptor {
     EphemeralIdentity? identity;
     Uint8List? bundleDek;
     try {
-      identity = await SboxIdentityDeriver().deriveIdentity(mnemonic);
+      final deriver = SboxIdentityDeriver();
+      identity = kIsWeb
+          ? await deriver.deriveIdentityCooperatively(mnemonic)
+          : await deriver.deriveIdentity(mnemonic);
       if (expectedIdentity != null &&
           !constantTimeBytesEqual(
             identity.publicIdentity.spkiDer,
@@ -565,7 +572,7 @@ final class BundleDecryptor {
         if (nextIndex >= objects.length) return;
         final index = nextIndex++;
         final object = objects[index];
-        final result = _canUseShardIsolates
+        final result = _canUseShardIsolates && !kIsWeb
             ? await _decryptShardInIsolate(object, bundleDek)
             : await _decryptShard(object, bundleDek);
         results[index] = result;
@@ -597,6 +604,7 @@ final class BundleDecryptor {
   }
 
   int _shardWorkerCount(int shardCount) {
+    if (kIsWeb) return 1;
     final processorCount = Platform.numberOfProcessors;
     final parallelism = processorCount < 2
         ? 1

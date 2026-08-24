@@ -4,7 +4,9 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
+import 'package:flutter/foundation.dart' show kIsWeb;
 
+import '../../platform/web_proxy_http_client.dart';
 import '../errors.dart';
 import '../format/strict_json.dart';
 import '../logging.dart';
@@ -13,12 +15,13 @@ enum RemoteFailureContext { read, immutableCreate, delete }
 
 final class RemoteHttp {
   RemoteHttp(
-    this.client, {
+    http.Client client, {
+    bool useWebProxy = false,
     this.requestTimeout = const Duration(seconds: 30),
     this.streamIdleTimeout = const Duration(seconds: 30),
     this.logger,
     this.sourceName = '云端数据源',
-  });
+  }) : client = useWebProxy ? configureRemoteHttpClient(client) : client;
 
   static const int maximumRedirects = 5;
   static const int maximumHeaderBytes = 64 * 1024;
@@ -183,7 +186,9 @@ final class RemoteHttp {
       // Flutter isolate, but avoid paying an isolate startup for normal
       // repositories with only a few hundred entries.
       final value =
-          parseInBackground && bytes.length >= minimumJsonBytesForIsolate
+          !kIsWeb &&
+              parseInBackground &&
+              bytes.length >= minimumJsonBytesForIsolate
           ? await Isolate.run<Object?>(
               () => _parseJsonWorker(bytes, maximumBytes),
               debugName: 'safebox-parse-file-list',
@@ -348,6 +353,16 @@ final class RemoteHttp {
   Future<http.StreamedResponse> _send(http.BaseRequest request) async {
     try {
       return await client.send(request).timeout(requestTimeout);
+    } on WebProxyUnavailableException catch (error) {
+      _logError(
+        error,
+        operation: '$sourceName：Web 云端代理不可用',
+        context: '${request.method} ${_endpoint(request.url)}',
+      );
+      throw const SboxException(
+        SboxErrorCode.sourceNetwork,
+        'Web 云端代理不可用，请使用 SafeBox Web 服务器启动',
+      );
     } on SboxException {
       rethrow;
     } on Object catch (error) {

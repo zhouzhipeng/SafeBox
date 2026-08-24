@@ -6,6 +6,10 @@ import 'der.dart';
 import 'rsa_identity_profile1.dart';
 import 'rsa_models.dart';
 
+const _compactPublicKeyPrefix = 'sboxpk1:';
+const _compactPublicKeyChecksumBytes = 4;
+const _profile1ModulusBytes = RsaIdentityProfile1.rsaBits ~/ 8;
+
 /// The exact persisted RSA-only public identity schema.
 final class PublicIdentityRecord {
   const PublicIdentityRecord({
@@ -29,6 +33,90 @@ final class PublicIdentityRecord {
     'spki_der': base64Url.encode(spkiDer).replaceAll('=', ''),
     'recipient_key_id': hexLower(recipientKeyId),
   };
+
+  /// Encodes the public identity as the compact single-line format copied by
+  /// SafeBox. Profile 1 fixes the exponent and DER wrapper, so only the
+  /// 3072-bit modulus and a four-byte key-ID checksum need to be carried.
+  String encode() {
+    final identity = toPublicIdentity();
+    final modulus = bigIntToFixedBytes(
+      identity.rsaPublicKey.modulus,
+      _profile1ModulusBytes,
+    );
+    final payload = concatBytes(<List<int>>[
+      modulus,
+      identity.recipientKeyId.sublist(0, _compactPublicKeyChecksumBytes),
+    ]);
+    return '$_compactPublicKeyPrefix'
+        '${base64Url.encode(payload).replaceAll('=', '')}';
+  }
+
+  /// Retains the original verbose JSON representation for persisted data and
+  /// compatibility with SDK clients that have not adopted `sboxpk1:` yet.
+  String encodeJson() => jsonEncode(toJson());
+
+  /// Decodes either the compact copied format or the legacy public-identity
+  /// JSON document.
+  factory PublicIdentityRecord.decode(String input) {
+    final value = input.trim();
+    if (value.startsWith(_compactPublicKeyPrefix)) {
+      return PublicIdentityRecord._fromCompact(value);
+    }
+    try {
+      final decoded = jsonDecode(value);
+      if (decoded is! Map<String, Object?>) {
+        throw const FormatException('Invalid public identity');
+      }
+      return PublicIdentityRecord.fromJson(decoded);
+    } on FormatException {
+      throw const FormatException('Invalid public identity');
+    }
+  }
+
+  factory PublicIdentityRecord._fromCompact(String value) {
+    final encoded = value.substring(_compactPublicKeyPrefix.length);
+    if (encoded.isEmpty ||
+        encoded.contains('=') ||
+        !RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(encoded)) {
+      throw const FormatException('Invalid compact public key encoding');
+    }
+
+    late final Uint8List payload;
+    try {
+      final padding = '=' * ((4 - encoded.length % 4) % 4);
+      payload = Uint8List.fromList(base64Url.decode('$encoded$padding'));
+    } on FormatException {
+      throw const FormatException('Invalid compact public key encoding');
+    }
+    if (payload.length !=
+            _profile1ModulusBytes + _compactPublicKeyChecksumBytes ||
+        base64Url.encode(payload).replaceAll('=', '') != encoded) {
+      throw const FormatException('Invalid compact public key encoding');
+    }
+
+    final modulusBytes = payload.sublist(0, _profile1ModulusBytes);
+    final modulus = bytesToBigInt(modulusBytes);
+    if (modulus.bitLength != RsaIdentityProfile1.rsaBits || modulus.isEven) {
+      throw const FormatException('Invalid compact RSA public key');
+    }
+    final key = SboxRsaPublicKey(
+      modulus: modulus,
+      exponent: BigInt.from(RsaIdentityProfile1.publicExponent),
+    );
+    final spkiDer = encodeRsaSubjectPublicKeyInfo(key);
+    final recipientKeyId = sha256Bytes(spkiDer);
+    final checksum = payload.sublist(_profile1ModulusBytes);
+    if (!constantTimeBytesEqual(
+      checksum,
+      recipientKeyId.sublist(0, _compactPublicKeyChecksumBytes),
+    )) {
+      throw const FormatException('Compact public key checksum mismatch');
+    }
+    return PublicIdentityRecord(
+      spkiDer: spkiDer,
+      recipientKeyId: recipientKeyId,
+    );
+  }
 
   PublicIdentity toPublicIdentity() {
     final publicKey = parseRsaSubjectPublicKeyInfo(spkiDer);

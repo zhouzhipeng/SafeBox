@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:path/path.dart' as p;
 
 import '../errors.dart';
@@ -13,11 +14,13 @@ final class TemporaryPlaintextStore {
     : root =
           root ??
           Directory(
-            p.join(
-              Directory.systemTemp.path,
-              defaultDirectoryName,
-              'plaintext',
-            ),
+            kIsWeb
+                ? 'web-memory/plaintext'
+                : p.join(
+                    Directory.systemTemp.path,
+                    defaultDirectoryName,
+                    'plaintext',
+                  ),
           );
 
   static const String markerName = '.sbox-managed-temp-v3';

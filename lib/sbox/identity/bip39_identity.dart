@@ -65,6 +65,20 @@ final class SboxIdentityDeriver {
   }
 
   Future<EphemeralIdentity> deriveIdentity(String mnemonic) async {
+    return _deriveIdentity(mnemonic, cooperative: false);
+  }
+
+  /// Derives the identical frozen RSA profile while periodically returning
+  /// control to the host event loop. UI code should use this variant so a Web
+  /// tab can continue painting during the deterministic prime search.
+  Future<EphemeralIdentity> deriveIdentityCooperatively(String mnemonic) {
+    return _deriveIdentity(mnemonic, cooperative: true);
+  }
+
+  Future<EphemeralIdentity> _deriveIdentity(
+    String mnemonic, {
+    required bool cooperative,
+  }) async {
     final seed = SecretBytes(deriveBip39Seed(mnemonic));
     Uint8List? okm;
     HmacDrbgSha256? drbg;
@@ -75,7 +89,10 @@ final class SboxIdentityDeriver {
         nonce: okm.sublist(32, 48),
         personalization: asciiBytes(RsaIdentityProfile1.personalization),
       );
-      final rsa = DeterministicRsa3072Generator(drbg).generate();
+      final generator = DeterministicRsa3072Generator(drbg);
+      final rsa = cooperative
+          ? await generator.generateCooperatively()
+          : generator.generate();
       final spkiDer = encodeRsaSubjectPublicKeyInfo(rsa.privateKey.publicKey);
       final recipientKeyId = sha256Bytes(spkiDer);
       final publicIdentity = PublicIdentity(

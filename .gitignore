@@ -33,6 +33,7 @@ migrate_working_dir/
 /build/
 /coverage/
 /test/failures/
+/sdk/rust/target/
 
 # SafeBox local plaintext Catalog cache (never upload or commit)
 **/.sbox-sync/catalog.json

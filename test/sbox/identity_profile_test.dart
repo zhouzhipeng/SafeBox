@@ -38,6 +38,29 @@ void main() {
           .toPublicIdentity();
       expect(restored.recipientKeyId, identity.publicIdentity.recipientKeyId);
       expect(restored.spkiDer, identity.publicIdentity.spkiDer);
+
+      final compact = record.encode();
+      expect(compact, startsWith('sboxpk1:'));
+      expect(compact.length, 526);
+      final compactRestored = PublicIdentityRecord.decode(compact)
+          .toPublicIdentity();
+      expect(
+        compactRestored.recipientKeyId,
+        identity.publicIdentity.recipientKeyId,
+      );
+      expect(compactRestored.spkiDer, identity.publicIdentity.spkiDer);
+      expect(
+        PublicIdentityRecord.decode(record.encodeJson()).toJson(),
+        record.toJson(),
+      );
+
+      final replacement = compact.endsWith('A') ? 'B' : 'A';
+      final tampered =
+          '${compact.substring(0, compact.length - 1)}$replacement';
+      expect(
+        () => PublicIdentityRecord.decode(tampered),
+        throwsA(isA<FormatException>()),
+      );
     } finally {
       identity.disposeControlledSecrets();
     }

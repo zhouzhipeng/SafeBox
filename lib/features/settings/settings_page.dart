@@ -1,6 +1,8 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
@@ -173,27 +175,41 @@ final class _SettingsPageState extends State<SettingsPage> {
         ),
       ],
     );
-    final actions = Row(
-      children: <Widget>[
-        Expanded(
-          child: OutlinedButton.icon(
-            onPressed: identityReady && !_removingIdentity
-                ? _removeIdentity
-                : null,
-            icon: const Icon(Icons.person_remove_outlined),
-            label: Text(_removingIdentity ? '正在移除…' : '移除身份'),
-          ),
-        ),
-        const SizedBox(width: 14),
-        Expanded(
-          child: OutlinedButton.icon(
-            onPressed: _removingIdentity ? null : widget.onOpenOnboarding,
-            icon: const Icon(Icons.refresh_rounded),
-            label: const Text('恢复身份'),
-          ),
-        ),
-      ],
+    final copyButton = OutlinedButton.icon(
+      onPressed: identityReady && !_removingIdentity ? _copyPublicKey : null,
+      icon: const Icon(Icons.content_copy_rounded),
+      label: const Text('复制公钥'),
     );
+    final removeButton = OutlinedButton.icon(
+      onPressed: identityReady && !_removingIdentity ? _removeIdentity : null,
+      icon: const Icon(Icons.person_remove_outlined),
+      label: Text(_removingIdentity ? '正在移除…' : '移除身份'),
+    );
+    final restoreButton = OutlinedButton.icon(
+      onPressed: _removingIdentity ? null : widget.onOpenOnboarding,
+      icon: const Icon(Icons.refresh_rounded),
+      label: const Text('恢复身份'),
+    );
+    final actions = mobile
+        ? Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              copyButton,
+              const SizedBox(height: 10),
+              removeButton,
+              const SizedBox(height: 10),
+              restoreButton,
+            ],
+          )
+        : Row(
+            children: <Widget>[
+              Expanded(child: copyButton),
+              const SizedBox(width: 14),
+              Expanded(child: removeButton),
+              const SizedBox(width: 14),
+              Expanded(child: restoreButton),
+            ],
+          );
     return SboxCard(
       padding: EdgeInsets.fromLTRB(
         mobile ? 18 : 30,
@@ -216,9 +232,9 @@ final class _SettingsPageState extends State<SettingsPage> {
           ] else
             Row(
               children: <Widget>[
-                Expanded(child: details),
+                Expanded(flex: 2, child: details),
                 const SizedBox(width: 44),
-                SizedBox(width: 532, child: actions),
+                Expanded(flex: 3, child: actions),
               ],
             ),
           if (!mobile) ...<Widget>[
@@ -516,7 +532,7 @@ final class _SettingsPageState extends State<SettingsPage> {
                 spacing: 12,
                 runSpacing: 12,
                 children: <Widget>[
-                  _openCacheDirectoryButton(),
+                  if (!kIsWeb) _openCacheDirectoryButton(),
                   _clearTemporaryPlaintextButton(),
                 ],
               ),
@@ -530,8 +546,10 @@ final class _SettingsPageState extends State<SettingsPage> {
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.end,
                   children: <Widget>[
-                    _openCacheDirectoryButton(),
-                    const SizedBox(height: 12),
+                    if (!kIsWeb) ...<Widget>[
+                      _openCacheDirectoryButton(),
+                      const SizedBox(height: 12),
+                    ],
                     _clearTemporaryPlaintextButton(),
                   ],
                 ),
@@ -604,7 +622,9 @@ final class _SettingsPageState extends State<SettingsPage> {
       configuration = CloudBackupConfiguration(
         backupDirectory:
             existing?.backupDirectory ??
-            p.join(Directory.systemTemp.path, 'SafeBox', 'backup'),
+            (kIsWeb
+                ? 'web-memory'
+                : p.join(Directory.systemTemp.path, 'SafeBox', 'backup')),
         github: CloudRepositoryEndpoint.fromRepositoryUrl(
           githubUrl,
           credentialId: _githubCredential,
@@ -728,6 +748,39 @@ final class _SettingsPageState extends State<SettingsPage> {
     return true;
   }
 
+  Future<void> _copyPublicKey() async {
+    final identity = widget.controller.identityRecord;
+    if (identity == null) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('复制公钥？'),
+        content: const Text(
+          '将复制 sboxpk1: 单行精简公钥。获得此公钥的人可以读取文件名、说明、时间和缩略图预览，但不能仅凭公钥解密文件正文。请只分享给你信任的加密方。',
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('复制'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await Clipboard.setData(ClipboardData(text: identity.encode()));
+      if (mounted) _showFeedback('公钥已复制。');
+    } catch (error) {
+      if (!mounted) return;
+      widget.controller.setError(error, operation: '复制公钥失败');
+      _showFeedback('公钥暂时无法复制，请稍后重试。', error: true);
+    }
+  }
+
   Future<void> _removeIdentity() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -818,6 +871,13 @@ final class _SettingsPageState extends State<SettingsPage> {
       ),
     );
     if (confirmed != true || !mounted) return;
+    if (kIsWeb) {
+      PaintingBinding.instance.imageCache
+        ..clear()
+        ..clearLiveImages();
+      _showFeedback('浏览器图片缓存已清理。');
+      return;
+    }
     final failures = <Object>[];
     try {
       try {

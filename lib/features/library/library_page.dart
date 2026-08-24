@@ -6,6 +6,7 @@ import 'dart:ui' show PointerDeviceKind;
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:http/http.dart' as http;
@@ -17,6 +18,7 @@ import '../../app/sbox_feedback.dart';
 import '../../app/sbox_theme.dart';
 import '../../app/sbox_widgets.dart';
 import '../../platform/cloud_backup_configuration_store.dart';
+import '../../platform/browser_download.dart';
 import '../../platform/file_opener.dart';
 import '../../platform/flutter_video_poster_decoder.dart';
 import '../../platform/preview_generation_result.dart';
@@ -24,8 +26,10 @@ import '../../platform/preview_generator.dart';
 import '../../platform/secure_credential_store.dart';
 import '../../platform/temporary_plaintext_platform.dart';
 import '../../platform/video_poster_decoder.dart';
+import '../../platform/web_runtime_limits.dart';
 import '../../sbox/bytes.dart';
 import '../../sbox/constants.dart';
+import '../../sbox/engine/bundle_decryptor.dart';
 import '../../sbox/engine/bundle_probe.dart';
 import '../../sbox/engine/bundle_encryptor.dart';
 import '../../sbox/errors.dart';
@@ -103,7 +107,9 @@ final class _LibraryPageState extends State<LibraryPage> {
       SboxProtocol.defaultNominalShardPlaintextSize;
   bool _savingShardSize = false;
   int? _shardSizeBeforeDrag;
-  _LibrarySource _selectedSource = _LibrarySource.local;
+  _LibrarySource _selectedSource = kIsWeb
+      ? _LibrarySource.github
+      : _LibrarySource.local;
   // Reading authenticated metadata for every Bundle is expensive. The saved
   // preference is restored before this page is created, while cached JPEGs
   // let an enabled preview load without repeating Metadata decryption.
@@ -961,7 +967,8 @@ final class _LibraryPageState extends State<LibraryPage> {
 
   bool _isSourceEnabled(_LibrarySource source) {
     final configuration = _configuration;
-    if (source == _LibrarySource.local || configuration == null) return true;
+    if (source == _LibrarySource.local) return !kIsWeb;
+    if (configuration == null) return false;
     return source == _LibrarySource.github
         ? configuration.github.enabled
         : configuration.gitee.enabled;
@@ -969,21 +976,22 @@ final class _LibraryPageState extends State<LibraryPage> {
 
   Widget _buildSourceSwitcher(BuildContext context, {bool mobile = false}) {
     final options = <Widget>[
-      mobile
-          ? Expanded(
-              child: _buildSourceOption(
+      if (!kIsWeb)
+        mobile
+            ? Expanded(
+                child: _buildSourceOption(
+                  context,
+                  source: _LibrarySource.local,
+                  icon: Icons.folder_outlined,
+                  mobile: mobile,
+                ),
+              )
+            : _buildSourceOption(
                 context,
                 source: _LibrarySource.local,
                 icon: Icons.folder_outlined,
                 mobile: mobile,
               ),
-            )
-          : _buildSourceOption(
-              context,
-              source: _LibrarySource.local,
-              icon: Icons.folder_outlined,
-              mobile: mobile,
-            ),
       if (_isSourceEnabled(_LibrarySource.github))
         mobile
             ? Expanded(
@@ -1638,7 +1646,7 @@ final class _LibraryPageState extends State<LibraryPage> {
           token?.dispose();
         }
         final selectedEnabled = switch (_selectedSource) {
-          _LibrarySource.local => true,
+          _LibrarySource.local => !kIsWeb,
           _LibrarySource.github => configuration.github.enabled,
           _LibrarySource.gitee => configuration.gitee.enabled,
         };
@@ -1647,8 +1655,10 @@ final class _LibraryPageState extends State<LibraryPage> {
               ? _LibrarySource.github
               : configuration.gitee.enabled
               ? _LibrarySource.gitee
-              : _LibrarySource.local;
+              : (kIsWeb ? _LibrarySource.github : _LibrarySource.local);
         }
+      } else if (kIsWeb) {
+        _selectedSource = _LibrarySource.github;
       }
       if (!mounted) return;
       setState(() {
@@ -1668,10 +1678,164 @@ final class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
+  Future<void> _scanWeb({bool forceStart = false}) async {
+    if (!mounted) return;
+    if (_listingInBackground && !forceStart) {
+      _scanQueued = true;
+      _scanQueuedWithCloudSources = true;
+      setState(() {});
+      return;
+    }
+
+    _scanQueued = false;
+    _scanQueuedWithCloudSources = false;
+    final scanGeneration = ++_scanGeneration;
+    setState(() {
+      _listingInBackground = true;
+      _listingErrors = const <String, Object>{};
+    });
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted || scanGeneration != _scanGeneration) return;
+    await _loadConfiguration();
+    if (!mounted || scanGeneration != _scanGeneration) return;
+
+    http.Client? nextClient;
+    var listingTimedOut = false;
+    final staged = <_LibraryBundle>[];
+    final encryptedBytes = <String, int>{};
+    final encryptedSizeUnknown = <String, bool>{};
+    final listingErrors = <String, Object>{};
+    try {
+      final configuration = _configuration;
+      if (configuration == null) {
+        final previous = _bundles;
+        final previousClient = _client;
+        _client = null;
+        previousClient?.close();
+        setState(() {
+          _bundles = const <_LibraryBundle>[];
+          _encryptedBytesBySource = const <String, int>{};
+          _encryptedSizeUnknownBySource = const <String, bool>{};
+        });
+        _disposeBundlePreviews(previous);
+        return;
+      }
+
+      nextClient = http.Client();
+      final pair = CloudRepositoryPair.fromConfiguration(
+        configuration: configuration,
+        client: nextClient,
+        logger: widget.controller.logger,
+      );
+      final listings = <Future<void>>[];
+      for (final configured in pair.enabledSources) {
+        final sourceName = configured.name;
+        listings.add(() async {
+          final sourceBundles = <_LibraryBundle>[];
+          final roots = await _listSource(
+            configured.source,
+            sourceName,
+            includePreview: _showPreviewAndDetails,
+            onRoot: (root) {
+              sourceBundles.add(
+                _LibraryBundle(
+                  root: root,
+                  source: configured.source,
+                  sourceName: sourceName,
+                  manifest: root.manifest,
+                  preview: root.preview,
+                  hasPreview: root.hasPreview,
+                  isCached: root.isCached,
+                  status: root.status,
+                ),
+              );
+            },
+            onObject: (object) {
+              if (!object.path.value.endsWith('.sbox')) return;
+              if (object.length <= 0) {
+                encryptedSizeUnknown[sourceName] = true;
+              } else {
+                encryptedBytes.update(
+                  sourceName,
+                  (total) => total + object.length,
+                  ifAbsent: () => object.length,
+                );
+              }
+            },
+            onError: (error) => listingErrors[sourceName] = error,
+          );
+          if (roots == null) {
+            _disposeBundlePreviews(sourceBundles);
+          } else {
+            staged.addAll(sourceBundles);
+          }
+        }());
+      }
+      await Future.wait<void>(listings).timeout(_listingTimeout);
+      if (!mounted || scanGeneration != _scanGeneration) return;
+
+      final previous = _bundles;
+      final previousClient = _client;
+      _client = nextClient;
+      nextClient = null;
+      previousClient?.close();
+      setState(() {
+        _bundles = List<_LibraryBundle>.unmodifiable(staged);
+        _encryptedBytesBySource = Map<String, int>.unmodifiable(encryptedBytes);
+        _encryptedSizeUnknownBySource = Map<String, bool>.unmodifiable(
+          encryptedSizeUnknown,
+        );
+        _listingErrors = Map<String, Object>.unmodifiable(listingErrors);
+      });
+      _disposeBundlePreviews(previous);
+    } catch (error) {
+      _disposeBundlePreviews(staged);
+      if (mounted && scanGeneration == _scanGeneration) {
+        listingTimedOut = error is TimeoutException;
+        if (listingTimedOut) {
+          listingErrors['数据源'] = const SboxException(
+            SboxErrorCode.sourceNetwork,
+            '读取文件超过 1 分钟，已停止后台读取',
+          );
+          _scanGeneration++;
+        }
+        setState(
+          () =>
+              _listingErrors = Map<String, Object>.unmodifiable(listingErrors),
+        );
+        widget.controller.logger.warning(
+          '读取 Web 云端文件失败',
+          detail: AppLogger.describeError(error),
+        );
+        _showFeedback('暂时无法读取云端文件，请检查仓库跨域访问和网络。', error: true);
+      }
+    } finally {
+      nextClient?.close();
+      if (mounted &&
+          _scanQueued &&
+          (scanGeneration == _scanGeneration || listingTimedOut)) {
+        _scanQueued = false;
+        _scanQueuedWithCloudSources = false;
+        unawaited(_scanWeb(forceStart: true));
+      } else if (mounted &&
+          (scanGeneration == _scanGeneration || listingTimedOut)) {
+        setState(() {
+          _listingInBackground = false;
+          _scanQueued = false;
+          _scanQueuedWithCloudSources = false;
+        });
+      }
+    }
+  }
+
   Future<void> _scan({
     bool forceStart = false,
     bool includeCloudSources = true,
   }) async {
+    if (kIsWeb) {
+      await _scanWeb(forceStart: forceStart);
+      return;
+    }
     if (!mounted) return;
     if (_listingInBackground && !forceStart) {
       _scanQueued = true;
@@ -2397,13 +2561,21 @@ final class _LibraryPageState extends State<LibraryPage> {
 
   Future<void> _setFile(XFile file) async {
     final path = file.path.trim();
-    if (path.isEmpty ||
-        await FileSystemEntity.type(path, followLinks: false) !=
-            FileSystemEntityType.file) {
+    if ((!kIsWeb && path.isEmpty) ||
+        (!kIsWeb &&
+            await FileSystemEntity.type(path, followLinks: false) !=
+                FileSystemEntityType.file)) {
       _showFeedback('请选择一个文件。', error: true);
       return;
     }
-    final length = await File(path).length();
+    final length = kIsWeb ? await file.length() : await File(path).length();
+    if (kIsWeb && length > WebRuntimeLimits.maxFileBytes) {
+      _showFeedback(
+        'Web 版单文件上限为 ${WebRuntimeLimits.maxFileMiB} MiB；浏览器会同时保留明文和密文。',
+        error: true,
+      );
+      return;
+    }
     if (!mounted) return;
     final looksLikeVideo =
         _looksLikeVideoFile(file.name) || _looksLikeVideoFile(file.path);
@@ -2452,6 +2624,18 @@ final class _LibraryPageState extends State<LibraryPage> {
         _videoPreviewError = null;
         _selectedVideoPreviewIndex = 0;
       });
+    }
+
+    if (kIsWeb) {
+      if (mounted && requestId == _videoPreviewRequestId) {
+        setState(() {
+          _videoPreviewLoading = false;
+          _videoPreviewError = looksLikeVideo
+              ? 'Web 版暂不生成视频缩略图，文件仍可正常加密上传。'
+              : null;
+        });
+      }
+      return;
     }
 
     final source = File(file.path);
@@ -2565,7 +2749,7 @@ final class _LibraryPageState extends State<LibraryPage> {
       widget.onOpenCloudSettings?.call();
       return;
     }
-    final sourceFile = File(file.path);
+    final sourceFile = kIsWeb ? null : File(file.path);
     final cancellation = CloudBundleUploadCancellation();
     setState(() {
       _busy = true;
@@ -2578,44 +2762,76 @@ final class _LibraryPageState extends State<LibraryPage> {
     });
     BundlePreview? preview;
     PreviewUnavailableReason? previewUnavailableReason;
+    MemoryBundleInput? webInput;
+    Uint8List? webBytes;
+    int? webLength;
     var mediaType = 'application/octet-stream';
     try {
-      // Enter the busy state before touching the file system. A removable or
-      // temporarily unavailable drive must not leave a tap looking ignored,
-      // and a second tap must not start another upload while this check waits.
-      if (!await sourceFile.exists()) {
-        if (mounted) {
-          _showFeedback('找不到要上传的文件，请重新选择。', error: true);
+      if (kIsWeb) {
+        final declaredLength = await file.length();
+        if (declaredLength > WebRuntimeLimits.maxFileBytes) {
+          throw SboxException(
+            SboxErrorCode.sourceLimit,
+            'Web 版单文件上限为 ${WebRuntimeLimits.maxFileMiB} MiB',
+          );
         }
-        return;
-      }
-      cancellation.throwIfCancelled();
-      if (_generatePreview) {
-        final selectedCandidate = _selectedVideoPreview();
-        if (selectedCandidate != null) {
-          preview = selectedCandidate.copy();
-          mediaType = _videoPreviewMediaType;
-        } else {
-          final generated = await PlatformPreviewGenerator(
-            videoPosterDecoder: widget.videoPosterDecoder,
-          ).generate(sourceFile);
-          switch (generated) {
-            case PreviewGenerated(
-              preview: final generatedPreview,
-              detectedSourceMediaType: final detected,
-            ):
-              preview = generatedPreview;
-              mediaType = detected;
-            case PreviewUnavailable(
-              reason: final reason,
-              detectedSourceMediaType: final detected,
-            ):
-              previewUnavailableReason = reason;
-              if (detected != null) mediaType = detected;
-          }
+        final bytes = await file.readAsBytes();
+        webBytes = bytes;
+        if (bytes.length != declaredLength) {
+          throw const SboxException(
+            SboxErrorCode.inputChanged,
+            '选择的文件在读取时发生变化',
+          );
         }
+        if (bytes.length > WebRuntimeLimits.maxFileBytes) {
+          throw SboxException(
+            SboxErrorCode.sourceLimit,
+            'Web 版单文件上限为 ${WebRuntimeLimits.maxFileMiB} MiB',
+          );
+        }
+        webInput = MemoryBundleInput.owned(bytes);
+        webLength = bytes.length;
+        mediaType = file.mimeType ?? 'application/octet-stream';
+        previewUnavailableReason = _generatePreview
+            ? PreviewUnavailableReason.platformUnsupported
+            : PreviewUnavailableReason.userDisabled;
       } else {
-        previewUnavailableReason = PreviewUnavailableReason.userDisabled;
+        // Enter the busy state before touching the file system. A removable
+        // drive disappearing must not leave a tap looking ignored.
+        if (!await sourceFile!.exists()) {
+          if (mounted) {
+            _showFeedback('找不到要上传的文件，请重新选择。', error: true);
+          }
+          return;
+        }
+        cancellation.throwIfCancelled();
+        if (_generatePreview) {
+          final selectedCandidate = _selectedVideoPreview();
+          if (selectedCandidate != null) {
+            preview = selectedCandidate.copy();
+            mediaType = _videoPreviewMediaType;
+          } else {
+            final generated = await PlatformPreviewGenerator(
+              videoPosterDecoder: widget.videoPosterDecoder,
+            ).generate(sourceFile);
+            switch (generated) {
+              case PreviewGenerated(
+                preview: final generatedPreview,
+                detectedSourceMediaType: final detected,
+              ):
+                preview = generatedPreview;
+                mediaType = detected;
+              case PreviewUnavailable(
+                reason: final reason,
+                detectedSourceMediaType: final detected,
+              ):
+                previewUnavailableReason = reason;
+                if (detected != null) mediaType = detected;
+            }
+          }
+        } else {
+          previewUnavailableReason = PreviewUnavailableReason.userDisabled;
+        }
       }
       cancellation.throwIfCancelled();
       final identity = PublicIdentityRecord(
@@ -2632,17 +2848,17 @@ final class _LibraryPageState extends State<LibraryPage> {
               client: client,
               logger: widget.controller.logger,
             ).upload(
-              input: FileBundleInput(sourceFile),
-              declaredLength: await sourceFile.length(),
+              input: kIsWeb ? webInput! : FileBundleInput(sourceFile!),
+              declaredLength: kIsWeb ? webLength! : await sourceFile!.length(),
               options: BundleEncryptionOptions(
                 recipient: identity,
                 contentKind: SboxContentKind.file,
                 originalName: file.name.trim().isEmpty
-                    ? p.basename(file.path)
+                    ? (kIsWeb ? 'safebox-upload.bin' : p.basename(file.path))
                     : file.name,
                 mediaType: mediaType,
                 title: file.name.trim().isEmpty
-                    ? p.basename(file.path)
+                    ? (kIsWeb ? 'safebox-upload.bin' : p.basename(file.path))
                     : file.name,
                 description: _descriptionController.text,
                 targetNominalShardPlaintextSize:
@@ -2696,6 +2912,11 @@ final class _LibraryPageState extends State<LibraryPage> {
       }
     } finally {
       preview?.dispose();
+      if (webInput != null) {
+        webInput.dispose();
+      } else {
+        webBytes?.fillRange(0, webBytes.length, 0);
+      }
       if (mounted && identical(_uploadCancellation, cancellation)) {
         setState(() {
           _busy = false;
@@ -2928,6 +3149,113 @@ final class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
+  Future<void> _downloadWeb(
+    _LibraryBundle bundle,
+    CloudBackupConfiguration configuration,
+  ) async {
+    final knownSize =
+        bundle.manifest?.logicalPlaintextSize ??
+        bundle.root.header.shardPlaintextSize *
+            BigInt.from(bundle.root.header.shardCount);
+    if (knownSize > BigInt.from(WebRuntimeLimits.maxFileBytes)) {
+      _showFeedback(
+        'Web 版只能在内存中解密，单文件上限为 ${WebRuntimeLimits.maxFileMiB} MiB。',
+        error: true,
+      );
+      return;
+    }
+    final mnemonic = await _askMnemonic(title: '解密并下载', actionLabel: '下载');
+    if (mnemonic == null || mnemonic.trim().isEmpty || !mounted) return;
+
+    final cancellation = BundleDownloadCancellation();
+    final downloadClient = http.Client();
+    final downloadPair = CloudRepositoryPair.fromConfiguration(
+      configuration: configuration,
+      client: downloadClient,
+      logger: widget.controller.logger,
+    );
+    final downloadSource = bundle.sourceName == 'Gitee'
+        ? downloadPair.gitee
+        : downloadPair.github;
+    final unregisterDownloadCancellation = cancellation.registerOnCancel(
+      downloadClient.close,
+    );
+    _downloadClient = downloadClient;
+    setState(() {
+      _busy = true;
+      _busyTitle = '正在解密并下载';
+      _busyDetail = '密文和明文仅保留在当前浏览器标签页内存中。';
+      _downloadProgress = null;
+      _downloadCancellation = cancellation;
+      _downloadCancelRequested = false;
+    });
+
+    DecryptedBundle? decrypted;
+    var previewAdopted = false;
+    try {
+      final result = await BundleSync.fetchAndDecrypt(
+        source: downloadSource,
+        rootPath: bundle.root.path,
+        mnemonic: mnemonic,
+        expectedIdentity: widget.controller.identityRecord?.toPublicIdentity(),
+        maximumTotalObjectBytes: WebRuntimeLimits.maxCiphertextBytes,
+        onProgress: _handleDownloadProgress,
+        cancellation: cancellation,
+      );
+      decrypted = result;
+      cancellation.throwIfCancelled();
+      if (result.plaintext.length > WebRuntimeLimits.maxFileBytes) {
+        throw SboxException(
+          SboxErrorCode.sourceLimit,
+          'Web 版单文件上限为 ${WebRuntimeLimits.maxFileMiB} MiB',
+        );
+      }
+      await BrowserDownload.save(
+        bytes: result.plaintext,
+        name: result.manifest.originalName,
+        mediaType: result.manifest.mediaType,
+      );
+      cancellation.throwIfCancelled();
+      if (!mounted) return;
+      setState(() {
+        bundle.manifest = result.manifest;
+        _adoptPreview(bundle, result.preview);
+        previewAdopted = result.preview != null;
+        bundle.status = result.status;
+      });
+      _showFeedback('文件已解密，浏览器下载已开始。');
+    } catch (error) {
+      if (cancellation.isCancelled ||
+          error is SboxException && error.code == SboxErrorCode.cancelled) {
+        if (mounted) _showFeedback('下载已取消');
+        return;
+      }
+      if (mounted) {
+        widget.controller.setError(error, operation: 'Web 解密下载失败');
+        final message = error is SboxException
+            ? error.message
+            : '请检查恢复词、仓库跨域访问和网络。';
+        _showFeedback('下载失败：$message', error: true);
+      }
+    } finally {
+      if (!previewAdopted) decrypted?.preview?.dispose();
+      decrypted?.plaintext.fillRange(0, decrypted.plaintext.length, 0);
+      unregisterDownloadCancellation();
+      downloadClient.close();
+      if (identical(_downloadClient, downloadClient)) _downloadClient = null;
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _downloadProgress = null;
+          if (identical(_downloadCancellation, cancellation)) {
+            _downloadCancellation = null;
+            _downloadCancelRequested = false;
+          }
+        });
+      }
+    }
+  }
+
   Future<void> _download(_FileRow row) async {
     final bundle = row.bundle;
     if (bundle == null) return;
@@ -2938,6 +3266,10 @@ final class _LibraryPageState extends State<LibraryPage> {
     final configuration = _configuration ?? await _configurationStore.load();
     if (configuration == null) {
       _showFeedback('请先配置本地加密备份目录。', error: true);
+      return;
+    }
+    if (kIsWeb) {
+      await _downloadWeb(bundle, configuration);
       return;
     }
     if (!mounted) return;

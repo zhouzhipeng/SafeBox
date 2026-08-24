@@ -5,6 +5,7 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
+import 'package:flutter/foundation.dart' show kIsWeb;
 
 import '../bytes.dart';
 import '../constants.dart';
@@ -34,6 +35,10 @@ abstract interface class BundleInput {
 final class MemoryBundleInput implements BundleInput {
   MemoryBundleInput(List<int> bytes) : _bytes = Uint8List.fromList(bytes);
 
+  /// Takes ownership of [bytes]. The caller must not mutate it until
+  /// [dispose] is called after the operation completes.
+  MemoryBundleInput.owned(Uint8List bytes) : _bytes = bytes;
+
   MemoryBundleInput._owned(this._bytes);
 
   final Uint8List _bytes;
@@ -45,22 +50,20 @@ final class MemoryBundleInput implements BundleInput {
   Future<int> length() async => _bytes.length;
 
   @override
-  Stream<List<int>> openRange(int start, int length) {
+  Stream<List<int>> openRange(int start, int length) async* {
     if (start < 0 || length < 0 || start > _bytes.length - length) {
       throw ArgumentError('Invalid input range');
     }
     const transportChunk = 64 * 1024;
-    return Stream<List<int>>.fromIterable(<List<int>>[
-      for (
-        var offset = start;
-        offset < start + length;
-        offset += transportChunk
-      )
-        _bytes.sublist(
-          offset,
-          (offset + transportChunk).clamp(0, start + length),
-        ),
-    ]);
+    final end = start + length;
+    for (var offset = start; offset < end; offset += transportChunk) {
+      final chunkEnd = (offset + transportChunk).clamp(0, end).toInt();
+      // Yield one owned transport chunk at a time. The previous
+      // Stream.fromIterable implementation eagerly materialised a complete
+      // second copy of the selected file, which is particularly expensive in
+      // a browser tab.
+      yield Uint8List.fromList(Uint8List.sublistView(_bytes, offset, chunkEnd));
+    }
   }
 
   /// Returns an owned copy of a range that can be transferred to a worker
@@ -306,11 +309,22 @@ final class BundleEncryptor {
     required BundleInput input,
     required int declaredLength,
     required BundleEncryptionOptions options,
+    void Function(BundleEncryptionProgress progress)? onProgress,
   }) async {
     final plan = await _preflight(
       input: input,
       declaredLength: declaredLength,
       options: options,
+    );
+    _emitProgress(
+      onProgress,
+      BundleEncryptionProgress(
+        stage: BundleEncryptionStage.splitting,
+        processedBytes: 0,
+        totalBytes: declaredLength,
+        completedShards: 0,
+        totalShards: plan.shardCount,
+      ),
     );
     final firstPass = await _hashRange(
       input,
@@ -342,6 +356,7 @@ final class BundleEncryptor {
             input: input,
             shards: plan.shards,
             prepared: prepared,
+            onProgress: onProgress,
           ),
         ], eagerError: false);
       } else {
@@ -349,11 +364,9 @@ final class BundleEncryptor {
           input: input,
           shards: plan.shards,
           prepared: prepared,
+          onProgress: onProgress,
         );
-        values = <dynamic>[
-          await _hashRange(input, 0, declaredLength),
-          results,
-        ];
+        values = <dynamic>[await _hashRange(input, 0, declaredLength), results];
       }
       final secondPass = values[0] as _HashedRange;
       final results = values[1] as List<_ShardEncryptionResult>;
@@ -480,10 +493,7 @@ final class BundleEncryptor {
           totalBytes: declaredLength,
           onProgress: onProgress,
         );
-        values = <dynamic>[
-          await _hashRange(input, 0, declaredLength),
-          results,
-        ];
+        values = <dynamic>[await _hashRange(input, 0, declaredLength), results];
       }
       final secondPass = values[0] as _HashedRange;
       final results = values[1] as List<_ShardEncryptionResult>;
@@ -746,7 +756,7 @@ final class BundleEncryptor {
     if (shards.isEmpty) return <_ShardEncryptionResult>[];
     final results = List<_ShardEncryptionResult?>.filled(shards.length, null);
     final useIsolates =
-        _canUseShardIsolates && _supportsParallelInput(input);
+        !kIsWeb && _canUseShardIsolates && _supportsParallelInput(input);
     final workerCount = useIsolates ? _shardWorkerCount(shards.length) : 1;
     var nextIndex = 0;
     var completedShards = 0;
@@ -795,12 +805,9 @@ final class BundleEncryptor {
     }
 
     try {
-      await Future.wait<void>(
-        <Future<void>>[
-          for (var index = 0; index < workerCount; index++) worker(),
-        ],
-        eagerError: false,
-      );
+      await Future.wait<void>(<Future<void>>[
+        for (var index = 0; index < workerCount; index++) worker(),
+      ], eagerError: false);
       return <_ShardEncryptionResult>[for (final result in results) result!];
     } catch (_) {
       for (final result in results) {
@@ -819,7 +826,8 @@ final class BundleEncryptor {
   }) async {
     if (jobs.isEmpty) return <_ShardEncryptionResult>[];
     final results = List<_ShardEncryptionResult?>.filled(jobs.length, null);
-    final useIsolates = _canUseShardIsolates && _supportsParallelInput(input);
+    final useIsolates =
+        !kIsWeb && _canUseShardIsolates && _supportsParallelInput(input);
     final workerCount = useIsolates ? _shardWorkerCount(jobs.length) : 1;
     var nextIndex = 0;
     var completedShards = 0;
@@ -865,12 +873,9 @@ final class BundleEncryptor {
     }
 
     try {
-      await Future.wait<void>(
-        <Future<void>>[
-          for (var index = 0; index < workerCount; index++) worker(),
-        ],
-        eagerError: false,
-      );
+      await Future.wait<void>(<Future<void>>[
+        for (var index = 0; index < workerCount; index++) worker(),
+      ], eagerError: false);
       return <_ShardEncryptionResult>[for (final result in results) result!];
     } catch (_) {
       for (final result in results) {
@@ -1005,7 +1010,7 @@ final class BundleEncryptor {
   }
 
   static bool _supportsParallelInput(BundleInput input) =>
-      input is FileBundleInput || input is MemoryBundleInput;
+      !kIsWeb && (input is FileBundleInput || input is MemoryBundleInput);
 
   static int _shardWorkerCount(int shardCount) {
     final processorCount = Platform.numberOfProcessors;
@@ -1144,8 +1149,7 @@ final class BundleEncryptor {
       }
     }
     shardHashSink.close();
-    if (shardLength != shard.length ||
-        (shard.length == 0 && dataCount != 0)) {
+    if (shardLength != shard.length || (shard.length == 0 && dataCount != 0)) {
       throw const SboxException(
         SboxErrorCode.inputChanged,
         'Input changed during encryption',

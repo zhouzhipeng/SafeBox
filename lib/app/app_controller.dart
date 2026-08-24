@@ -112,7 +112,9 @@ final class AppController extends ChangeNotifier {
   Future<String> createIdentity() async {
     final deriver = SboxIdentityDeriver();
     final mnemonic = deriver.generateMnemonic();
-    final identity = await deriver.deriveIdentity(mnemonic);
+    final identity = kIsWeb
+        ? await deriver.deriveIdentityCooperatively(mnemonic)
+        : await deriver.deriveIdentity(mnemonic);
     try {
       final record = PublicIdentityRecord.fromIdentity(identity.publicIdentity);
       await _identityStore.save(record);
@@ -127,7 +129,10 @@ final class AppController extends ChangeNotifier {
   }
 
   Future<void> restoreIdentity(String mnemonic) async {
-    final identity = await SboxIdentityDeriver().deriveIdentity(mnemonic);
+    final deriver = SboxIdentityDeriver();
+    final identity = kIsWeb
+        ? await deriver.deriveIdentityCooperatively(mnemonic)
+        : await deriver.deriveIdentity(mnemonic);
     try {
       final record = PublicIdentityRecord.fromIdentity(identity.publicIdentity);
       await _identityStore.save(record);
@@ -190,13 +195,15 @@ final class AppController extends ChangeNotifier {
     await attempt(_sourceConfigurationStore.clear);
     await _showPreviewSaveTail;
     await attempt(_appSettingsStore.clear);
-    await attempt(() async {
-      final root = Directory(_temporaryPlaintextStore.path);
-      if (await root.exists()) {
-        await TemporaryPlaintextPlatform.protectRoot(root.path);
-      }
-      await _temporaryPlaintextStore.deleteRoot();
-    });
+    if (!kIsWeb) {
+      await attempt(() async {
+        final root = Directory(_temporaryPlaintextStore.path);
+        if (await root.exists()) {
+          await TemporaryPlaintextPlatform.protectRoot(root.path);
+        }
+        await _temporaryPlaintextStore.deleteRoot();
+      });
+    }
     await attempt(_logger.clear);
 
     if (failures.isNotEmpty) {

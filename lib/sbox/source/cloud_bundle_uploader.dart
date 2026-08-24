@@ -3,9 +3,11 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
+import '../../platform/web_runtime_limits.dart';
 import '../bytes.dart';
 import '../constants.dart';
 import '../engine/background_bundle_crypto.dart';
@@ -277,6 +279,16 @@ final class CloudBundleUploader {
     void Function(CloudBundleUploadProgress progress)? onProgress,
     CloudBundleUploadCancellation? cancellation,
   }) async {
+    if (kIsWeb) {
+      return _uploadInMemory(
+        input: input,
+        declaredLength: declaredLength,
+        options: options,
+        configuration: configuration,
+        onProgress: onProgress,
+        cancellation: cancellation,
+      );
+    }
     final signal = cancellation ?? CloudBundleUploadCancellation();
     final unregisterCancellation = signal.registerOnCancel(_client.close);
     Uint8List? md5;
@@ -534,6 +546,383 @@ final class CloudBundleUploader {
       unregisterCancellation();
       final digest = md5;
       digest?.fillRange(0, digest.length, 0);
+    }
+  }
+
+  Future<CloudBundleUploadResult> _uploadInMemory({
+    required BundleInput input,
+    required int declaredLength,
+    required BundleEncryptionOptions options,
+    required CloudBackupConfiguration configuration,
+    void Function(CloudBundleUploadProgress progress)? onProgress,
+    CloudBundleUploadCancellation? cancellation,
+  }) async {
+    if (declaredLength > WebRuntimeLimits.maxFileBytes) {
+      throw SboxException(
+        SboxErrorCode.sourceLimit,
+        'Web 版单文件上限为 ${WebRuntimeLimits.maxFileMiB} MiB',
+      );
+    }
+
+    final signal = cancellation ?? CloudBundleUploadCancellation();
+    final unregisterCancellation = signal.registerOnCancel(_client.close);
+    Uint8List? md5;
+    EncryptedBundle? encrypted;
+    final memoryObjects = <String, Uint8List>{};
+    try {
+      signal.throwIfCancelled();
+      final effectiveOptions = _withSharedObjectLimit(options);
+      final encryptor = _encryptor ?? BundleEncryptor();
+      md5 = await encryptor.md5ForInput(
+        input: input,
+        declaredLength: declaredLength,
+        validateUtf8: options.contentKind == SboxContentKind.text,
+      );
+      signal.throwIfCancelled();
+      final bundleId = hexLower(md5);
+      final plan = BundlePlanner.plan(
+        logicalLength: declaredLength,
+        targetNominalShardPlaintextSize:
+            effectiveOptions.targetNominalShardPlaintextSize,
+        maxObjectBytes: effectiveOptions.maxObjectBytes,
+      );
+      final objectNames = <String>[
+        for (final shard in plan.shards)
+          canonicalBundleBasename(
+            bundleId: md5,
+            shardIndex: shard.index,
+            shardCount: plan.shardCount,
+          ),
+      ];
+      final expected = objectNames.toSet();
+      final sources = <_CloudUploadSource>[
+        if (configuration.github.enabled)
+          _CloudUploadSource(
+            name: 'GitHub',
+            source: GitHubDataSource(
+              config: configuration.github.repositoryConfig,
+              client: _client,
+              credentialStore: _credentialStore,
+              credentialId: configuration.github.credentialId,
+              logger: _logger,
+            ),
+          ),
+        if (configuration.gitee.enabled)
+          _CloudUploadSource(
+            name: 'Gitee',
+            source: GiteeDataSource(
+              config: configuration.gitee.repositoryConfig,
+              client: _client,
+              credentialStore: _credentialStore,
+              credentialId: configuration.gitee.credentialId,
+              logger: _logger,
+            ),
+          ),
+      ];
+      if (sources.isEmpty) {
+        throw const SboxException(
+          SboxErrorCode.sourceAuthentication,
+          '至少启用一个云端仓库后才能上传',
+        );
+      }
+
+      final progress = _UploadProgressReporter(
+        totalShards: plan.shardCount,
+        totalBytes: declaredLength,
+        sourceNames: sources.map((source) => source.name),
+        onProgress: onProgress,
+      )..emit(stage: CloudBundleUploadStage.preparing);
+      final remoteObjects = <String, Set<String>>{};
+      await Future.wait<void>(
+        sources.map((configured) async {
+          remoteObjects[configured.name] = await _remoteObjects(
+            configured.source,
+            expected,
+            sourceName: configured.name,
+            cancellation: signal,
+          );
+        }),
+      );
+      final first = sources.first;
+      final firstObjects = remoteObjects[first.name]!;
+      for (final configured in sources.skip(1)) {
+        await _assertRemoteSourcesAgree(
+          first.source,
+          configured.source,
+          firstObjects.intersection(remoteObjects[configured.name]!),
+          cancellation: signal,
+        );
+      }
+      final remoteComplete = <String, bool>{
+        for (final configured in sources)
+          configured.name:
+              remoteObjects[configured.name]!.length == expected.length,
+      };
+      for (final configured in sources) {
+        progress.setCompleted(
+          configured.name,
+          remoteObjects[configured.name]!.length,
+        );
+      }
+      progress.emit(stage: CloudBundleUploadStage.preparing);
+
+      _CloudUploadSource? mirror;
+      for (final configured in sources) {
+        if (remoteComplete[configured.name] == true) {
+          mirror = configured;
+          break;
+        }
+      }
+      final allComplete = remoteComplete.values.every((value) => value);
+      final rootObjectName = objectNames.firstWhere(
+        (name) => parseCanonicalBundleBasename(name).shardIndex == 0,
+      );
+      if (mirror != null && allComplete) {
+        final rootRead = await mirror.source.get(SourcePath(rootObjectName));
+        final rootBytes = await _readSourceBytes(
+          rootRead,
+          cancellation: signal,
+          maximumBytes: effectiveOptions.maxObjectBytes!,
+        );
+        try {
+          progress.emit(stage: CloudBundleUploadStage.verifying);
+          final previewOutcome = await _readPreviewOutcomeBytes(
+            rootBytes: rootBytes,
+            rootObjectName: rootObjectName,
+            options: effectiveOptions,
+            reused: true,
+            cancellation: signal,
+          );
+          progress.emit(stage: CloudBundleUploadStage.completed);
+          return CloudBundleUploadResult(
+            bundleId: bundleId,
+            objectNames: List.unmodifiable(objectNames),
+            duplicate: true,
+            uploadedSources: const <String>[],
+            previewRequested: effectiveOptions.wantsPreview,
+            previewEmbedded: previewOutcome.embedded,
+            previewUnavailableReason: previewOutcome.reason,
+          );
+        } finally {
+          rootBytes.fillRange(0, rootBytes.length, 0);
+        }
+      }
+
+      var created = false;
+      if (mirror != null) {
+        // A complete provider is the immutable source of truth when repairing
+        // another provider. Read one object at a time to keep peak tab memory
+        // bounded by the Bundle plus one network chunk.
+        var retainedCiphertextBytes = 0;
+        for (final name in objectNames) {
+          signal.throwIfCancelled();
+          final read = await mirror.source.get(SourcePath(name));
+          if (read.length < 0 ||
+              read.length >
+                  WebRuntimeLimits.maxCiphertextBytes -
+                      retainedCiphertextBytes) {
+            throw const SboxException(
+              SboxErrorCode.sourceLimit,
+              '远端 Bundle 超过浏览器内存下载上限',
+            );
+          }
+          final bytes = await _readSourceBytes(
+            read,
+            cancellation: signal,
+            maximumBytes: effectiveOptions.maxObjectBytes!,
+          );
+          retainedCiphertextBytes += bytes.length;
+          memoryObjects[name] = bytes;
+        }
+      } else {
+        final hasPartial = remoteObjects.values.any(
+          (items) => items.isNotEmpty,
+        );
+        if (hasPartial) {
+          throw const SboxException(
+            SboxErrorCode.immutableConflict,
+            'Web 版没有可复用的本地密文，无法安全续传残缺 Bundle；请先删除远端残片后重试',
+          );
+        }
+        encrypted = await encryptor.encrypt(
+          input: input,
+          declaredLength: declaredLength,
+          options: effectiveOptions,
+          onProgress: progress.updateEncryption,
+        );
+        var retainedCiphertextBytes = 0;
+        for (final object in encrypted.objects) {
+          if (object.bytes.length >
+              WebRuntimeLimits.maxCiphertextBytes - retainedCiphertextBytes) {
+            throw const SboxException(
+              SboxErrorCode.sourceLimit,
+              '加密 Bundle 超过浏览器内存上限',
+            );
+          }
+          retainedCiphertextBytes += object.bytes.length;
+          memoryObjects[object.basename] = object.bytes;
+        }
+        if (memoryObjects.keys.toSet().length != expected.length ||
+            !memoryObjects.keys.toSet().containsAll(expected)) {
+          throw const SboxException(SboxErrorCode.shardMissing, '内存加密结果缺少预期分片');
+        }
+        created = true;
+      }
+
+      progress.emit(stage: CloudBundleUploadStage.uploading);
+      final uploadedSources = <String>[];
+      final uploadTasks = <Future<void>>[];
+      for (final configured in sources) {
+        if (remoteComplete[configured.name] == true) continue;
+        uploadedSources.add(configured.name);
+        uploadTasks.add(
+          _publishMemory(
+            source: configured.source,
+            objects: memoryObjects,
+            objectNames: objectNames,
+            existing: remoteObjects[configured.name]!,
+            sourceName: configured.name,
+            progress: progress,
+            cancellation: signal,
+          ),
+        );
+      }
+      await Future.wait(uploadTasks);
+      progress.emit(stage: CloudBundleUploadStage.verifying);
+      final previewOutcome = await _readPreviewOutcomeBytes(
+        rootBytes: memoryObjects[rootObjectName]!,
+        rootObjectName: rootObjectName,
+        options: effectiveOptions,
+        reused: !created,
+        cancellation: signal,
+      );
+      progress.emit(stage: CloudBundleUploadStage.completed);
+      return CloudBundleUploadResult(
+        bundleId: bundleId,
+        objectNames: List.unmodifiable(objectNames),
+        duplicate: !created,
+        uploadedSources: List.unmodifiable(uploadedSources),
+        previewRequested: effectiveOptions.wantsPreview,
+        previewEmbedded: previewOutcome.embedded,
+        previewUnavailableReason: previewOutcome.reason,
+      );
+    } on Object {
+      if (signal.isCancelled) {
+        throw const SboxException(SboxErrorCode.cancelled, '上传已取消');
+      }
+      rethrow;
+    } finally {
+      unregisterCancellation();
+      md5?.fillRange(0, md5.length, 0);
+      for (final bytes in memoryObjects.values) {
+        bytes.fillRange(0, bytes.length, 0);
+      }
+      final result = encrypted;
+      if (result != null) {
+        result.plaintextSha256.fillRange(0, result.plaintextSha256.length, 0);
+        for (final object in result.objects) {
+          object.bytes.fillRange(0, object.bytes.length, 0);
+          object.sha256.fillRange(0, object.sha256.length, 0);
+        }
+        result.preview?.dispose();
+      }
+    }
+  }
+
+  Future<Uint8List> _readSourceBytes(
+    SourceRead read, {
+    required CloudBundleUploadCancellation cancellation,
+    required int maximumBytes,
+  }) async {
+    if (read.notModified ||
+        read.length < 0 ||
+        read.length > maximumBytes) {
+      throw const SboxException(
+        SboxErrorCode.sourceLimit,
+        '远端对象超过浏览器内存上限',
+      );
+    }
+    final output = BytesBuilder(copy: false);
+    var count = 0;
+    try {
+      await for (final chunk in read.body) {
+        cancellation.throwIfCancelled();
+        count += chunk.length;
+        if (count > read.length || count > maximumBytes) {
+          throw const SboxException(
+            SboxErrorCode.remoteChanged,
+            '远端对象超过声明长度',
+          );
+        }
+        output.add(chunk);
+      }
+      if (count != read.length) {
+        throw const SboxException(SboxErrorCode.remoteChanged, '远端对象长度不一致');
+      }
+      return output.takeBytes();
+    } catch (_) {
+      final partial = output.takeBytes();
+      partial.fillRange(0, partial.length, 0);
+      rethrow;
+    }
+  }
+
+  Future<_PreviewOutcome> _readPreviewOutcomeBytes({
+    required Uint8List rootBytes,
+    required String rootObjectName,
+    required BundleEncryptionOptions options,
+    required bool reused,
+    required CloudBundleUploadCancellation cancellation,
+  }) async {
+    cancellation.throwIfCancelled();
+    final header = BundleHeader.parse(rootBytes);
+    validateBundlePathAgainstHeader(rootObjectName, header);
+    if (header.version == SboxVersion.v30) {
+      return const _PreviewOutcome(
+        embedded: false,
+        reason: PreviewUnavailableReason.existingV30,
+      );
+    }
+    final result = await BundleProbe.readMetadata(
+      basename: rootObjectName,
+      objectPrefix: rootBytes,
+      identity: options.recipient,
+    );
+    try {
+      cancellation.throwIfCancelled();
+      if (result.preview != null) {
+        return const _PreviewOutcome(embedded: true);
+      }
+      if (reused) {
+        return const _PreviewOutcome(
+          embedded: false,
+          reason: PreviewUnavailableReason.existingV31WithoutPreview,
+        );
+      }
+      if (options.preview != null) {
+        final manifestBytes = result.manifest!.encode();
+        try {
+          if (options.preview!.encodedLength >
+              MetadataBlockCodec.previewCapacity(manifestBytes.length)) {
+            return const _PreviewOutcome(
+              embedded: false,
+              reason: PreviewUnavailableReason.metadataCapacity,
+            );
+          }
+        } finally {
+          manifestBytes.fillRange(0, manifestBytes.length, 0);
+        }
+      }
+      return _PreviewOutcome(
+        embedded: false,
+        reason:
+            options.previewUnavailableReason ??
+            (options.wantsPreview
+                ? PreviewUnavailableReason.encodeFailed
+                : PreviewUnavailableReason.userDisabled),
+      );
+    } finally {
+      result.preview?.dispose();
     }
   }
 
@@ -890,6 +1279,212 @@ final class CloudBundleUploader {
     } finally {
       await output?.close();
       if (!renamed && await stage.exists()) await stage.delete();
+    }
+  }
+
+  Future<void> _publishMemory({
+    required EnumerableDataSource source,
+    required Map<String, Uint8List> objects,
+    required List<String> objectNames,
+    required Set<String> existing,
+    required String sourceName,
+    required _UploadProgressReporter progress,
+    required CloudBundleUploadCancellation cancellation,
+  }) async {
+    try {
+      cancellation.throwIfCancelled();
+      if (!source.capabilities.canWrite) {
+        throw const SboxException(
+          SboxErrorCode.sourceAuthentication,
+          'Configure write credentials for this cloud source first',
+        );
+      }
+      var observed = Set<String>.of(existing);
+      for (var pass = 0; ; pass++) {
+        cancellation.throwIfCancelled();
+        final pending = _publicationOrder(objectNames)
+            .where((name) => !observed.contains(name))
+            .toList(growable: false);
+        String? rootName;
+        for (final name in pending) {
+          if (parseCanonicalBundleBasename(name).shardIndex == 0) {
+            rootName = name;
+            break;
+          }
+        }
+        final continuations = pending
+            .where((name) => name != rootName)
+            .toList(growable: false);
+        await _parallelForEach(
+          continuations,
+          maxParallel: source.capabilities.maxParallelTransfers,
+          action: (name) => _publishMemoryObject(
+            source: source,
+            name: name,
+            bytes: objects[name]!,
+            sourceName: sourceName,
+            progress: progress,
+            cancellation: cancellation,
+          ),
+        );
+        if (rootName != null) {
+          await _publishMemoryObject(
+            source: source,
+            name: rootName,
+            bytes: objects[rootName]!,
+            sourceName: sourceName,
+            progress: progress,
+            cancellation: cancellation,
+          );
+        }
+
+        progress.emit(
+          stage: CloudBundleUploadStage.verifying,
+          currentSource: sourceName,
+        );
+        observed = await _remoteObjects(
+          source,
+          objectNames.toSet(),
+          sourceName: sourceName,
+          cancellation: cancellation,
+        );
+        progress.setCompleted(sourceName, observed.length);
+        if (observed.length == objectNames.length) return;
+        if (pass >= maxShardUploadRetries) {
+          throw SboxException(
+            SboxErrorCode.shardMissing,
+            '上传校验失败，$sourceName 仍缺少 '
+            '${objectNames.length - observed.length} 个分片',
+          );
+        }
+        await _waitBeforeRetry(pass, cancellation: cancellation);
+      }
+    } on SboxException catch (error) {
+      _logger?.warning(
+        '$sourceName: publish failed',
+        detail: describeSboxError(error),
+      );
+      throw SboxException(
+        error.code,
+        '$sourceName: ${error.message}',
+        retryAfter: error.retryAfter,
+        httpStatus: error.httpStatus,
+      );
+    } on Object catch (error) {
+      _logger?.error(error, operation: '$sourceName: publish failed');
+      throw SboxException(
+        SboxErrorCode.sourceNetwork,
+        '$sourceName: unable to publish the Bundle',
+      );
+    }
+  }
+
+  Future<void> _publishMemoryObject({
+    required DataSource source,
+    required String name,
+    required Uint8List bytes,
+    required String sourceName,
+    required _UploadProgressReporter progress,
+    required CloudBundleUploadCancellation cancellation,
+  }) async {
+    cancellation.throwIfCancelled();
+    final header = BundleHeader.parse(bytes);
+    validateBundlePathAgainstHeader(name, header);
+    final digest = Uint8List.fromList(crypto.sha256.convert(bytes).bytes);
+    try {
+      final shard = parseCanonicalBundleBasename(name);
+      Object? lastError;
+      for (var retry = 0; retry <= maxShardUploadRetries; retry++) {
+        cancellation.throwIfCancelled();
+        final attempt = retry + 1;
+        progress.emit(
+          stage: CloudBundleUploadStage.uploading,
+          currentSource: sourceName,
+          currentShardIndex: shard.shardIndex,
+          attempt: attempt,
+        );
+        try {
+          await source.putNew(
+            SourcePath(name),
+            Stream<List<int>>.value(bytes),
+            length: bytes.length,
+            sha256: digest,
+          );
+          cancellation.throwIfCancelled();
+          progress.completed(
+            sourceName,
+            shardIndex: shard.shardIndex,
+            attempt: attempt,
+          );
+          return;
+        } on Object catch (error) {
+          cancellation.throwIfCancelled();
+          lastError = error;
+          if (error is SboxException &&
+              error.code == SboxErrorCode.immutableConflict &&
+              await _remoteObjectMatchesBytes(
+                source: source,
+                name: name,
+                bytes: bytes,
+                expectedHash: digest,
+                cancellation: cancellation,
+              )) {
+            progress.completed(
+              sourceName,
+              shardIndex: shard.shardIndex,
+              attempt: attempt,
+            );
+            return;
+          }
+          if (retry >= maxShardUploadRetries || !_shouldRetry(error)) {
+            throw _shardUploadError(shard, attempt: attempt, error: error);
+          }
+          _logger?.warning(
+            '$sourceName: shard upload failed; retrying',
+            detail: describeSboxError(error),
+          );
+          await _waitBeforeRetry(
+            retry,
+            cancellation: cancellation,
+            error: error,
+          );
+        }
+      }
+      throw _shardUploadError(
+        shard,
+        attempt: maxShardUploadRetries + 1,
+        error: lastError,
+      );
+    } finally {
+      digest.fillRange(0, digest.length, 0);
+    }
+  }
+
+  Future<bool> _remoteObjectMatchesBytes({
+    required DataSource source,
+    required String name,
+    required Uint8List bytes,
+    required Uint8List expectedHash,
+    required CloudBundleUploadCancellation cancellation,
+  }) async {
+    try {
+      cancellation.throwIfCancelled();
+      final remote = await source.get(SourcePath(name));
+      final remoteHash = await _hashSourceRead(
+        remote,
+        cancellation: cancellation,
+      );
+      try {
+        return remote.length == bytes.length &&
+            constantTimeBytesEqual(remoteHash, expectedHash);
+      } finally {
+        remoteHash.fillRange(0, remoteHash.length, 0);
+      }
+    } on SboxException catch (error) {
+      if (error.code == SboxErrorCode.cancelled) rethrow;
+      return false;
+    } on Object {
+      return false;
     }
   }
 

@@ -25,50 +25,84 @@ final class DeterministicRsa3072Generator {
         maxCandidates: 10 * RsaIdentityProfile1.rsaBits,
         otherPrime: pResult.prime,
       );
-
-      var p = pResult.prime;
-      var q = qResult.prime;
-      final lambda = _lcm(p - BigInt.one, q - BigInt.one);
-      final d = _publicExponent.modInverse(lambda);
-      if (d <= (BigInt.one << RsaIdentityProfile1.primeBits)) {
-        continue;
-      }
-
-      if (q > p) {
-        final temporary = p;
-        p = q;
-        q = temporary;
-      }
-
-      final modulus = p * q;
-      if (modulus.bitLength != RsaIdentityProfile1.rsaBits) {
-        throw StateError('Deterministic RSA modulus has an invalid bit length');
-      }
-      if ((_publicExponent * d) % lambda != BigInt.one) {
-        throw StateError('Deterministic RSA inverse self-check failed');
-      }
-
-      final publicKey = SboxRsaPublicKey(
-        modulus: modulus,
-        exponent: _publicExponent,
-      );
-      final privateKey = SboxRsaPrivateKey(
-        publicKey: publicKey,
-        p: p,
-        q: q,
-        d: d,
-        dP: d % (p - BigInt.one),
-        dQ: d % (q - BigInt.one),
-        qInv: q.modInverse(p),
-      );
-      return RsaGenerationResult(
-        privateKey: privateKey,
-        pCandidateCount: pResult.candidateCount,
-        qCandidateCount: qResult.candidateCount,
-        outerAttemptCount: outerAttempt,
-      );
+      final result = _buildResult(pResult, qResult, outerAttempt);
+      if (result != null) return result;
     }
     throw StateError('Deterministic RSA outer attempt limit exhausted');
+  }
+
+  /// Runs the same frozen deterministic algorithm while periodically yielding
+  /// to the host event loop. This keeps Flutter Web able to paint progress and
+  /// handle browser events during the expensive RSA-3072 prime search.
+  Future<RsaGenerationResult> generateCooperatively({
+    int yieldEveryCandidates = 16,
+  }) async {
+    if (yieldEveryCandidates < 1) {
+      throw ArgumentError.value(yieldEveryCandidates, 'yieldEveryCandidates');
+    }
+    for (var outerAttempt = 1; outerAttempt <= 16; outerAttempt++) {
+      final pResult = await _generatePrimeCooperatively(
+        maxCandidates: 5 * RsaIdentityProfile1.rsaBits,
+        yieldEveryCandidates: yieldEveryCandidates,
+      );
+      final qResult = await _generatePrimeCooperatively(
+        maxCandidates: 10 * RsaIdentityProfile1.rsaBits,
+        otherPrime: pResult.prime,
+        yieldEveryCandidates: yieldEveryCandidates,
+      );
+      final result = _buildResult(pResult, qResult, outerAttempt);
+      if (result != null) return result;
+      await Future<void>.delayed(Duration.zero);
+    }
+    throw StateError('Deterministic RSA outer attempt limit exhausted');
+  }
+
+  RsaGenerationResult? _buildResult(
+    _PrimeResult pResult,
+    _PrimeResult qResult,
+    int outerAttempt,
+  ) {
+    var p = pResult.prime;
+    var q = qResult.prime;
+    final lambda = _lcm(p - BigInt.one, q - BigInt.one);
+    final d = _publicExponent.modInverse(lambda);
+    if (d <= (BigInt.one << RsaIdentityProfile1.primeBits)) {
+      return null;
+    }
+
+    if (q > p) {
+      final temporary = p;
+      p = q;
+      q = temporary;
+    }
+
+    final modulus = p * q;
+    if (modulus.bitLength != RsaIdentityProfile1.rsaBits) {
+      throw StateError('Deterministic RSA modulus has an invalid bit length');
+    }
+    if ((_publicExponent * d) % lambda != BigInt.one) {
+      throw StateError('Deterministic RSA inverse self-check failed');
+    }
+
+    final publicKey = SboxRsaPublicKey(
+      modulus: modulus,
+      exponent: _publicExponent,
+    );
+    final privateKey = SboxRsaPrivateKey(
+      publicKey: publicKey,
+      p: p,
+      q: q,
+      d: d,
+      dP: d % (p - BigInt.one),
+      dQ: d % (q - BigInt.one),
+      qInv: q.modInverse(p),
+    );
+    return RsaGenerationResult(
+      privateKey: privateKey,
+      pCandidateCount: pResult.candidateCount,
+      qCandidateCount: qResult.candidateCount,
+      outerAttemptCount: outerAttempt,
+    );
   }
 
   _PrimeResult _generatePrime({
@@ -80,32 +114,58 @@ final class DeterministicRsa3072Generator {
       candidateCount <= maxCandidates;
       candidateCount++
     ) {
-      var candidate = bytesToBigInt(_drbg.generate(192));
-      if (candidate.isEven) {
-        candidate += BigInt.one;
-      }
-      if (candidate < _lowerBound || candidate >= _upperBound) {
-        continue;
-      }
-      if ((candidate - BigInt.one).gcd(_publicExponent) != BigInt.one) {
-        continue;
-      }
-      if (_hasSmallPrimeFactor(candidate)) {
-        continue;
-      }
-      if (!_millerRabin(candidate, 4)) {
-        continue;
-      }
-      if (!_generalLucasProbablePrime(candidate)) {
-        continue;
-      }
-      if (otherPrime != null &&
-          (candidate - otherPrime).abs() <= _minimumPrimeDifference) {
-        continue;
-      }
-      return _PrimeResult(candidate, candidateCount);
+      final candidate = _nextPrimeCandidate(otherPrime: otherPrime);
+      if (candidate != null) return _PrimeResult(candidate, candidateCount);
     }
     throw StateError('Deterministic RSA prime candidate limit exhausted');
+  }
+
+  Future<_PrimeResult> _generatePrimeCooperatively({
+    required int maxCandidates,
+    required int yieldEveryCandidates,
+    BigInt? otherPrime,
+  }) async {
+    for (
+      var candidateCount = 1;
+      candidateCount <= maxCandidates;
+      candidateCount++
+    ) {
+      final candidate = _nextPrimeCandidate(otherPrime: otherPrime);
+      if (candidate != null) return _PrimeResult(candidate, candidateCount);
+      if (candidateCount % yieldEveryCandidates == 0) {
+        // A timer turn (rather than a microtask) gives the browser a chance to
+        // render Flutter's busy state and process input between CPU slices.
+        await Future<void>.delayed(Duration.zero);
+      }
+    }
+    throw StateError('Deterministic RSA prime candidate limit exhausted');
+  }
+
+  BigInt? _nextPrimeCandidate({BigInt? otherPrime}) {
+    var candidate = bytesToBigInt(_drbg.generate(192));
+    if (candidate.isEven) {
+      candidate += BigInt.one;
+    }
+    if (candidate < _lowerBound || candidate >= _upperBound) {
+      return null;
+    }
+    if ((candidate - BigInt.one).gcd(_publicExponent) != BigInt.one) {
+      return null;
+    }
+    if (_hasSmallPrimeFactor(candidate)) {
+      return null;
+    }
+    if (!_millerRabin(candidate, 4)) {
+      return null;
+    }
+    if (!_generalLucasProbablePrime(candidate)) {
+      return null;
+    }
+    if (otherPrime != null &&
+        (candidate - otherPrime).abs() <= _minimumPrimeDifference) {
+      return null;
+    }
+    return candidate;
   }
 
   bool _hasSmallPrimeFactor(BigInt candidate) {

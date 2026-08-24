@@ -69,6 +69,23 @@ void main() {
         );
       }
 
+      await expectLater(
+        BundleSync.fetchAndDecrypt(
+          source: source,
+          rootPath: SourcePath(encrypted.root.basename),
+          mnemonic: mnemonic,
+          expectedIdentity: identity.publicIdentity,
+          maximumTotalObjectBytes: encrypted.root.bytes.length - 1,
+        ),
+        throwsA(
+          isA<SboxException>().having(
+            (error) => error.code,
+            'code',
+            SboxErrorCode.sourceLimit,
+          ),
+        ),
+      );
+
       final progress = <BundleDownloadProgress>[];
       final decrypted = await BundleSync.fetchAndDecrypt(
         source: source,

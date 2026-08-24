@@ -198,17 +198,26 @@ abstract final class BundleSync {
       cancellation: signal,
       emitDecrypting: false,
     );
-    for (final name in _publicationOrder(objects.objects.keys)) {
+    try {
+      for (final name in _publicationOrder(objects.objects.keys)) {
+        signal.throwIfCancelled();
+        final bytes = objects.objects[name]!;
+        final digest = sha256Bytes(bytes);
+        try {
+          await destination.putNew(
+            SourcePath(name),
+            Stream<List<int>>.value(bytes),
+            length: bytes.length,
+            sha256: digest,
+          );
+        } finally {
+          digest.fillRange(0, digest.length, 0);
+        }
+      }
       signal.throwIfCancelled();
-      final bytes = objects.objects[name]!;
-      await destination.putNew(
-        SourcePath(name),
-        Stream<List<int>>.value(bytes),
-        length: bytes.length,
-        sha256: sha256Bytes(bytes),
-      );
+    } finally {
+      _wipeObjects(objects.objects);
     }
-    signal.throwIfCancelled();
   }
 
   static Future<DecryptedBundle> fetchAndDecrypt({
@@ -216,6 +225,7 @@ abstract final class BundleSync {
     required SourcePath rootPath,
     required String mnemonic,
     PublicIdentity? expectedIdentity,
+    int? maximumTotalObjectBytes,
     void Function(BundleDownloadProgress progress)? onProgress,
     BundleDownloadCancellation? cancellation,
   }) async {
@@ -226,21 +236,26 @@ abstract final class BundleSync {
       onProgress: onProgress,
       cancellation: signal,
       emitDecrypting: true,
-    );
-    signal.throwIfCancelled();
-    final decrypted = await BackgroundBundleCrypto.decrypt(
-      objects: objects.objects,
-      mnemonic: mnemonic,
-      expectedIdentity: expectedIdentity,
-      onProgress: objects.reporter.updateDecryption,
+      maximumTotalObjectBytes: maximumTotalObjectBytes,
     );
     try {
       signal.throwIfCancelled();
-      return decrypted;
-    } catch (_) {
-      decrypted.plaintext.fillRange(0, decrypted.plaintext.length, 0);
-      decrypted.preview?.dispose();
-      rethrow;
+      final decrypted = await BackgroundBundleCrypto.decrypt(
+        objects: objects.objects,
+        mnemonic: mnemonic,
+        expectedIdentity: expectedIdentity,
+        onProgress: objects.reporter.updateDecryption,
+      );
+      try {
+        signal.throwIfCancelled();
+        return decrypted;
+      } catch (_) {
+        decrypted.plaintext.fillRange(0, decrypted.plaintext.length, 0);
+        decrypted.preview?.dispose();
+        rethrow;
+      }
+    } finally {
+      _wipeObjects(objects.objects);
     }
   }
 
@@ -282,15 +297,26 @@ abstract final class BundleSync {
       cancellation: signal,
       emitDecrypting: true,
     );
-    signal.throwIfCancelled();
-    await BackgroundBundleCrypto.decryptToFile(
-      objects: objects.objects,
-      mnemonic: mnemonic,
-      destination: destination,
-      expectedIdentity: expectedIdentity,
-      onProgress: objects.reporter.updateDecryption,
-    );
-    signal.throwIfCancelled();
+    try {
+      signal.throwIfCancelled();
+      await BackgroundBundleCrypto.decryptToFile(
+        objects: objects.objects,
+        mnemonic: mnemonic,
+        destination: destination,
+        expectedIdentity: expectedIdentity,
+        onProgress: objects.reporter.updateDecryption,
+      );
+      signal.throwIfCancelled();
+    } finally {
+      _wipeObjects(objects.objects);
+    }
+  }
+
+  static void _wipeObjects(Map<String, List<int>> objects) {
+    for (final bytes in objects.values) {
+      bytes.fillRange(0, bytes.length, 0);
+    }
+    objects.clear();
   }
 
   static Future<_DownloadedObjects> _downloadObjects({
@@ -299,7 +325,14 @@ abstract final class BundleSync {
     void Function(BundleDownloadProgress progress)? onProgress,
     required BundleDownloadCancellation cancellation,
     required bool emitDecrypting,
+    int? maximumTotalObjectBytes,
   }) async {
+    if (maximumTotalObjectBytes != null && maximumTotalObjectBytes <= 0) {
+      throw ArgumentError.value(
+        maximumTotalObjectBytes,
+        'maximumTotalObjectBytes',
+      );
+    }
     cancellation.throwIfCancelled();
     if (!source.capabilities.canRead) {
       throw const SboxException(
@@ -308,76 +341,105 @@ abstract final class BundleSync {
       );
     }
     final reporter = _DownloadProgressReporter(onProgress);
+    var reservedBytes = 0;
+    void reserve(SourceRead read) {
+      if (read.length < 0) {
+        throw const SboxException(
+          SboxErrorCode.remoteChanged,
+          'The remote object length is not acceptable',
+        );
+      }
+      final maximum = maximumTotalObjectBytes;
+      if (maximum != null && read.length > maximum - reservedBytes) {
+        throw const SboxException(
+          SboxErrorCode.sourceLimit,
+          'The encrypted Bundle exceeds the in-memory download limit',
+        );
+      }
+      reservedBytes += read.length;
+    }
+
     final rootRead = await source.get(rootPath);
     cancellation.throwIfCancelled();
+    reserve(rootRead);
     reporter.startObject(shardIndex: 0, length: rootRead.length);
-    final rootBytes = await _readObject(
-      source,
-      rootRead,
-      cancellation: cancellation,
-      onBytesRead: (count) => reporter.updateObject(0, count),
-    );
-    cancellation.throwIfCancelled();
-    reporter.completeObject(0);
-    final rootHeader = BundleHeader.parse(rootBytes);
-    validateBundlePathAgainstHeader(rootPath.value, rootHeader);
-    if (!rootHeader.isRoot) {
-      throw const SboxException(
-        SboxErrorCode.rootRequired,
-        'A root shard is required',
+    Uint8List? rootBytes;
+    final objects = <String, List<int>>{};
+    try {
+      rootBytes = await _readObject(
+        source,
+        rootRead,
+        cancellation: cancellation,
+        onBytesRead: (count) => reporter.updateObject(0, count),
       );
-    }
-    reporter.setTotalObjects(rootHeader.shardCount);
+      cancellation.throwIfCancelled();
+      reporter.completeObject(0);
+      final rootHeader = BundleHeader.parse(rootBytes);
+      validateBundlePathAgainstHeader(rootPath.value, rootHeader);
+      if (!rootHeader.isRoot) {
+        throw const SboxException(
+          SboxErrorCode.rootRequired,
+          'A root shard is required',
+        );
+      }
+      reporter.setTotalObjects(rootHeader.shardCount);
+      objects[rootPath.value] = rootBytes;
+      rootBytes = null;
 
-    final objects = <String, List<int>>{rootPath.value: rootBytes};
-    final paths = <({SourcePath path, int shardIndex})>[
-      for (var index = 1; index < rootHeader.shardCount; index++)
-        (
-          path: SourcePath(
-            canonicalBundleBasename(
-              bundleId: rootHeader.bundleId,
-              shardIndex: index,
-              shardCount: rootHeader.shardCount,
+      final paths = <({SourcePath path, int shardIndex})>[
+        for (var index = 1; index < rootHeader.shardCount; index++)
+          (
+            path: SourcePath(
+              canonicalBundleBasename(
+                bundleId: rootHeader.bundleId,
+                shardIndex: index,
+                shardCount: rootHeader.shardCount,
+              ),
             ),
+            shardIndex: index,
           ),
-          shardIndex: index,
-        ),
-    ];
-    await _parallelForEach(
-      paths,
-      maxParallel: source.capabilities.maxParallelTransfers,
-      action: (item) async {
-        try {
-          cancellation.throwIfCancelled();
-          final read = await source.get(item.path);
-          cancellation.throwIfCancelled();
-          reporter.startObject(
-            shardIndex: item.shardIndex,
-            length: read.length,
-          );
-          objects[item.path.value] = await _readObject(
-            source,
-            read,
-            cancellation: cancellation,
-            onBytesRead: (count) =>
-                reporter.updateObject(item.shardIndex, count),
-          );
-          cancellation.throwIfCancelled();
-          reporter.completeObject(item.shardIndex);
-        } on SboxException catch (error) {
-          if (error.code == SboxErrorCode.sourceNotFound) {
-            throw const SboxException(
-              SboxErrorCode.shardMissing,
-              'Bundle is missing a continuation shard',
+      ];
+      await _parallelForEach(
+        paths,
+        maxParallel: source.capabilities.maxParallelTransfers,
+        action: (item) async {
+          try {
+            cancellation.throwIfCancelled();
+            final read = await source.get(item.path);
+            cancellation.throwIfCancelled();
+            reserve(read);
+            reporter.startObject(
+              shardIndex: item.shardIndex,
+              length: read.length,
             );
+            objects[item.path.value] = await _readObject(
+              source,
+              read,
+              cancellation: cancellation,
+              onBytesRead: (count) =>
+                  reporter.updateObject(item.shardIndex, count),
+            );
+            cancellation.throwIfCancelled();
+            reporter.completeObject(item.shardIndex);
+          } on SboxException catch (error) {
+            if (error.code == SboxErrorCode.sourceNotFound) {
+              throw const SboxException(
+                SboxErrorCode.shardMissing,
+                'Bundle is missing a continuation shard',
+              );
+            }
+            rethrow;
           }
-          rethrow;
-        }
-      },
-    );
-    cancellation.throwIfCancelled();
-    if (emitDecrypting) reporter.emitDecrypting();
-    return _DownloadedObjects(objects: objects, reporter: reporter);
+        },
+      );
+      cancellation.throwIfCancelled();
+      if (emitDecrypting) reporter.emitDecrypting();
+      return _DownloadedObjects(objects: objects, reporter: reporter);
+    } catch (_) {
+      rootBytes?.fillRange(0, rootBytes.length, 0);
+      _wipeObjects(objects);
+      rethrow;
+    }
   }
 
   static Future<List<RevisionToken>> publish(

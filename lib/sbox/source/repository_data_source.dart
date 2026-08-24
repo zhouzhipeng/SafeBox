@@ -65,6 +65,7 @@ abstract base class RepositoryDataSource
     this.sourceName = 'Repository',
   }) : httpTransport = RemoteHttp(
          client,
+         useWebProxy: true,
          logger: logger,
          sourceName: sourceName,
        );

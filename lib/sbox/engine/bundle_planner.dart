@@ -69,10 +69,7 @@ abstract final class BundlePlanner {
         targetNominalShardPlaintextSize >
             SboxProtocol.maxNominalShardPlaintextSize ||
         targetNominalShardPlaintextSize % (1024 * 1024) != 0) {
-      throw const SboxException(
-        SboxErrorCode.sourceLimit,
-        '分片大小无效',
-      );
+      throw const SboxException(SboxErrorCode.sourceLimit, '分片大小无效');
     }
     final unit = 1024 * 1024;
     final candidates = <int>[];
@@ -124,7 +121,11 @@ abstract final class BundlePlanner {
   }
 
   static int _checkedSum(List<int> values) {
-    const maxInt = 0x7fffffffffffffff;
+    // Dart web integers are represented as JavaScript numbers. Keep size
+    // arithmetic inside the largest integer that every supported target can
+    // represent exactly; the SBOX protocol limit (512 MiB * 10,000 shards)
+    // is comfortably below this value.
+    const maxInt = 0x1fffffffffffff;
     var result = 0;
     for (final value in values) {
       if (value < 0 || result > maxInt - value) {

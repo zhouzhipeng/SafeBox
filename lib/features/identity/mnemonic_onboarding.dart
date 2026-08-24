@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -190,7 +191,13 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
           width: double.infinity,
           child: ElevatedButton(
             onPressed: _busy ? null : _create,
-            child: const Text('创建安全身份'),
+            child: kIsWeb
+                ? _busyActionLabel(
+                    context,
+                    idleLabel: '创建安全身份',
+                    busyLabel: '正在计算身份…',
+                  )
+                : const Text('创建安全身份'),
           ),
         ),
         const SizedBox(height: 12),
@@ -202,6 +209,14 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
           ),
         ),
         const SizedBox(height: 15),
+        if (_busy && kIsWeb) ...<Widget>[
+          Text(
+            '正在本地计算 RSA-3072 身份，浏览器可能需要约 1 分钟，请勿关闭页面。',
+            style: Theme.of(context).textTheme.bodySmall
+                ?.copyWith(color: context.sboxColors.textMuted),
+          ),
+          const SizedBox(height: 12),
+        ],
         const SboxLockHint(text: '恢复信息只保存在你手中'),
       ],
     );
@@ -363,7 +378,13 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
                   width: double.infinity,
                   child: ElevatedButton(
                     onPressed: _busy ? null : _restore,
-                    child: Text(_busy ? '正在恢复…' : '恢复身份'),
+                    child: kIsWeb
+                        ? _busyActionLabel(
+                            context,
+                            idleLabel: '恢复身份',
+                            busyLabel: '正在计算身份…',
+                          )
+                        : Text(_busy ? '正在恢复…' : '恢复身份'),
                   ),
                 ),
               ],
@@ -381,11 +402,26 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
                 Expanded(
                   child: ElevatedButton(
                     onPressed: _busy ? null : _restore,
-                    child: Text(_busy ? '正在恢复…' : '恢复身份'),
+                    child: kIsWeb
+                        ? _busyActionLabel(
+                            context,
+                            idleLabel: '恢复身份',
+                            busyLabel: '正在计算身份…',
+                          )
+                        : Text(_busy ? '正在恢复…' : '恢复身份'),
                   ),
                 ),
               ],
             ),
+          if (_busy && kIsWeb) ...<Widget>[
+            const SizedBox(height: 12),
+            Text(
+              '正在本地计算 RSA-3072 身份，浏览器可能需要约 1 分钟，请勿关闭页面。',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodySmall
+                  ?.copyWith(color: context.sboxColors.textMuted),
+            ),
+          ],
           const SizedBox(height: 10),
           const SboxLockHint(text: '恢复词仅用于本地恢复，不会上传'),
         ],
@@ -490,6 +526,30 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
     );
   }
 
+  Widget _busyActionLabel(
+    BuildContext context, {
+    required String idleLabel,
+    required String busyLabel,
+  }) {
+    if (!_busy) return Text(idleLabel);
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: <Widget>[
+        SizedBox(
+          width: 17,
+          height: 17,
+          child: CircularProgressIndicator(
+            strokeWidth: 2.2,
+            color: context.sboxColors.accent,
+          ),
+        ),
+        const SizedBox(width: 10),
+        Text(busyLabel),
+      ],
+    );
+  }
+
   Widget _buildBottomHint(BuildContext context, bool mobile) {
     return Align(
       alignment: mobile ? Alignment.centerLeft : Alignment.centerLeft,
@@ -499,6 +559,10 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
 
   Future<void> _create() async {
     setState(() => _busy = true);
+    if (kIsWeb) {
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
+    }
     try {
       final mnemonic = await widget.controller.createIdentity();
       final words = mnemonic.trim().split(RegExp(r'\s+'));
@@ -524,6 +588,10 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
       return;
     }
     setState(() => _busy = true);
+    if (kIsWeb) {
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
+    }
     try {
       await widget.controller.restoreIdentity(words.join(' '));
       if (!mounted) return;
@@ -542,12 +610,22 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
   Future<void> _copyMnemonic() async {
     final words = _mnemonic;
     if (words == null) return;
-    await Clipboard.setData(ClipboardData(text: words.join(' ')));
-    if (mounted) _showFeedback('恢复词已复制，请立即离线保存。');
+    try {
+      await Clipboard.setData(ClipboardData(text: words.join(' ')));
+      if (mounted) _showFeedback('恢复词已复制，请立即离线保存。');
+    } catch (_) {
+      _showFeedback('无法写入剪贴板，请手动保存恢复词。', error: true);
+    }
   }
 
   Future<void> _pasteRecoveryPhrase() async {
-    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    ClipboardData? data;
+    try {
+      data = await Clipboard.getData(Clipboard.kTextPlain);
+    } catch (_) {
+      _showFeedback('无法读取剪贴板，请手动输入 12 个恢复词。', error: true);
+      return;
+    }
     final text = data?.text ?? '';
     final words = text.trim().split(RegExp(r'\s+'));
     if (words.length != 12) {

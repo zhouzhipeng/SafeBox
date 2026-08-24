@@ -2,6 +2,8 @@ import 'dart:isolate';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
+
 import '../constants.dart';
 import '../format/bundle_header.dart';
 import '../format/bundle_manifest.dart';
@@ -27,6 +29,13 @@ abstract final class BackgroundBundleCrypto {
     required int declaredLength,
     bool validateUtf8 = false,
   }) async {
+    if (kIsWeb) {
+      return BundleEncryptor().md5ForInput(
+        input: input,
+        declaredLength: declaredLength,
+        validateUtf8: validateUtf8,
+      );
+    }
     final request = _InputRequest.fromInput(input);
     final result = await Isolate.run<Uint8List>(
       () => _md5Worker(
@@ -46,6 +55,11 @@ abstract final class BackgroundBundleCrypto {
     required Directory root,
     void Function(BundleEncryptionProgress progress)? onProgress,
   }) async {
+    if (kIsWeb) {
+      throw UnsupportedError(
+        'Browser builds cannot write encrypted bundles to a local directory',
+      );
+    }
     final request = _EncryptionRequest.fromValues(
       input: input,
       declaredLength: declaredLength,
@@ -81,6 +95,14 @@ abstract final class BackgroundBundleCrypto {
     PublicIdentity? expectedIdentity,
     void Function(BundleDecryptionProgress progress)? onProgress,
   }) async {
+    if (kIsWeb) {
+      return BundleDecryptor().decrypt(
+        objects: objects,
+        mnemonic: mnemonic,
+        expectedIdentity: expectedIdentity,
+        onProgress: onProgress,
+      );
+    }
     final request = _DecryptRequest.fromValues(
       objects: objects,
       mnemonic: mnemonic,
@@ -137,6 +159,11 @@ abstract final class BackgroundBundleCrypto {
     PublicIdentity? expectedIdentity,
     void Function(BundleDecryptionProgress progress)? onProgress,
   }) async {
+    if (kIsWeb) {
+      throw UnsupportedError(
+        'Browser builds cannot decrypt directly to a local file',
+      );
+    }
     final request = _DecryptRequest.fromValues(
       objects: objects,
       mnemonic: mnemonic,
@@ -164,6 +191,9 @@ abstract final class BackgroundBundleCrypto {
   }
 
   static Future<Uint8List> sha256File(File file) async {
+    if (kIsWeb) {
+      throw UnsupportedError('Browser builds do not expose local files');
+    }
     final result = await Isolate.run<Uint8List>(
       () => _sha256FileWorker(file.path),
       debugName: 'safebox-sha256',
@@ -180,6 +210,13 @@ abstract final class BackgroundBundleCrypto {
     required List<int> objectPrefix,
     required PublicIdentity identity,
   }) async {
+    if (kIsWeb) {
+      return BundleProbe.readMetadata(
+        basename: basename,
+        objectPrefix: objectPrefix,
+        identity: identity,
+      );
+    }
     final request = _ManifestRequest(
       basename: basename,
       objectPrefix: Uint8List.fromList(objectPrefix),
