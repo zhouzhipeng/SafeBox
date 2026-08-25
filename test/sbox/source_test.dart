@@ -45,6 +45,23 @@ void main() {
         ),
         predicate<RevisionToken>((revision) => revision.matches(rootRevision)),
       );
+      final sameLengthConflict = Uint8List.fromList(rootBytes);
+      sameLengthConflict[sameLengthConflict.length - 1] ^= 0xff;
+      await expectLater(
+        source.putNew(
+          rootPath,
+          Stream<List<int>>.value(sameLengthConflict),
+          length: sameLengthConflict.length,
+          sha256: sha256Bytes(sameLengthConflict),
+        ),
+        throwsA(
+          isA<SboxException>().having(
+            (error) => error.code,
+            'code',
+            SboxErrorCode.immutableConflict,
+          ),
+        ),
+      );
 
       final continuationHeader = BundleHeader.continuation(
         bundleId: rootHeader.bundleId,

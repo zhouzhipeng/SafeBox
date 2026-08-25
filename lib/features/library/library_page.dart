@@ -48,6 +48,7 @@ import '../../sbox/source/data_source.dart';
 import '../../sbox/source/local_directory_source.dart';
 import '../../sbox/source/repository_data_source.dart';
 import '../../sbox/source/source_path.dart';
+import '../../sbox/storage/io_hash.dart';
 import '../../sbox/storage/local_bundle_index.dart';
 import '../../sbox/storage/temporary_plaintext_store.dart';
 
@@ -57,11 +58,13 @@ final class LibraryPage extends StatefulWidget {
     required this.controller,
     this.onOpenCloudSettings,
     this.videoPosterDecoder = const FlutterVideoPosterDecoder(),
+    this.directoryOpener,
   });
 
   final AppController controller;
   final VoidCallback? onOpenCloudSettings;
   final VideoPosterDecoder videoPosterDecoder;
+  final Future<void> Function(Directory directory)? directoryOpener;
 
   @override
   State<LibraryPage> createState() => _LibraryPageState();
@@ -209,6 +212,7 @@ final class _LibraryPageState extends State<LibraryPage> {
   }
 
   Widget _buildUploadArea(BuildContext context, bool mobile) {
+    final selectedSbox = _selectedFileIsSbox;
     return _DashedDropTarget(
       dragging: _dragging,
       onDragEntered: () {
@@ -259,51 +263,69 @@ final class _LibraryPageState extends State<LibraryPage> {
                 key: ValueKey<String>(
                   _selectedFile == null
                       ? 'library-select-file-button'
+                      : selectedSbox
+                      ? 'library-save-sbox-button'
                       : 'library-upload-file-button',
                 ),
                 onPressed: _busy || _savingShardSize
                     ? null
-                    : (_selectedFile == null ? _pickFile : _upload),
+                    : (_selectedFile == null
+                          ? _pickFile
+                          : selectedSbox
+                          ? _saveSboxToLocal
+                          : _upload),
                 icon: Icon(
                   _selectedFile == null
                       ? Icons.file_upload_outlined
+                      : selectedSbox
+                      ? Icons.save_alt_outlined
                       : Icons.lock_outline,
                   size: 23,
                 ),
-                label: Text(_busy ? '正在准备' : '上传文件'),
+                label: Text(
+                  _busy
+                      ? (selectedSbox ? '正在保存' : '正在准备')
+                      : _selectedFile == null
+                      ? '选择文件'
+                      : selectedSbox
+                      ? '保存到local'
+                      : '加密并上传',
+                ),
               ),
             ),
             const SizedBox(height: 18),
             _buildFileSelectionHint(context),
-            const SizedBox(height: 22),
-            TextField(
-              controller: _descriptionController,
-              enabled: !_busy && !_savingShardSize,
-              minLines: 3,
-              maxLines: 3,
-              keyboardType: TextInputType.multiline,
-              decoration: const InputDecoration(
-                labelText: '附加信息（可选）',
-                hintText: '为文件添加说明',
-                alignLabelWithHint: true,
+            if (!selectedSbox) ...<Widget>[
+              const SizedBox(height: 22),
+              TextField(
+                controller: _descriptionController,
+                enabled: !_busy && !_savingShardSize,
+                minLines: 3,
+                maxLines: 3,
+                keyboardType: TextInputType.multiline,
+                decoration: const InputDecoration(
+                  labelText: '附加信息（可选）',
+                  hintText: '为文件添加说明',
+                  alignLabelWithHint: true,
+                ),
               ),
-            ),
-            const SizedBox(height: 8),
-            Material(
-              type: MaterialType.transparency,
-              child: SwitchListTile(
-                value: _generatePreview,
-                onChanged: _busy || _savingShardSize
-                    ? null
-                    : _setGeneratePreview,
-                contentPadding: EdgeInsets.zero,
-                secondary: const Icon(Icons.image_outlined),
-                title: const Text('嵌入缩略图；图片/视频文件专用'),
+              const SizedBox(height: 8),
+              Material(
+                type: MaterialType.transparency,
+                child: SwitchListTile(
+                  value: _generatePreview,
+                  onChanged: _busy || _savingShardSize
+                      ? null
+                      : _setGeneratePreview,
+                  contentPadding: EdgeInsets.zero,
+                  secondary: const Icon(Icons.image_outlined),
+                  title: const Text('嵌入缩略图；图片/视频文件专用'),
+                ),
               ),
-            ),
-            _buildVideoPreviewPicker(context),
-            const SizedBox(height: 8),
-            _buildShardSizeControl(context),
+              _buildVideoPreviewPicker(context),
+              const SizedBox(height: 8),
+              _buildShardSizeControl(context),
+            ],
             if (_busy) ...<Widget>[
               const SizedBox(height: 18),
               Text(
@@ -1286,9 +1308,11 @@ final class _LibraryPageState extends State<LibraryPage> {
         ),
       ],
     };
+    final canOpenLocalFolder = _canOpenLocalFolder(row);
     final canCopyPublicLink = _canCopyPublicLink(row);
     final canDeleteCloudBundle = _canDeleteCloudBundle(row);
-    if (canCopyPublicLink || canDeleteCloudBundle) {
+    if (canOpenLocalFolder || canCopyPublicLink || canDeleteCloudBundle) {
+      final openFolderEnabled = !_busy;
       final deleteEnabled = !_busy && !_listingInBackground;
       buttons.add(
         SizedBox(
@@ -1300,6 +1324,8 @@ final class _LibraryPageState extends State<LibraryPage> {
             padding: EdgeInsets.zero,
             onSelected: (action) {
               switch (action) {
+                case _FileRowMenuAction.openLocalFolder:
+                  _openLocalFolder(row);
                 case _FileRowMenuAction.copyPublicLink:
                   _copyPublicLink(row);
                 case _FileRowMenuAction.deleteCloudBundle:
@@ -1309,6 +1335,22 @@ final class _LibraryPageState extends State<LibraryPage> {
             itemBuilder: (context) {
               final errorColor = Theme.of(context).colorScheme.error;
               return <PopupMenuEntry<_FileRowMenuAction>>[
+                if (canOpenLocalFolder)
+                  PopupMenuItem<_FileRowMenuAction>(
+                    enabled: openFolderEnabled,
+                    value: _FileRowMenuAction.openLocalFolder,
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Icon(Icons.folder_open_outlined, size: 20),
+                        SizedBox(width: 10),
+                        Text('打开文件夹'),
+                      ],
+                    ),
+                  ),
+                if (canOpenLocalFolder &&
+                    (canCopyPublicLink || canDeleteCloudBundle))
+                  const PopupMenuDivider(),
                 if (canCopyPublicLink)
                   const PopupMenuItem<_FileRowMenuAction>(
                     value: _FileRowMenuAction.copyPublicLink,
@@ -1348,6 +1390,22 @@ final class _LibraryPageState extends State<LibraryPage> {
       runSpacing: 8,
       children: buttons,
     );
+  }
+
+  bool _canOpenLocalFolder(_FileRow row) =>
+      row.bundle?.source is LocalDirectoryDataSource;
+
+  Future<void> _openLocalFolder(_FileRow row) async {
+    final source = row.bundle?.source;
+    if (source is! LocalDirectoryDataSource) return;
+    try {
+      await (widget.directoryOpener ?? FileOpener.openDirectory)(source.root);
+      if (mounted) _showFeedback('文件夹已打开。');
+    } catch (error) {
+      if (!mounted) return;
+      widget.controller.setError(error, operation: '打开本地备份文件夹失败');
+      _showFeedback('文件夹暂时无法打开，请稍后重试。', error: true);
+    }
   }
 
   bool _canCopyPublicLink(_FileRow row) =>
@@ -2559,6 +2617,15 @@ final class _LibraryPageState extends State<LibraryPage> {
     if (file != null) await _setFile(file);
   }
 
+  bool get _selectedFileIsSbox {
+    final file = _selectedFile;
+    return file != null && _isSboxFile(file);
+  }
+
+  static bool _isSboxFile(XFile file) =>
+      p.extension(file.name).toLowerCase() == '.sbox' ||
+      p.extension(file.path).toLowerCase() == '.sbox';
+
   Future<void> _setFile(XFile file) async {
     final path = file.path.trim();
     if ((!kIsWeb && path.isEmpty) ||
@@ -2577,8 +2644,10 @@ final class _LibraryPageState extends State<LibraryPage> {
       return;
     }
     if (!mounted) return;
+    final isSbox = _isSboxFile(file);
     final looksLikeVideo =
-        _looksLikeVideoFile(file.name) || _looksLikeVideoFile(file.path);
+        !isSbox &&
+        (_looksLikeVideoFile(file.name) || _looksLikeVideoFile(file.path));
     _videoPreviewRequestId++;
     _disposeVideoPreviewCandidates();
     setState(() {
@@ -2590,7 +2659,9 @@ final class _LibraryPageState extends State<LibraryPage> {
       _videoPreviewError = null;
       _videoPreviewMediaType = 'video/mp4';
     });
-    if (_generatePreview) await _prepareVideoPreviewCandidates(file);
+    if (_generatePreview && !isSbox) {
+      await _prepareVideoPreviewCandidates(file);
+    }
   }
 
   void _setGeneratePreview(bool value) {
@@ -2729,6 +2800,116 @@ final class _LibraryPageState extends State<LibraryPage> {
       '.m2ts',
       '.mts',
     }.contains(extension);
+  }
+
+  Future<void> _saveSboxToLocal() async {
+    if (_busy || _savingShardSize) return;
+    final selected = _selectedFile;
+    if (selected == null) {
+      await _pickFile();
+      return;
+    }
+    if (!_isSboxFile(selected)) {
+      await _upload();
+      return;
+    }
+    if (kIsWeb) {
+      _showFeedback('Web 版暂不支持保存到 Local。', error: true);
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _busyTitle = '正在保存到 Local';
+      _busyDetail = '正在检查并保存 SBOX 文件，请稍候。';
+      _uploadProgress = null;
+      _downloadProgress = null;
+    });
+    try {
+      final source = File(selected.path);
+      if (await FileSystemEntity.type(source.path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        throw const SboxException(
+          SboxErrorCode.sourceNotFound,
+          '找不到所选 SBOX 文件',
+        );
+      }
+      final length = await source.length();
+      final digest = await sha256File(source);
+      if (await source.length() != length) {
+        throw const SboxException(
+          SboxErrorCode.inputChanged,
+          '所选 SBOX 文件在读取时发生变化',
+        );
+      }
+      final header = await _readSelectedSboxHeader(source, length);
+      final configuration = _configuration ?? await _configurationStore.load();
+      final backupDirectory =
+          configuration?.backupDirectory ??
+          p.join(Directory.systemTemp.path, 'SafeBox', 'backup');
+      final destination = await LocalDirectoryDataSource.attach(
+        root: Directory(backupDirectory),
+        mode: LocalDirectoryMode.readWrite,
+        requestWrite: true,
+      );
+      await destination.putNew(
+        SourcePath(header.canonicalBasename),
+        source.openRead(),
+        length: length,
+        sha256: digest,
+      );
+      if (!mounted) return;
+      _videoPreviewRequestId++;
+      _disposeVideoPreviewCandidates();
+      setState(() {
+        _selectedFile = null;
+        _selectedFileLength = null;
+        _videoFileDetected = false;
+        _videoPreviewLoading = false;
+        _videoPreviewError = null;
+        _videoPreviewMediaType = 'video/mp4';
+        _descriptionController.clear();
+      });
+      _showFeedback('SBOX 文件已保存到 Local。');
+      unawaited(_scan(includeCloudSources: false));
+    } catch (error) {
+      if (!mounted) return;
+      widget.controller.setError(error, operation: '保存 SBOX 文件到 Local 失败');
+      final message = error is SboxException ? error.message : '发生未知错误，请稍后重试。';
+      _showFeedback('保存失败：$message', error: true);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _uploadProgress = null;
+          _downloadProgress = null;
+        });
+      }
+    }
+  }
+
+  static Future<BundleHeader> _readSelectedSboxHeader(
+    File file,
+    int length,
+  ) async {
+    final readLength = length < SboxProtocol.rootHeaderLength
+        ? length
+        : SboxProtocol.rootHeaderLength;
+    final handle = await file.open(mode: FileMode.read);
+    try {
+      final header = BundleHeader.parse(await handle.read(readLength));
+      final minimumLength =
+          header.headerLength +
+          SboxProtocol.recordHeaderLength +
+          SboxProtocol.finalPlaintextLength +
+          SboxProtocol.gcmTagLength;
+      if (length < minimumLength) {
+        throw const SboxException(SboxErrorCode.truncated, 'SBOX 文件内容不完整');
+      }
+      return header;
+    } finally {
+      await handle.close();
+    }
   }
 
   Future<void> _upload() async {
@@ -3137,7 +3318,7 @@ final class _LibraryPageState extends State<LibraryPage> {
       return;
     }
     try {
-      await FileOpener.openDirectory(
+      await (widget.directoryOpener ?? FileOpener.openDirectory)(
         Directory(p.dirname(bundle.plaintextFile!.path)),
       );
       if (mounted) _showFeedback('文件夹已打开。');
@@ -3636,7 +3817,7 @@ final class _LibraryBundle {
 
 enum _FileActionState { localPlaintext, localEncrypted, remoteOnly }
 
-enum _FileRowMenuAction { copyPublicLink, deleteCloudBundle }
+enum _FileRowMenuAction { openLocalFolder, copyPublicLink, deleteCloudBundle }
 
 enum _LibrarySource {
   github('GitHub'),

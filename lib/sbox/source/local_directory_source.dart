@@ -1,10 +1,12 @@
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:path/path.dart' as p;
 
 import '../bytes.dart';
 import '../errors.dart';
+import '../storage/io_hash.dart';
 import 'data_source.dart';
 import 'source_path.dart';
 
@@ -163,14 +165,18 @@ final class LocalDirectoryDataSource
     required Uint8List sha256,
   }) async {
     _requireWrite();
-    if (length < 0) {
+    if (length < 0 || sha256.length != 32) {
       throw ArgumentError('Invalid object dimensions');
     }
+    final expectedSha256 = Uint8List.fromList(sha256);
     final target = await _resolve(path, mustExist: false);
     if (await target.exists()) {
       final existing = await target.stat();
       if (existing.size == length) {
-        return _statRevision(existing);
+        final existingSha256 = await sha256File(target);
+        if (constantTimeBytesEqual(existingSha256, expectedSha256)) {
+          return _statRevision(existing);
+        }
       }
       throw const SboxException(
         SboxErrorCode.immutableConflict,
@@ -184,6 +190,9 @@ final class LocalDirectoryDataSource
       ),
     );
     final output = stage.openWrite();
+    final hashAccumulator = HashDigestSink();
+    final hashSink = crypto.sha256.startChunkedConversion(hashAccumulator);
+    var hashClosed = false;
     var count = 0;
     try {
       await for (final chunk in body) {
@@ -191,10 +200,19 @@ final class LocalDirectoryDataSource
         if (count > length) {
           throw const SboxException(SboxErrorCode.integrity, '对象超过声明长度');
         }
+        hashSink.add(chunk);
         output.add(chunk);
       }
       if (count != length) {
         throw const SboxException(SboxErrorCode.integrity, '对象长度不匹配');
+      }
+      hashSink.close();
+      hashClosed = true;
+      if (!constantTimeBytesEqual(
+        hashAccumulator.value.bytes,
+        expectedSha256,
+      )) {
+        throw const SboxException(SboxErrorCode.integrity, '对象 SHA-256 不匹配');
       }
       await output.flush();
       await output.close();
@@ -204,6 +222,7 @@ final class LocalDirectoryDataSource
       await stage.rename(target.path);
       return _statRevision(await target.stat());
     } finally {
+      if (!hashClosed) hashSink.close();
       await output.close();
       if (await stage.exists()) await stage.delete();
     }
