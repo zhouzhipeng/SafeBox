@@ -4,8 +4,8 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
-import 'package:flutter/foundation.dart' show kIsWeb;
 
+import '../../platform/runtime_environment.dart';
 import '../../platform/web_proxy_http_client.dart';
 import '../errors.dart';
 import '../format/strict_json.dart';
@@ -186,7 +186,7 @@ final class RemoteHttp {
       // Flutter isolate, but avoid paying an isolate startup for normal
       // repositories with only a few hundred entries.
       final value =
-          !kIsWeb &&
+          !isWebRuntime &&
               parseInBackground &&
               bytes.length >= minimumJsonBytesForIsolate
           ? await Isolate.run<Object?>(

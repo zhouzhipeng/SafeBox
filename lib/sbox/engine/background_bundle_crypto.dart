@@ -2,13 +2,12 @@ import 'dart:isolate';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show kIsWeb;
-
 import '../constants.dart';
 import '../format/bundle_header.dart';
 import '../format/bundle_manifest.dart';
 import '../format/bundle_preview.dart';
 import '../../platform/preview_generation_result.dart';
+import '../../platform/runtime_environment.dart';
 import '../identity/der.dart';
 import '../identity/rsa_models.dart';
 import '../storage/io_hash.dart' as io_hash;
@@ -29,7 +28,7 @@ abstract final class BackgroundBundleCrypto {
     required int declaredLength,
     bool validateUtf8 = false,
   }) async {
-    if (kIsWeb) {
+    if (isWebRuntime) {
       return BundleEncryptor().md5ForInput(
         input: input,
         declaredLength: declaredLength,
@@ -55,7 +54,7 @@ abstract final class BackgroundBundleCrypto {
     required Directory root,
     void Function(BundleEncryptionProgress progress)? onProgress,
   }) async {
-    if (kIsWeb) {
+    if (isWebRuntime) {
       throw UnsupportedError(
         'Browser builds cannot write encrypted bundles to a local directory',
       );
@@ -95,7 +94,7 @@ abstract final class BackgroundBundleCrypto {
     PublicIdentity? expectedIdentity,
     void Function(BundleDecryptionProgress progress)? onProgress,
   }) async {
-    if (kIsWeb) {
+    if (isWebRuntime) {
       return BundleDecryptor().decrypt(
         objects: objects,
         mnemonic: mnemonic,
@@ -159,7 +158,7 @@ abstract final class BackgroundBundleCrypto {
     PublicIdentity? expectedIdentity,
     void Function(BundleDecryptionProgress progress)? onProgress,
   }) async {
-    if (kIsWeb) {
+    if (isWebRuntime) {
       throw UnsupportedError(
         'Browser builds cannot decrypt directly to a local file',
       );
@@ -191,7 +190,7 @@ abstract final class BackgroundBundleCrypto {
   }
 
   static Future<Uint8List> sha256File(File file) async {
-    if (kIsWeb) {
+    if (isWebRuntime) {
       throw UnsupportedError('Browser builds do not expose local files');
     }
     final result = await Isolate.run<Uint8List>(
@@ -210,7 +209,7 @@ abstract final class BackgroundBundleCrypto {
     required List<int> objectPrefix,
     required PublicIdentity identity,
   }) async {
-    if (kIsWeb) {
+    if (isWebRuntime) {
       return BundleProbe.readMetadata(
         basename: basename,
         objectPrefix: objectPrefix,

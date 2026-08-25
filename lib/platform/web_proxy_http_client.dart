@@ -1,7 +1,8 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
+
+import 'runtime_environment.dart';
 
 /// Raised when a Web build expects SafeBox's same-origin cloud proxy but the
 /// current server does not provide it.
@@ -17,7 +18,7 @@ final class WebProxyUnavailableException implements Exception {
 /// Route provider traffic through the restricted same-origin endpoint served
 /// by `serve_safebox_web.py`. Non-Web builds keep their native HTTP client.
 http.Client configureRemoteHttpClient(http.Client client) {
-  if (!kIsWeb) return client;
+  if (!isWebRuntime) return client;
   const configuredPath = String.fromEnvironment(
     'SBOX_WEB_PROXY_PATH',
     defaultValue: '/_safebox/proxy',

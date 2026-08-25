@@ -3,10 +3,10 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
+import '../../platform/runtime_environment.dart';
 import '../../platform/web_runtime_limits.dart';
 import '../bytes.dart';
 import '../constants.dart';
@@ -279,7 +279,7 @@ final class CloudBundleUploader {
     void Function(CloudBundleUploadProgress progress)? onProgress,
     CloudBundleUploadCancellation? cancellation,
   }) async {
-    if (kIsWeb) {
+    if (isWebRuntime) {
       return _uploadInMemory(
         input: input,
         declaredLength: declaredLength,

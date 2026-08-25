@@ -1,8 +1,8 @@
 import 'dart:io';
 
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:path/path.dart' as p;
 
+import '../../platform/runtime_environment.dart';
 import '../errors.dart';
 import '../format/bundle_manifest.dart';
 
@@ -14,7 +14,7 @@ final class TemporaryPlaintextStore {
     : root =
           root ??
           Directory(
-            kIsWeb
+            isWebRuntime
                 ? 'web-memory/plaintext'
                 : p.join(
                     Directory.systemTemp.path,

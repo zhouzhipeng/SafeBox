@@ -4,8 +4,8 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
-import 'package:flutter/foundation.dart' show kIsWeb;
 
+import '../../platform/runtime_environment.dart';
 import '../bytes.dart';
 import '../constants.dart';
 import '../crypto/rsa_oaep.dart';
@@ -138,7 +138,7 @@ final class BundleDecryptor {
     Uint8List? bundleDek;
     try {
       final deriver = SboxIdentityDeriver();
-      identity = kIsWeb
+      identity = isWebRuntime
           ? await deriver.deriveIdentityCooperatively(mnemonic)
           : await deriver.deriveIdentity(mnemonic);
       if (expectedIdentity != null &&
@@ -470,7 +470,7 @@ final class BundleDecryptor {
     Uint8List? bundleDek;
     try {
       final deriver = SboxIdentityDeriver();
-      identity = kIsWeb
+      identity = isWebRuntime
           ? await deriver.deriveIdentityCooperatively(mnemonic)
           : await deriver.deriveIdentity(mnemonic);
       if (expectedIdentity != null &&
@@ -572,7 +572,7 @@ final class BundleDecryptor {
         if (nextIndex >= objects.length) return;
         final index = nextIndex++;
         final object = objects[index];
-        final result = _canUseShardIsolates && !kIsWeb
+        final result = _canUseShardIsolates && !isWebRuntime
             ? await _decryptShardInIsolate(object, bundleDek)
             : await _decryptShard(object, bundleDek);
         results[index] = result;
@@ -604,7 +604,7 @@ final class BundleDecryptor {
   }
 
   int _shardWorkerCount(int shardCount) {
-    if (kIsWeb) return 1;
+    if (isWebRuntime) return 1;
     final processorCount = Platform.numberOfProcessors;
     final parallelism = processorCount < 2
         ? 1

@@ -5,8 +5,8 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
-import 'package:flutter/foundation.dart' show kIsWeb;
 
+import '../../platform/runtime_environment.dart';
 import '../bytes.dart';
 import '../constants.dart';
 import '../crypto/metadata_cipher.dart';
@@ -756,7 +756,7 @@ final class BundleEncryptor {
     if (shards.isEmpty) return <_ShardEncryptionResult>[];
     final results = List<_ShardEncryptionResult?>.filled(shards.length, null);
     final useIsolates =
-        !kIsWeb && _canUseShardIsolates && _supportsParallelInput(input);
+        !isWebRuntime && _canUseShardIsolates && _supportsParallelInput(input);
     final workerCount = useIsolates ? _shardWorkerCount(shards.length) : 1;
     var nextIndex = 0;
     var completedShards = 0;
@@ -827,7 +827,7 @@ final class BundleEncryptor {
     if (jobs.isEmpty) return <_ShardEncryptionResult>[];
     final results = List<_ShardEncryptionResult?>.filled(jobs.length, null);
     final useIsolates =
-        !kIsWeb && _canUseShardIsolates && _supportsParallelInput(input);
+        !isWebRuntime && _canUseShardIsolates && _supportsParallelInput(input);
     final workerCount = useIsolates ? _shardWorkerCount(jobs.length) : 1;
     var nextIndex = 0;
     var completedShards = 0;
@@ -1010,7 +1010,7 @@ final class BundleEncryptor {
   }
 
   static bool _supportsParallelInput(BundleInput input) =>
-      !kIsWeb && (input is FileBundleInput || input is MemoryBundleInput);
+      !isWebRuntime && (input is FileBundleInput || input is MemoryBundleInput);
 
   static int _shardWorkerCount(int shardCount) {
     final processorCount = Platform.numberOfProcessors;
