@@ -28,6 +28,10 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
     12,
     (_) => TextEditingController(),
   );
+  final _restoreFocusNodes = List<FocusNode>.generate(
+    12,
+    (index) => FocusNode(debugLabel: 'restore-word-${index + 1}'),
+  );
   List<String>? _mnemonic;
   int _step = 1;
   bool _restoring = false;
@@ -38,6 +42,9 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
     for (final controller in _restoreControllers) {
       controller.clear();
       controller.dispose();
+    }
+    for (final focusNode in _restoreFocusNodes) {
+      focusNode.dispose();
     }
     super.dispose();
   }
@@ -361,6 +368,7 @@ final class _MnemonicOnboardingState extends State<MnemonicOnboarding> {
             inputs: true,
             mobile: mobile,
             controllers: _restoreControllers,
+            focusNodes: _restoreFocusNodes,
           ),
           const SizedBox(height: 14),
           if (mobile)
@@ -739,12 +747,46 @@ final class _WordGrid extends StatelessWidget {
     required this.inputs,
     required this.mobile,
     this.controllers,
-  });
+    this.focusNodes,
+  }) : assert(!inputs || controllers != null),
+       assert(!inputs || focusNodes != null);
 
   final List<String> words;
   final bool inputs;
   final bool mobile;
   final List<TextEditingController>? controllers;
+  final List<FocusNode>? focusNodes;
+
+  static final RegExp _whitespace = RegExp(r'\s+');
+
+  void _focusNextWord(int index) {
+    final nodes = focusNodes;
+    if (nodes == null || index >= nodes.length - 1) return;
+    nodes[index + 1].requestFocus();
+  }
+
+  KeyEventResult _handleNavigationKey(KeyEvent event, int index) {
+    final key = event.logicalKey;
+    final navigatesForward =
+        key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.numpadEnter ||
+        key == LogicalKeyboardKey.space;
+    if (!navigatesForward) return KeyEventResult.ignored;
+
+    if (event is KeyDownEvent) _focusNextWord(index);
+    return KeyEventResult.handled;
+  }
+
+  void _handleTextChanged(int index, String value) {
+    if (!_whitespace.hasMatch(value)) return;
+
+    final text = value.replaceAll(_whitespace, '');
+    controllers![index].value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+    _focusNextWord(index);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -783,18 +825,32 @@ final class _WordGrid extends StatelessWidget {
               const SizedBox(width: 8),
               if (inputs)
                 Expanded(
-                  child: TextField(
-                    controller: controllers![index],
-                    decoration: InputDecoration(
-                      hintText: '第 ${index + 1} 个词',
-                      border: InputBorder.none,
-                      enabledBorder: InputBorder.none,
-                      focusedBorder: InputBorder.none,
-                      filled: false,
-                      contentPadding: EdgeInsets.zero,
-                      hintStyle: TextStyle(color: context.sboxColors.textMuted),
+                  child: Focus(
+                    canRequestFocus: false,
+                    skipTraversal: true,
+                    onKeyEvent: (_, event) =>
+                        _handleNavigationKey(event, index),
+                    child: TextField(
+                      controller: controllers![index],
+                      focusNode: focusNodes![index],
+                      textInputAction: index < 11
+                          ? TextInputAction.next
+                          : TextInputAction.done,
+                      onSubmitted: (_) => _focusNextWord(index),
+                      onChanged: (value) => _handleTextChanged(index, value),
+                      decoration: InputDecoration(
+                        hintText: '第 ${index + 1} 个词',
+                        border: InputBorder.none,
+                        enabledBorder: InputBorder.none,
+                        focusedBorder: InputBorder.none,
+                        filled: false,
+                        contentPadding: EdgeInsets.zero,
+                        hintStyle: TextStyle(
+                          color: context.sboxColors.textMuted,
+                        ),
+                      ),
+                      style: TextStyle(color: context.sboxColors.text),
                     ),
-                    style: TextStyle(color: context.sboxColors.text),
                   ),
                 )
               else

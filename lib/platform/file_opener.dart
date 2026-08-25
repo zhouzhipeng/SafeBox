@@ -1,16 +1,24 @@
 import 'dart:io';
 
+import 'package:flutter/services.dart';
+
 /// Opens files and directories with the operating system's default app.
 abstract final class FileOpener {
+  static const MethodChannel _windowsShellChannel = MethodChannel(
+    'com.zhouzhipeng.safebox/windows_shell',
+  );
+
   static Future<void> _startDetached(
     String executable,
     List<String> arguments,
   ) async {
-    await Process.start(
-      executable,
-      arguments,
-      mode: ProcessStartMode.detached,
-    );
+    await Process.start(executable, arguments, mode: ProcessStartMode.detached);
+  }
+
+  static Future<void> _openWithWindowsShell(String path) async {
+    await _windowsShellChannel.invokeMethod<void>('openPath', <String, Object?>{
+      'path': path,
+    });
   }
 
   static Future<void> open(File file) async {
@@ -20,7 +28,7 @@ abstract final class FileOpener {
     }
     final path = file.absolute.path;
     if (Platform.isWindows) {
-      await _startDetached('explorer.exe', <String>[path]);
+      await _openWithWindowsShell(path);
       return;
     }
     if (Platform.isMacOS) {
@@ -41,7 +49,7 @@ abstract final class FileOpener {
     }
     final path = directory.absolute.path;
     if (Platform.isWindows) {
-      await _startDetached('explorer.exe', <String>[path]);
+      await _openWithWindowsShell(path);
       return;
     }
     if (Platform.isMacOS) {

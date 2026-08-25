@@ -3214,7 +3214,7 @@ final class _LibraryPageState extends State<LibraryPage> {
       _showFeedback('未找到本地加密备份，请先下载文件。', error: true);
       return;
     }
-    final mnemonic = await _askMnemonic(title: '解密文件', actionLabel: '解密');
+    final mnemonic = await _askMnemonic(actionLabel: '解密');
     if (mnemonic == null || mnemonic.trim().isEmpty) return;
     if (!mounted) return;
     final cancellation = BundleDownloadCancellation();
@@ -3345,7 +3345,7 @@ final class _LibraryPageState extends State<LibraryPage> {
       );
       return;
     }
-    final mnemonic = await _askMnemonic(title: '解密并下载', actionLabel: '下载');
+    final mnemonic = await _askMnemonic(actionLabel: '下载');
     if (mnemonic == null || mnemonic.trim().isEmpty || !mounted) return;
 
     final cancellation = BundleDownloadCancellation();
@@ -3580,39 +3580,11 @@ final class _LibraryPageState extends State<LibraryPage> {
     bundle.hasPreview = true;
   }
 
-  Future<String?> _askMnemonic({
-    String title = '验证文件',
-    String actionLabel = '打开',
-  }) async {
-    final input = TextEditingController();
-    try {
-      return await showDialog<String>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: Text(title),
-          content: TextField(
-            controller: input,
-            autofocus: true,
-            obscureText: true,
-            maxLines: 1,
-            decoration: const InputDecoration(labelText: '输入 12 个恢复词'),
-          ),
-          actions: <Widget>[
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: const Text('取消'),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.of(context).pop(input.text),
-              child: Text(actionLabel),
-            ),
-          ],
-        ),
-      );
-    } finally {
-      input.clear();
-      input.dispose();
-    }
+  Future<String?> _askMnemonic({String actionLabel = '打开'}) {
+    return showDialog<String>(
+      context: context,
+      builder: (context) => _RecoveryPhraseDialog(actionLabel: actionLabel),
+    );
   }
 
   void _showFeedback(String message, {bool error = false}) {
@@ -3641,6 +3613,261 @@ final class _LibraryPageState extends State<LibraryPage> {
     if (local == null) return '已同步';
     String two(int number) => number.toString().padLeft(2, '0');
     return '${local.month}月${local.day}日 ${two(local.hour)}:${two(local.minute)}';
+  }
+}
+
+final class _RecoveryPhraseDialog extends StatefulWidget {
+  const _RecoveryPhraseDialog({required this.actionLabel});
+
+  final String actionLabel;
+
+  @override
+  State<_RecoveryPhraseDialog> createState() => _RecoveryPhraseDialogState();
+}
+
+final class _RecoveryPhraseDialogState extends State<_RecoveryPhraseDialog> {
+  static final RegExp _whitespace = RegExp(r'\s+');
+
+  final _controllers = List<TextEditingController>.generate(
+    12,
+    (_) => TextEditingController(),
+  );
+  final _focusNodes = List<FocusNode>.generate(12, (_) => FocusNode());
+
+  bool get _complete => _controllers.every((controller) {
+    final word = controller.text.trim();
+    return word.isNotEmpty && !_whitespace.hasMatch(word);
+  });
+
+  @override
+  void dispose() {
+    for (final controller in _controllers) {
+      controller.clear();
+      controller.dispose();
+    }
+    for (final focusNode in _focusNodes) {
+      focusNode.dispose();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final screenSize = MediaQuery.sizeOf(context);
+    final compact = screenSize.width < 620;
+    return Dialog(
+      key: const Key('recovery-phrase-dialog'),
+      insetPadding: EdgeInsets.symmetric(
+        horizontal: compact ? 12 : 32,
+        vertical: compact ? 16 : 24,
+      ),
+      backgroundColor: context.sboxColors.panelSoft,
+      shape: RoundedRectangleBorder(
+        side: BorderSide(color: context.sboxColors.borderSoft),
+        borderRadius: BorderRadius.circular(compact ? 16 : 13),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: 800,
+          maxHeight: screenSize.height - (compact ? 32 : 48),
+        ),
+        child: SingleChildScrollView(
+          padding: EdgeInsets.fromLTRB(
+            compact ? 16 : 30,
+            compact ? 24 : 22,
+            compact ? 16 : 30,
+            compact ? 18 : 20,
+          ),
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final gridWidth = constraints.maxWidth;
+              final columns = gridWidth >= 720
+                  ? 3
+                  : gridWidth >= 280
+                  ? 2
+                  : 1;
+              final mobileGrid = columns < 3;
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Text(
+                    '输入 12 个恢复词',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.headlineMedium,
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '按顺序输入恢复词，恢复词只保存在你手中',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                      color: context.sboxColors.textMuted,
+                      fontSize: compact ? 13 : 14,
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  GridView.builder(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    itemCount: 12,
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: columns,
+                      crossAxisSpacing: mobileGrid ? 8 : 12,
+                      mainAxisSpacing: 8,
+                      childAspectRatio: columns == 3
+                          ? 3.7
+                          : columns == 2
+                          ? 2.4
+                          : 4.6,
+                    ),
+                    itemBuilder: (context, index) =>
+                        _buildWordField(context, index, compact: compact),
+                  ),
+                  SizedBox(height: compact ? 20 : 24),
+                  _buildActions(context, compact),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWordField(
+    BuildContext context,
+    int index, {
+    required bool compact,
+  }) {
+    return TextField(
+      key: Key('recovery-word-${index + 1}'),
+      controller: _controllers[index],
+      focusNode: _focusNodes[index],
+      autofocus: index == 0,
+      maxLines: 1,
+      textInputAction: index == 11
+          ? TextInputAction.done
+          : TextInputAction.next,
+      autofillHints: const <String>[],
+      autocorrect: false,
+      enableSuggestions: false,
+      textAlignVertical: TextAlignVertical.center,
+      onChanged: (value) => _handleWordChanged(index, value),
+      onSubmitted: (_) => _handleWordSubmitted(index),
+      style: TextStyle(
+        color: context.sboxColors.text,
+        fontSize: compact ? 15 : 16,
+        fontWeight: FontWeight.w600,
+      ),
+      decoration: InputDecoration(
+        hintText: '第 ${index + 1} 个词',
+        filled: true,
+        fillColor: context.sboxColors.panelRaised.withValues(alpha: 0.62),
+        prefixIconConstraints: BoxConstraints.tightFor(
+          width: index >= 9 ? (compact ? 54 : 64) : (compact ? 48 : 58),
+        ),
+        prefixIcon: Center(
+          child: Text(
+            '${index + 1}',
+            style: TextStyle(
+              color: context.sboxColors.accent,
+              fontSize: compact ? 15 : 16,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+        contentPadding: EdgeInsets.only(right: compact ? 10 : 14),
+        hintStyle: TextStyle(
+          color: context.sboxColors.textMuted,
+          fontSize: compact ? 14 : 16,
+        ),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: BorderSide(color: context.sboxColors.border),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: BorderSide(color: context.sboxColors.border),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: BorderSide(color: context.sboxColors.accent, width: 1.5),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildActions(BuildContext context, bool compact) {
+    final cancel = TextButton(
+      key: const Key('recovery-phrase-cancel'),
+      onPressed: () => Navigator.of(context).pop(),
+      child: const Text('取消'),
+    );
+    final submit = ElevatedButton(
+      key: const Key('recovery-phrase-submit'),
+      onPressed: _complete ? _submit : null,
+      child: Text(widget.actionLabel),
+    );
+    if (compact) {
+      return Row(
+        children: <Widget>[
+          Expanded(child: cancel),
+          const SizedBox(width: 12),
+          Expanded(child: submit),
+        ],
+      );
+    }
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.end,
+      children: <Widget>[cancel, const SizedBox(width: 12), submit],
+    );
+  }
+
+  void _handleWordChanged(int index, String value) {
+    final trimmed = value.trim();
+    final words = trimmed.isEmpty
+        ? const <String>[]
+        : trimmed.split(_whitespace);
+    if (words.length > 1) {
+      final startIndex = words.length == 12 ? 0 : index;
+      if (startIndex + words.length <= _controllers.length) {
+        for (var offset = 0; offset < words.length; offset++) {
+          _setWord(startIndex + offset, words[offset]);
+        }
+        final nextIndex = startIndex + words.length < 12
+            ? startIndex + words.length
+            : 11;
+        _focusNodes[nextIndex].requestFocus();
+      } else {
+        _setWord(index, words.first);
+      }
+    } else if (words.isNotEmpty && RegExp(r'\s$').hasMatch(value)) {
+      _setWord(index, words.single);
+      if (index < 11) _focusNodes[index + 1].requestFocus();
+    }
+    setState(() {});
+  }
+
+  void _setWord(int index, String word) {
+    _controllers[index].value = TextEditingValue(
+      text: word,
+      selection: TextSelection.collapsed(offset: word.length),
+    );
+  }
+
+  void _handleWordSubmitted(int index) {
+    if (index < 11) {
+      _focusNodes[index + 1].requestFocus();
+    } else if (_complete) {
+      _submit();
+    }
+  }
+
+  void _submit() {
+    final mnemonic = _controllers
+        .map((controller) => controller.text.trim())
+        .join(' ');
+    Navigator.of(context).pop(mnemonic);
   }
 }
 

@@ -294,4 +294,143 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();
   });
+
+  testWidgets('decrypt dialog uses twelve responsive recovery word inputs', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final temporary = (await tester.runAsync(() async {
+      final directory = await Directory.systemTemp.createTemp(
+        'safebox-library-decrypt-dialog-test-',
+      );
+      final encoded = await File('test/fixtures/rust_sdk_interop.sbox.b64')
+          .readAsString();
+      final object = base64Decode(encoded.trim());
+      final header = BundleHeader.parse(object);
+      await File(
+        '${directory.path}${Platform.pathSeparator}${header.canonicalBasename}',
+      ).writeAsBytes(object, flush: true);
+      return directory;
+    }))!;
+    addTearDown(() => tester.runAsync(() => temporary.delete(recursive: true)));
+
+    final preferences = await SharedPreferences.getInstance();
+    await CloudBackupConfigurationStore(preferences: preferences).save(
+      CloudBackupConfiguration(
+        backupDirectory: temporary.path,
+        github: CloudRepositoryEndpoint(
+          owner: 'owner',
+          repository: 'github-box',
+          credentialId: SourceCredentialId('github-token'),
+          enabled: false,
+        ),
+        gitee: CloudRepositoryEndpoint(
+          owner: 'owner',
+          repository: 'gitee-box',
+          credentialId: SourceCredentialId('gitee-token'),
+          enabled: false,
+        ),
+      ),
+    );
+
+    final controller = AppController();
+    addTearDown(controller.dispose);
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildSboxTheme(),
+        home: Scaffold(body: LibraryPage(controller: controller)),
+      ),
+    );
+
+    Future<void> waitFor(Finder finder) async {
+      for (var attempt = 0; attempt < 100; attempt++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 10)),
+        );
+        await tester.pump(const Duration(milliseconds: 10));
+        if (finder.evaluate().isNotEmpty) return;
+      }
+    }
+
+    await waitFor(find.text('解密'));
+    await tester.tap(find.text('解密'));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('recovery-phrase-dialog')), findsOneWidget);
+    expect(find.text('输入 12 个恢复词'), findsOneWidget);
+    expect(find.text('按顺序输入恢复词，恢复词只保存在你手中'), findsOneWidget);
+    for (var index = 1; index <= 12; index++) {
+      expect(find.byKey(Key('recovery-word-$index')), findsOneWidget);
+    }
+
+    final firstRect = tester.getRect(find.byKey(const Key('recovery-word-1')));
+    final secondRect = tester.getRect(find.byKey(const Key('recovery-word-2')));
+    final thirdRect = tester.getRect(find.byKey(const Key('recovery-word-3')));
+    final fourthRect = tester.getRect(find.byKey(const Key('recovery-word-4')));
+    expect(secondRect.top, firstRect.top);
+    expect(thirdRect.top, firstRect.top);
+    expect(fourthRect.top, greaterThan(firstRect.top));
+
+    var submit = tester.widget<ElevatedButton>(
+      find.byKey(const Key('recovery-phrase-submit')),
+    );
+    expect(submit.onPressed, isNull);
+
+    const words = <String>[
+      'alpha',
+      'bravo',
+      'charlie',
+      'delta',
+      'echo',
+      'foxtrot',
+      'golf',
+      'hotel',
+      'india',
+      'juliet',
+      'kilo',
+      'lima',
+    ];
+    await tester.enterText(
+      find.byKey(const Key('recovery-word-1')),
+      words.join(' '),
+    );
+    await tester.pump();
+
+    for (var index = 0; index < words.length; index++) {
+      final field = tester.widget<TextField>(
+        find.byKey(Key('recovery-word-${index + 1}')),
+      );
+      expect(field.controller?.text, words[index]);
+    }
+    submit = tester.widget<ElevatedButton>(
+      find.byKey(const Key('recovery-phrase-submit')),
+    );
+    expect(submit.onPressed, isNotNull);
+
+    await tester.binding.setSurfaceSize(const Size(430, 900));
+    await tester.pumpAndSettle();
+    final mobileFirst = tester.getRect(
+      find.byKey(const Key('recovery-word-1')),
+    );
+    final mobileSecond = tester.getRect(
+      find.byKey(const Key('recovery-word-2')),
+    );
+    final mobileThird = tester.getRect(
+      find.byKey(const Key('recovery-word-3')),
+    );
+    expect(mobileSecond.top, mobileFirst.top);
+    expect(mobileThird.top, greaterThan(mobileFirst.top));
+    expect(tester.takeException(), isNull);
+
+    final cancel = find.byKey(const Key('recovery-phrase-cancel'));
+    await tester.ensureVisible(cancel);
+    await tester.tap(cancel);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('recovery-phrase-dialog')), findsNothing);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+  });
 }

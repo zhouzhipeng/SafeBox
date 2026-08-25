@@ -27,6 +27,8 @@ bool FlutterWindow::OnCreate() {
   RegisterPlugins(flutter_controller_->engine());
   video_poster_channel_ = std::make_unique<VideoPosterChannel>(
       flutter_controller_->engine()->messenger());
+  windows_shell_channel_ = std::make_unique<WindowsShellChannel>(
+      flutter_controller_->engine()->messenger(), GetHandle());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
@@ -42,6 +44,7 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  windows_shell_channel_.reset();
   video_poster_channel_.reset();
   if (flutter_controller_) {
     flutter_controller_ = nullptr;

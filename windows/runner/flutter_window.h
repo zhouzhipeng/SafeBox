@@ -7,6 +7,7 @@
 #include <memory>
 
 #include "video_poster_channel.h"
+#include "windows_shell_channel.h"
 #include "win32_window.h"
 
 // A window that does nothing but host a Flutter view.
@@ -32,6 +33,10 @@ class FlutterWindow : public Win32Window {
 
   // Native video poster extraction for the upload preview pipeline.
   std::unique_ptr<VideoPosterChannel> video_poster_channel_;
+
+  // Opens files and folders through ShellExecute instead of spawning a
+  // short-lived explorer.exe child process.
+  std::unique_ptr<WindowsShellChannel> windows_shell_channel_;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_
